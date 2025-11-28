@@ -1,0 +1,52 @@
+services:
+  postgres:
+    image: postgres:18.1
+    container_name: postgres
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/init.sql
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "wal_sender_timeout=300s" # 5 min
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cdc-bridge
+
+  nats-server:
+    image: nats:latest
+    container_name: nats-server
+    ports:
+      - "4222:4222" # Client connections
+      - "8222:8222" # HTTP monitoring
+    command: -js  -sd /data
+    volumes:
+      - nats-data:/data
+    restart: unless-stopped
+    networks:
+      - cdc-bridge
+
+volumes:
+  postgres-data:
+    driver: local
+  nats-data:
+    driver: local
+
+networks:
+  cdc-bridge:

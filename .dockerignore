@@ -1,0 +1,18 @@
+# Zig build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
+
+# NATS data
+nats-data/
+
+# Dependencies (vendored)
+libs/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Docker
+postgres-data/
