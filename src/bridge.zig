@@ -22,48 +22,12 @@ fn handleShutdown(sig: c_int) callconv(.c) void {
     should_stop.store(true, .seq_cst);
 }
 
-/// Encode a simple CDC event to MessagePack
-///
-/// Caller is responsible for freeing the returned slice
-fn encodeCDCEvent(allocator: std.mem.Allocator, table: []const u8, operation: []const u8) ![]u8 {
-    var buffer: [512]u8 = undefined;
-
-    const compat = msgpack.compat;
-    var write_buffer = compat.fixedBufferStream(&buffer);
-    var read_buffer = compat.fixedBufferStream(&buffer);
-
-    const BufferType = compat.BufferStream;
-    var packer = msgpack.Pack(
-        *BufferType,
-        *BufferType,
-        BufferType.WriteError,
-        BufferType.ReadError,
-        BufferType.write,
-        BufferType.read,
-    ).init(&write_buffer, &read_buffer);
-
-    // Create map with table and operation
-    var root = msgpack.Payload.mapPayload(allocator);
-    defer root.free(allocator);
-
-    try root.mapPut("table", try msgpack.Payload.strToPayload(table, allocator));
-    try root.mapPut("operation", try msgpack.Payload.strToPayload(operation, allocator));
-
-    // Write the payload
-    try packer.write(root);
-
-    // Copy to owned slice
-    const written = write_buffer.pos;
-    return try allocator.dupe(u8, buffer[0..written]);
-}
-
 const Args = struct {
     stream_name: []const u8,
     http_port: u16,
     slot_name: []const u8,
     publication_name: []const u8,
     tables: []const []const u8, // Empty slice = all tables
-    enable_batch: bool, // Enable batching
 
     pub fn parseArgs(allocator: std.mem.Allocator) !Args {
         // Parse command-line arguments
@@ -74,12 +38,9 @@ const Args = struct {
         var slot_name: []const u8 = "bridge_slot"; // default
         var publication_name: []const u8 = "bridge_pub"; // default
         var tables: []const []const u8 = &.{}; // default: all tables
-        var enable_batch: bool = false; // default: disabled
 
         while (args.next()) |arg| {
-            if (std.mem.eql(u8, arg, "--batch")) {
-                enable_batch = true;
-            } else if (std.mem.eql(u8, arg, "--stream")) {
+            if (std.mem.eql(u8, arg, "--stream")) {
                 if (args.next()) |value| {
                     stream_name = value;
                 }
@@ -135,7 +96,6 @@ const Args = struct {
             .slot_name = slot_name,
             .publication_name = publication_name,
             .tables = tables,
-            .enable_batch = enable_batch,
         };
     }
 };
@@ -292,6 +252,16 @@ pub fn main() !void {
     // Make publisher available to HTTP server for stream management
     http_srv.nats_publisher = &publisher;
 
+    // Initialize batch publisher (always enabled)
+    const batch_config = batch_publisher.BatchConfig{
+        .max_events = 100,
+        .max_wait_ms = 50,
+        .max_payload_bytes = 64 * 1024,
+    };
+    var batch_pub = batch_publisher.BatchPublisher.init(allocator, &publisher, batch_config);
+    defer batch_pub.deinit();
+    log.info("✓ Batch publishing enabled (max 100 events or 50ms or 64KB)\n", .{});
+
     // 4. Get current LSN to skip historical data
     log.info(" 3. Getting current LSN position...", .{});
     const current_lsn = try setup.getCurrentLSN();
@@ -339,6 +309,17 @@ pub fn main() !void {
     var last_keepalive_time = std.time.timestamp(); // Track last keepalive sent
     const keepalive_interval_seconds: i64 = 30; // Send keepalive every 30 seconds
 
+    // Status update batching to reduce PostgreSQL round trips
+    var pending_ack_lsn: u64 = 0; // LSN waiting to be acknowledged
+    var messages_since_ack: u32 = 0; // Count messages since last ack
+    var last_status_update_time = std.time.timestamp();
+    const status_update_interval_seconds: i64 = 10; // Send status update every 10 seconds
+    const status_update_message_count: u32 = 1000; // Or after 1000 messages
+
+    // NATS async publish flushing
+    var last_nats_flush_time = std.time.timestamp();
+    const nats_flush_interval_seconds: i64 = 5; // Flush NATS async publishes every 5 seconds
+
     // Periodic structured metric logging for Grafana Alloy/Loki
     var last_metric_log_time = std.time.timestamp();
     const metric_log_interval_seconds: i64 = 15; // Log metrics every 15 seconds
@@ -385,31 +366,27 @@ pub fn main() !void {
 
                 // Parse and publish pgoutput messages
                 if (wal_msg.type == .xlogdata and wal_msg.payload.len > 0) {
-                    // Parse messages with main allocator
-                    // Relations persist in the map, others are freed after processing
-                    var parser = pgoutput.Parser.init(allocator, wal_msg.payload);
-                    if (parser.parse()) |parsed_msg| {
-                        var pg_msg = parsed_msg;
-                        defer {
-                            switch (pg_msg) {
-                                .relation => {}, // Don't deinit relations - we store them in the map
-                                .insert => |*ins| ins.deinit(allocator),
-                                .update => |*upd| upd.deinit(allocator),
-                                .delete => |*del| del.deinit(allocator),
-                                else => {},
-                            }
-                        }
+                    // Use arena allocator for all parsing and temporary allocations
+                    // This reduces 10-15 allocations per event to just 1
+                    var arena = std.heap.ArenaAllocator.init(allocator);
+                    defer arena.deinit(); // Frees all parsing + temp allocations at once
+                    const arena_allocator = arena.allocator();
 
-                        // Use arena allocator for temporary allocations within each case
-                        var arena = std.heap.ArenaAllocator.init(allocator);
-                        defer arena.deinit();
-                        const temp_allocator = arena.allocator();
+                    // Parse messages with arena allocator
+                    // Relations use main allocator since they persist in the map
+                    var parser = pgoutput.Parser.init(arena_allocator, wal_msg.payload);
+                    if (parser.parse()) |parsed_msg| {
+                        const pg_msg = parsed_msg;
+                        // No manual deinit needed - arena.deinit() handles everything
 
                         switch (pg_msg) {
                             .relation => |rel| {
-                                // Store relation metadata for future use
+                                // Relations persist in the map, so clone with main allocator
+                                // (arena will be destroyed at end of scope)
+                                const cloned_rel = try rel.clone(allocator);
+
                                 // If relation already exists, free the old one first
-                                const result = try relation_map.fetchPut(rel.relation_id, rel);
+                                const result = try relation_map.fetchPut(cloned_rel.relation_id, cloned_rel);
                                 if (result) |old_entry| {
                                     var old_rel = old_entry.value;
                                     old_rel.deinit(allocator);
@@ -425,23 +402,21 @@ pub fn main() !void {
 
                                     // Publish to NATS (using arena for temporary allocations)
                                     const subject = try std.fmt.allocPrintSentinel(
-                                        temp_allocator,
+                                        arena_allocator,
                                         "{s}.{s}.insert",
                                         .{ subject_prefix, rel.name },
                                         0,
                                     );
 
-                                    // Encode as MessagePack
-                                    const payload = try encodeCDCEvent(temp_allocator, rel.name, "INSERT");
-
                                     // Generate message ID from WAL LSN for idempotent delivery
                                     const msg_id = try std.fmt.allocPrint(
-                                        temp_allocator,
+                                        arena_allocator,
                                         "{x}-{s}-insert",
                                         .{ wal_msg.wal_end, rel.name },
                                     );
 
-                                    try publisher.publish(subject, payload, msg_id);
+                                    // Add to batch publisher - encoding happens once
+                                    try batch_pub.addEvent(subject, rel.name, "INSERT", msg_id);
                                     cdc_events += 1;
                                     metrics.incrementCdcEvents();
                                     log.info("  → Published to NATS: {s} (msg_id: {s})", .{ subject, msg_id });
@@ -452,22 +427,21 @@ pub fn main() !void {
                                     log.info("UPDATE: {s}.{s}", .{ rel.namespace, rel.name });
 
                                     const subject = try std.fmt.allocPrintSentinel(
-                                        temp_allocator,
+                                        arena_allocator,
                                         "{s}.{s}.update",
                                         .{ subject_prefix, rel.name },
                                         0,
                                     );
 
-                                    const payload = try encodeCDCEvent(temp_allocator, rel.name, "UPDATE");
-
                                     // Generate message ID from WAL LSN for idempotent delivery
                                     const msg_id = try std.fmt.allocPrint(
-                                        temp_allocator,
+                                        arena_allocator,
                                         "{x}-{s}-update",
                                         .{ wal_msg.wal_end, rel.name },
                                     );
 
-                                    try publisher.publish(subject, payload, msg_id);
+                                    // Add to batch publisher - encoding happens once
+                                    try batch_pub.addEvent(subject, rel.name, "UPDATE", msg_id);
                                     cdc_events += 1;
                                     metrics.incrementCdcEvents();
                                     log.info("  → Published to NATS: {s} (msg_id: {s})", .{ subject, msg_id });
@@ -478,22 +452,21 @@ pub fn main() !void {
                                     log.info("DELETE: {s}.{s}", .{ rel.namespace, rel.name });
 
                                     const subject = try std.fmt.allocPrintSentinel(
-                                        temp_allocator,
+                                        arena_allocator,
                                         "{s}.{s}.delete",
                                         .{ subject_prefix, rel.name },
                                         0,
                                     );
 
-                                    const payload = try encodeCDCEvent(temp_allocator, rel.name, "DELETE");
-
                                     // Generate message ID from WAL LSN for idempotent delivery
                                     const msg_id = try std.fmt.allocPrint(
-                                        temp_allocator,
+                                        arena_allocator,
                                         "{x}-{s}-delete",
                                         .{ wal_msg.wal_end, rel.name },
                                     );
 
-                                    try publisher.publish(subject, payload, msg_id);
+                                    // Add to batch publisher - encoding happens once
+                                    try batch_pub.addEvent(subject, rel.name, "DELETE", msg_id);
                                     cdc_events += 1;
                                     metrics.incrementCdcEvents();
                                     log.info("  → Published to NATS: {s} (msg_id: {s})", .{ subject, msg_id });
@@ -516,12 +489,25 @@ pub fn main() !void {
                     }
                 }
 
-                // Send acknowledgment for all messages with wal_end
+                // Buffer acknowledgment instead of sending immediately
                 if (wal_msg.wal_end > 0) {
-                    try pg_stream.sendStatusUpdate(wal_msg.wal_end);
-                    last_ack_lsn = wal_msg.wal_end;
-                    last_keepalive_time = std.time.timestamp(); // Reset keepalive timer
+                    pending_ack_lsn = wal_msg.wal_end;
+                    messages_since_ack += 1;
                     metrics.updateLsn(wal_msg.wal_end);
+                }
+
+                // Send buffered status update if we hit time or message threshold
+                const now = std.time.timestamp();
+                if (pending_ack_lsn > 0 and
+                    (messages_since_ack >= status_update_message_count or
+                    now - last_status_update_time >= status_update_interval_seconds))
+                {
+                    try pg_stream.sendStatusUpdate(pending_ack_lsn);
+                    last_ack_lsn = pending_ack_lsn;
+                    messages_since_ack = 0;
+                    last_status_update_time = now;
+                    last_keepalive_time = now; // Reset keepalive timer
+                    log.debug("Sent buffered status update (LSN: {x}, buffered {} messages)", .{ pending_ack_lsn, messages_since_ack });
                 }
 
                 // Record processing time
@@ -529,9 +515,18 @@ pub fn main() !void {
                 const processing_time = @as(u64, @intCast(end_time - start_time));
                 metrics.recordProcessingTime(processing_time);
             } else {
-                // No message available - check if we need to send keepalive
+                // No message available - check if we need to send pending acks or keepalive
                 const now = std.time.timestamp();
-                if (now - last_keepalive_time >= keepalive_interval_seconds) {
+
+                // Flush pending status updates if time threshold reached
+                if (pending_ack_lsn > 0 and now - last_status_update_time >= status_update_interval_seconds) {
+                    try pg_stream.sendStatusUpdate(pending_ack_lsn);
+                    last_ack_lsn = pending_ack_lsn;
+                    messages_since_ack = 0;
+                    last_status_update_time = now;
+                    last_keepalive_time = now;
+                    log.debug("Sent buffered status update on idle (LSN: {x})", .{pending_ack_lsn});
+                } else if (now - last_keepalive_time >= keepalive_interval_seconds) {
                     // Send keepalive status update to prevent timeout
                     if (last_ack_lsn > 0) {
                         try pg_stream.sendStatusUpdate(last_ack_lsn);
@@ -539,6 +534,21 @@ pub fn main() !void {
                         log.debug("Sent keepalive (LSN: {x})", .{last_ack_lsn});
                     }
                 }
+
+                // Check if batch needs time-based flush
+                if (batch_pub.shouldFlushByTime()) {
+                    try batch_pub.flush();
+                }
+
+                // Flush NATS async publishes periodically
+                if (now - last_nats_flush_time >= nats_flush_interval_seconds) {
+                    try publisher.flushAsync();
+                    last_nats_flush_time = now;
+                    log.debug("Flushed NATS async publishes", .{});
+                }
+
+                // Sleep briefly to avoid busy-waiting and reduce CPU usage
+                std.Thread.sleep(1 * std.time.ns_per_ms); // 1ms sleep
 
                 // Periodic structured metric logging for Alloy/Loki
                 if (now - last_metric_log_time >= metric_log_interval_seconds) {
@@ -584,6 +594,9 @@ pub fn main() !void {
             };
             defer allocator.free(reconnect_lsn);
 
+            // Clean up old connection before reconnecting
+            pg_stream.deinit();
+
             // Reconnect to replication stream
             pg_stream.connect() catch |conn_err| {
                 log.err("Failed to reconnect: {}", .{conn_err});
@@ -599,6 +612,7 @@ pub fn main() !void {
 
             log.info("✓ Reconnected to WAL stream at LSN {s}", .{reconnect_lsn});
             metrics.recordReconnect();
+            metrics.setConnected(true);
         }
     }
 

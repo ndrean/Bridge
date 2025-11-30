@@ -159,7 +159,10 @@ pub const Publisher = struct {
         log.info("Disconnected from NATS", .{});
     }
 
-    /// Publish a message to JetStream with optional message ID for deduplication
+    /// Publish a message to JetStream asynchronously with optional message ID for deduplication
+    ///
+    /// This uses js_PublishAsync which is non-blocking and returns immediately.
+    /// Call flushAsync() periodically to complete pending publishes.
     ///
     /// Parameters:
     /// - subject: Full subject name (without prefix)
@@ -172,9 +175,6 @@ pub const Publisher = struct {
 
         const subject_cstr = try self.allocator.dupeZ(u8, subject);
         defer self.allocator.free(subject_cstr);
-
-        var pub_ack: ?*c.jsPubAck = null;
-        var js_err: c.jsErrCode = 0;
 
         // Prepare publish options with message ID if provided
         var opts: ?*c.jsPubOptions = null;
@@ -196,27 +196,34 @@ pub const Publisher = struct {
         }
         defer if (msg_id_cstr) |cstr| self.allocator.free(cstr);
 
-        const status = c.js_Publish(
-            &pub_ack,
+        // Use async publish - returns immediately without waiting for ack
+        const status = c.js_PublishAsync(
             self.js,
             subject_cstr.ptr,
             @ptrCast(data.ptr),
             @intCast(data.len),
             opts,
-            &js_err,
         );
 
         if (status != c.NATS_OK) {
-            if (js_err != 0) {
-                log.err("JetStream publish error: {s} (code: {d})", .{ c.natsStatus_GetText(status), js_err });
-            } else {
-                log.err("Failed to publish: {s}", .{c.natsStatus_GetText(status)});
-            }
+            log.err("Failed to publish async: {s}", .{c.natsStatus_GetText(status)});
             return error.PublishFailed;
         }
+    }
 
-        if (pub_ack) |ack| {
-            c.jsPubAck_Destroy(ack);
+    /// Flush pending async publishes and wait for acknowledgments
+    ///
+    /// Call this periodically to complete pending async publishes.
+    /// This blocks until all pending publishes are acknowledged or timeout.
+    pub fn flushAsync(self: *Publisher) !void {
+        if (self.js == null) {
+            return error.NotConnected;
+        }
+
+        const status = c.js_PublishAsyncComplete(self.js, null);
+        if (status != c.NATS_OK) {
+            log.warn("Async publish completion had errors: {s}", .{c.natsStatus_GetText(status)});
+            // Don't return error - some publishes may have succeeded
         }
     }
 

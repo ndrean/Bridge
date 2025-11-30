@@ -32,11 +32,23 @@ defmodule Consumer.CdcConsumer do
 
   @impl true
   def handle_message(message, state) do
+    :ok
+
     try do
       # Decode MessagePack payload
-      _decoded = Msgpax.unpack!(message.body)
+      decoded = Msgpax.unpack!(message.body)
 
-      # Logger.info("[CDC Consumer] #{message.topic}: #{inspect(decoded)}")
+      cond do
+        is_list(decoded) ->
+          # Batch of events - each event has table, operation, subject, msg_id
+          Enum.each(decoded, fn event ->
+            Logger.info("[CDC Consumer] Batch event - table: #{event["table"]}, operation: #{event["operation"]}, msg_id: #{event["msg_id"]}")
+          end)
+
+        true ->
+          # Single event with table and operation fields
+          Logger.info("[CDC Consumer] #{message.topic}: table=#{decoded["table"]}, operation=#{decoded["operation"]}")
+      end
 
       # Acknowledge successful processing
       {:ack, state}

@@ -24,9 +24,9 @@ defmodule PgProducer do
 
   @impl GenServer
   def init(opts) do
-    table = Keyword.get(opts, :table, "users")
+    tables = Keyword.get(opts, :tables, ["users"])
     {:ok, pid} = Postgrex.start_link(opts)
-    :ok = create_table(table, pid) |> dbg()
+    Enum.each(tables, fn table -> create_table(table, pid) end)
     {:ok, {pid, 0}}
   end
 
@@ -38,7 +38,7 @@ defmodule PgProducer do
   end
 
   @impl GenServer
-  def handle_call({:run, nb, _name}, _, {pid, i} = _state) do
+  def handle_call({:run, nb, name}, _, {pid, i} = _state) do
     # Logger.info("Running PG statements...")
 
     # Generate list of maps for bulk insert
@@ -52,7 +52,7 @@ defmodule PgProducer do
         }
       end
 
-    Producer.Repo.insert_all("users", values)
+    Producer.Repo.insert_all(name, values)
 
     # %Postgrex.Result{} =
     # Postgrex.query!(pid, """
@@ -120,3 +120,6 @@ defmodule PgProducer do
     :ok
   end
 end
+
+# Stream.interval(1) |> Stream.take(1_000) |> Task.async_stream(fn _ -> PgProducer.run(100, Enum.random(["users", "orders"])) end, ordered: false) |> Stream.run()
+# Stream.interval(1) |> Stream.take(1_000) |> Task.async_stream(fn _ -> PgProducer.run(100, "users") end, ordered: false) |> Stream.run()

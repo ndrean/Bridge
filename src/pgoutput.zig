@@ -53,6 +53,41 @@ pub const RelationMessage = struct {
         }
         allocator.free(self.columns);
     }
+
+    pub fn clone(self: RelationMessage, allocator: std.mem.Allocator) !RelationMessage {
+        const cloned_namespace = try allocator.dupe(u8, self.namespace);
+        errdefer allocator.free(cloned_namespace);
+
+        const cloned_name = try allocator.dupe(u8, self.name);
+        errdefer allocator.free(cloned_name);
+
+        const cloned_columns = try allocator.alloc(ColumnInfo, self.columns.len);
+        errdefer allocator.free(cloned_columns);
+
+        for (self.columns, 0..) |col, i| {
+            const cloned_col_name = try allocator.dupe(u8, col.name);
+            errdefer {
+                // Free previously cloned column names on error
+                for (cloned_columns[0..i]) |c| {
+                    allocator.free(c.name);
+                }
+            }
+            cloned_columns[i] = ColumnInfo{
+                .flags = col.flags,
+                .name = cloned_col_name,
+                .type_id = col.type_id,
+                .type_modifier = col.type_modifier,
+            };
+        }
+
+        return RelationMessage{
+            .relation_id = self.relation_id,
+            .namespace = cloned_namespace,
+            .name = cloned_name,
+            .replica_identity = self.replica_identity,
+            .columns = cloned_columns,
+        };
+    }
 };
 
 pub const InsertMessage = struct {

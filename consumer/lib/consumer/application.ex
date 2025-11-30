@@ -18,6 +18,12 @@ defmodule Consumer.Application do
     Supervisor.start_link(children, opts)
   end
 
+  defp get_tables do
+    System.get_env("TABLES")
+    |> String.split(",")
+    |> Enum.map(&String.trim/1)
+  end
+
   defp args do
     [
       hostname: System.get_env("PG_HOST") || "localhost",
@@ -26,7 +32,7 @@ defmodule Consumer.Application do
       password: System.get_env("PG_PASSWORD") || "postgres",
       database: System.get_env("PG_DB") || "postgres",
       name: PgEx,
-      table: System.get_env("TABLE") || "users"
+      tables: get_tables() || ["users", "orders"]
     ]
   end
 
@@ -40,7 +46,7 @@ defmodule Consumer.Application do
       ack_wait: 60_000_000_000,
       max_deliver: 3,
       filter_subject:
-        ((System.get_env("NATS_STREAM_NAME") |> String.downcase() || "cdc_rt") <> ".>") |> dbg()
+        (System.get_env("NATS_STREAM_NAME") |> String.downcase() || "cdc_rt") <> ".>"
     }
   end
 
