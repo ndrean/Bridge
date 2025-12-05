@@ -58,10 +58,12 @@ fn processCdcEvent(
     }
 
     // Extract ID value for logging (if present) - use stack buffer
+    // Optimize: check length first before memcmp (most column names aren't "id")
     var id_buf: [64]u8 = undefined;
     const id_str = blk: {
         for (decoded_values.items) |column| {
-            if (std.mem.eql(u8, column.name, "id")) {
+            // Quick rejection: check length first (avoid memcmp for wrong-length names)
+            if (column.name.len == 2 and column.name[0] == 'i' and column.name[1] == 'd') {
                 break :blk switch (column.value) {
                     .int32 => |v| std.fmt.bufPrint(&id_buf, "{d}", .{v}) catch "?",
                     .int64 => |v| std.fmt.bufPrint(&id_buf, "{d}", .{v}) catch "?",
@@ -73,9 +75,14 @@ fn processCdcEvent(
         break :blk null;
     };
 
-    // Convert operation to lowercase for NATS subject - use stack buffer
-    var operation_lower_buf: [16]u8 = undefined;
-    const operation_lower = std.ascii.lowerString(&operation_lower_buf, operation);
+    // Convert operation to lowercase for NATS subject
+    // Optimize: operation is always INSERT/UPDATE/DELETE, use lookup table
+    const operation_lower = switch (operation[0]) {
+        'I' => "insert", // INSERT
+        'U' => "update", // UPDATE
+        'D' => "delete", // DELETE
+        else => unreachable, // Only these 3 operations exist in CDC
+    };
 
     // Create NATS subject - use stack buffer
     var subject_buf: [128]u8 = undefined;
@@ -301,10 +308,10 @@ pub fn main() !void {
     const keepalive_interval_seconds: i64 = 30; // Send keepalive every 30 seconds
 
     // Status update batching to reduce PostgreSQL round trips
-    var messages_since_ack: u32 = 0; // Count messages since last ack
+    var bytes_since_ack: u64 = 0; // Track bytes processed since last ack
     var last_status_update_time = std.time.timestamp();
     const status_update_interval_seconds: i64 = 1; // Send status update every 1 second (reduced for visibility)
-    const status_update_message_count: u32 = 100; // Or after 100 messages (reduced for visibility)
+    const status_update_byte_threshold: u64 = 1024 * 1024; // Or after 1MB of data (better than message count)
 
     // NATS async publish flushing
     var last_nats_flush_time = std.time.timestamp();
@@ -337,9 +344,6 @@ pub fn main() !void {
                 var wal_msg = wal_msg_val;
                 defer wal_msg.deinit(allocator);
 
-                // Track processing time
-                const start_time = std.time.microTimestamp();
-
                 msg_count += 1;
                 metrics.incrementWalMessages();
 
@@ -352,10 +356,6 @@ pub fn main() !void {
                         last_keepalive_time = std.time.timestamp();
                         log.debug("Replied to keepalive request (LSN: {x})", .{reply_lsn});
                     }
-                    // Record processing time for keepalive
-                    const end_time = std.time.microTimestamp();
-                    const processing_time = @as(u64, @intCast(end_time - start_time));
-                    metrics.recordProcessingTime(processing_time);
                     continue; // Don't process keepalives further
                 }
 
@@ -452,39 +452,44 @@ pub fn main() !void {
                     }
                 }
 
-                // Track the latest WAL position we've received
+                // Track the latest WAL position we've received and update metrics
                 if (wal_msg.wal_end > 0) {
-                    messages_since_ack += 1;
+                    bytes_since_ack += wal_msg.payload.len;
                     metrics.updateLsn(wal_msg.wal_end);
                 }
 
                 // Get the last LSN confirmed by NATS (after successful flush)
                 const confirmed_lsn = batch_pub.getLastConfirmedLsn();
 
-                // Debug: Log confirmed_lsn vs last_ack_lsn
-                if (messages_since_ack > 0 and messages_since_ack % 10 == 0) {
-                    log.debug("Checking ACK: confirmed_lsn={x}, last_ack_lsn={x}, messages={d}", .{ confirmed_lsn, last_ack_lsn, messages_since_ack });
+                // Debug: Log confirmed_lsn vs last_ack_lsn every 128KB (power of 2 for efficient bitwise check)
+                // Check if lower 17 bits are zero: 128KB = 2^17 = 0x20000
+                // Use comptime constant to avoid runtime calculation
+                const log_interval = comptime 128 * 1024;
+                if (bytes_since_ack > 0 and (bytes_since_ack & (log_interval - 1)) == 0) {
+                    log.debug("Checking ACK: confirmed_lsn={x}, last_ack_lsn={x}, bytes={d}", .{ confirmed_lsn, last_ack_lsn, bytes_since_ack });
                 }
 
-                // Send buffered status update if we hit time or message threshold
+                // Send buffered status update if we hit time or byte threshold
                 // Only ACK up to the LSN that NATS has confirmed
-                const now = std.time.timestamp();
-                if (confirmed_lsn > last_ack_lsn and
-                    (messages_since_ack >= status_update_message_count or
-                        now - last_status_update_time >= status_update_interval_seconds))
-                {
-                    try pg_stream.sendStatusUpdate(confirmed_lsn);
-                    log.info("✓ ACKed to PostgreSQL: LSN {x} (NATS confirmed, {d} messages)", .{ confirmed_lsn, messages_since_ack });
-                    last_ack_lsn = confirmed_lsn;
-                    messages_since_ack = 0;
-                    last_status_update_time = now;
-                    last_keepalive_time = now; // Reset keepalive timer
-                }
+                // Optimize: check byte threshold first (cheaper than timestamp syscall)
+                if (confirmed_lsn > last_ack_lsn) {
+                    const should_ack_bytes = bytes_since_ack >= status_update_byte_threshold;
+                    // Only get timestamp if byte threshold not met (avoid syscall in hot path)
+                    const should_ack_time = if (!should_ack_bytes) blk: {
+                        const now = std.time.timestamp();
+                        break :blk now - last_status_update_time >= status_update_interval_seconds;
+                    } else false;
 
-                // Record processing time
-                const end_time = std.time.microTimestamp();
-                const processing_time = @as(u64, @intCast(end_time - start_time));
-                metrics.recordProcessingTime(processing_time);
+                    if (should_ack_bytes or should_ack_time) {
+                        const now = std.time.timestamp(); // Get timestamp for update
+                        try pg_stream.sendStatusUpdate(confirmed_lsn);
+                        log.info("✓ ACKed to PostgreSQL: LSN {x} (NATS confirmed, {d} bytes)", .{ confirmed_lsn, bytes_since_ack });
+                        last_ack_lsn = confirmed_lsn;
+                        bytes_since_ack = 0;
+                        last_status_update_time = now;
+                        last_keepalive_time = now; // Reset keepalive timer
+                    }
+                }
             } else {
                 // No message available - check if we need to send pending acks or keepalive
                 const now = std.time.timestamp();
@@ -497,7 +502,7 @@ pub fn main() !void {
                     try pg_stream.sendStatusUpdate(confirmed_lsn);
                     log.info("✓ ACKed to PostgreSQL: LSN {x} (NATS confirmed)", .{confirmed_lsn});
                     last_ack_lsn = confirmed_lsn;
-                    messages_since_ack = 0;
+                    bytes_since_ack = 0;
                     last_status_update_time = now;
                     last_keepalive_time = now;
                 } else if (now - last_keepalive_time >= keepalive_interval_seconds) {
@@ -529,7 +534,7 @@ pub fn main() !void {
                     defer allocator.free(snap.current_lsn_str);
 
                     // Structured log format parseable by Grafana Alloy
-                    log.info("METRICS uptime={d} wal_messages={d} cdc_events={d} lsn={s} connected={d} reconnects={d} lag_bytes={d} slot_active={d} processing_time_us={d}", .{
+                    log.info("METRICS uptime={d} wal_messages={d} cdc_events={d} lsn={s} connected={d} reconnects={d} lag_bytes={d} slot_active={d}", .{
                         snap.uptime_seconds,
                         snap.wal_messages_received,
                         snap.cdc_events_published,
@@ -538,7 +543,6 @@ pub fn main() !void {
                         snap.reconnect_count,
                         snap.wal_lag_bytes,
                         if (snap.slot_active) @as(u8, 1) else @as(u8, 0),
-                        snap.last_processing_time_us,
                     });
 
                     last_metric_log_time = now;

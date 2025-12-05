@@ -1,53 +1,13 @@
 //! Parser for PostgreSQL logical replication protocol
 const std = @import("std");
 const array_mod = @import("array.zig");
+const ArrayResult = array_mod.ArrayResult;
+const ArrayElement = array_mod.ArrayElement;
 const numeric_mod = @import("numeric.zig");
+const utils = @import("utils.zig");
+const PgOid = @import("pg_constants.zig").PgOid;
 
 pub const log = std.log.scoped(.pgoutput);
-
-/// Convert days since Unix epoch (1970-01-01) to civil calendar date (year, month, day)
-///
-/// This uses the proleptic Gregorian calendar algorithm from Howard Hinnant's date library,
-/// which is what PostgreSQL uses internally for efficient date arithmetic.
-///
-/// Algorithm: http://howardhinnant.github.io/date_algorithms.html#civil_from_days
-inline fn civilFromDays(z: i64) struct { year: i32, month: u8, day: u8 } {
-    // Shift epoch from 1970-01-01 to 0000-03-01 (March 1, year 0)
-    // This makes leap day the last day of the year for simpler arithmetic
-    const z2 = z + 719468;
-
-    // An "era" is a 400-year cycle (146097 days) in the Gregorian calendar
-    const era = @divFloor(z2, 146097);
-    const doe = @as(u32, @intCast(z2 - era * 146097)); // Day of era [0, 146096]
-
-    // Year of era [0, 399]
-    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
-
-    // Compute year: cast era to i32 then multiply
-    const y = @as(i32, @intCast(yoe)) + @as(i32, @intCast(era)) * 400;
-
-    // Day of year [0, 365]
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-
-    // Month pointer: [0=Mar, 1=Apr, ..., 9=Dec, 10=Jan, 11=Feb]
-    const mp = @divFloor(5 * doy + 2, 153);
-
-    // Day of month [1, 31]
-    const d = @as(u8, @intCast(doy - @divFloor(153 * mp + 2, 5) + 1));
-
-    // Convert month pointer to civil month [1=Jan, ..., 12=Dec]
-    // mp: [0=Mar, 1=Apr, ..., 9=Dec, 10=Jan, 11=Feb]
-    const m: u8 = if (mp < 10) @intCast(mp + 3) else @intCast(mp - 9);
-
-    // Adjust year for Jan/Feb (they belong to the next year in our shifted calendar)
-    const year = y + @as(i32, if (m <= 2) 1 else 0);
-
-    return .{
-        .year = year,
-        .month = m,
-        .day = d,
-    };
-}
 
 /// pgoutput protocol parser
 ///
@@ -81,60 +41,6 @@ pub const CommitMessage = struct {
     timestamp: i64,
 };
 
-/// PostgreSQL built-in Type OIDs (Object IDs).
-///
-/// These values are standard and obtained from PostgreSQL with: `docker exec postgres psql -U postgres -d postgres -c "SELECT oid, typname FROM pg_type WHERE typname IN ('bool', 'int2', 'int4', 'int8', 'float4', 'float8', 'text', 'varchar', 'bpchar', 'date', 'timestamptz', 'uuid', 'bytea', 'jsonb', 'numeric', '_int4', '_text', '_jsonb') ORDER BY oid;"`
-pub const PgOid = enum(u32) {
-    // Numeric Types
-    BOOL = 16,
-    BYTEA = 17,
-    INT2 = 21, // smallint
-    INT4 = 23, // integer
-    INT8 = 20, // bigint
-    FLOAT4 = 700,
-    FLOAT8 = 701,
-
-    // Character Types
-    TEXT = 25,
-    VARCHAR = 1043,
-    BPCHAR = 1042, // char(n)
-
-    // Date/Time Types
-    DATE = 1082,
-    TIMESTAMP = 1114, // timestamp without time zone (8 bytes)
-    TIMESTAMPTZ = 1184, // timestamp with time zone (8 bytes)
-
-    // Others
-    UUID = 2950,
-    JSON = 114, // json (text format, before jsonb)
-    JSONB = 3802,
-    NUMERIC = 1700,
-
-    // Array Types (prefixed with underscore in PostgreSQL)
-    ARRAY_INT2 = 1005, // _int2 (smallint[])
-    ARRAY_INT4 = 1007, // _int4 (integer[])
-    ARRAY_INT8 = 1016, // _int8 (bigint[])
-    ARRAY_TEXT = 1009, // _text (text[])
-    ARRAY_VARCHAR = 1015, // _varchar (varchar[])
-    ARRAY_FLOAT4 = 1021, // _float4 (float4[])
-    ARRAY_FLOAT8 = 1022, // _float8 (float8[])
-    ARRAY_BOOL = 1000, // _bool (boolean[])
-    ARRAY_JSONB = 3807, // _jsonb (jsonb[])
-    ARRAY_NUMERIC = 1231, // _numeric (numeric[])
-    ARRAY_UUID = 2951, // _uuid (uuid[])
-    ARRAY_TIMESTAMPTZ = 1185, // _timestamptz (timestamptz[])
-
-    _, // Placeholder for unsupported types
-};
-
-const NUMERIC_POS: u16 = 0x0000;
-const NUMERIC_NEG: u16 = 0x4000;
-const NUMERIC_NAN: u16 = 0xC000;
-const NUMERIC_PINF: u16 = 0xD000;
-const NUMERIC_NINF: u16 = 0xF000;
-
-const NBASE: u16 = 10000; // Each digit represents 4 decimal digits
-
 /// Decoded column value representation
 pub const DecodedValue = union(enum) {
     null,
@@ -149,18 +55,6 @@ pub const DecodedValue = union(enum) {
     bytea: []const u8, // BYTEA - raw bytes or hex/base64 encoded
 };
 
-pub const TupleColKind = enum(u8) {
-    Null = 'n',
-    Unchanged = 'u',
-    Text = 't',
-    Binary = 'b',
-};
-
-pub const TupleCol = struct {
-    kind: TupleColKind,
-    value: ?[]u8, // owned for Text/Binary, null otherwise
-};
-
 /// Decoded column (name + value pair)
 /// Used instead of HashMap for better performance - we only iterate, never lookup by key
 pub const Column = struct {
@@ -168,7 +62,7 @@ pub const Column = struct {
     value: DecodedValue,
 };
 
-/// Decodes the raw bytes based on the PostgreSQL type OID (BINARY format).
+/// Decodes a scalar of raw bytes based on the PostgreSQL type OID (BINARY format).
 ///
 /// Decodes binary-encoded column data from PostgreSQL when using
 /// START_REPLICATION with binary 'true'.
@@ -219,57 +113,48 @@ pub fn decodeBinColumnData(
         },
 
         // --- Date/Time Types (Binary format) ---
+
         .DATE => {
             if (raw_bytes.len != 4) return error.InvalidDataLength;
             const pg_days = std.mem.readInt(i32, raw_bytes[0..4], .big);
-
             // PostgreSQL epoch: 2000-01-01
             // Convert to Unix epoch (1970-01-01)
-            const PG_EPOCH_DAYS: i64 = 10957; // Days between 1970-01-01 and 2000-01-01
+
+            const PG_EPOCH_DAYS: i64 = 10957;
             const unix_days = @as(i64, pg_days) + PG_EPOCH_DAYS;
-
             // Use efficient civil calendar algorithm
-            const date = civilFromDays(unix_days);
+            const date = utils.civilFromDays(unix_days);
 
-            // Format as YYYY-MM-DD (always 10 chars)
-            var buf: [16]u8 = undefined;
-            _ = try std.fmt.bufPrint(
-                &buf,
-                "{d:0>4}-{d:0>2}-{d:0>2}",
-                .{ @as(u32, @intCast(date.year)), date.month, date.day },
-            );
-
-            return .{ .text = try allocator.dupe(u8, buf[0..10]) };
+            return .{
+                // Format as YYYY-MM-DD (always 10 chars)
+                .text = try std.fmt.allocPrint(
+                    allocator,
+                    "{d:0>4}-{d:0>2}-{d:0>2}",
+                    .{ @as(u32, @intCast(date.year)), date.month, date.day },
+                ),
+            };
         },
 
         // ISO 8601 format: 2025-10-26T10:00:00.000000Z
         .TIMESTAMP, .TIMESTAMPTZ => {
-            // Both use identical binary format: 8 bytes of microseconds since PG epoch
-            // TIMESTAMPTZ is timezone-aware, TIMESTAMP is not, but encoding is the same
             if (raw_bytes.len != 8) return error.InvalidDataLength;
             const microseconds = std.mem.readInt(i64, raw_bytes[0..8], .big);
 
-            // PostgreSQL epoch: 2000-01-01 00:00:00 UTC
             const PG_EPOCH_SECONDS: i64 = 946684800;
-
-            // Convert PG microseconds to Unix seconds and extract remaining microseconds
             const total_seconds = PG_EPOCH_SECONDS + @divFloor(microseconds, 1_000_000);
             const remaining_micros: u32 = @intCast(@abs(@mod(microseconds, 1_000_000)));
 
-            // Convert to days for date calculation
             const unix_days = @divFloor(total_seconds, 86400);
-            const date = civilFromDays(unix_days);
+            const date = utils.civilFromDays(unix_days);
 
-            // Extract time-of-day from remaining seconds
+            // Convert to days for date calculation
             const day_seconds = @mod(total_seconds, 86400);
             const hour = @divFloor(day_seconds, 3600);
             const minute = @divFloor(@mod(day_seconds, 3600), 60);
             const second = @mod(day_seconds, 60);
 
-            // Format as ISO 8601: 2025-10-26T10:00:00.000000Z (always 27 chars)
-            var buf: [32]u8 = undefined;
-            _ = try std.fmt.bufPrint(
-                &buf,
+            return .{ .text = try std.fmt.allocPrint(
+                allocator,
                 "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}Z",
                 .{
                     @as(u32, @intCast(date.year)),
@@ -280,29 +165,13 @@ pub fn decodeBinColumnData(
                     @as(u8, @intCast(second)),
                     remaining_micros,
                 },
-            );
-
-            return .{ .text = try allocator.dupe(u8, buf[0..27]) };
+            ) };
         },
 
         // --- UUID (Binary format - 16 bytes) ---
-        // use `bufPrint` to avoid heap allocation
         .UUID => {
             if (raw_bytes.len != 16) return error.InvalidDataLength;
-            // Format as xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (always 36 chars)
-            var buf: [36]u8 = undefined;
-            _ = try std.fmt.bufPrint(
-                &buf,
-                "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}",
-                .{
-                    raw_bytes[0],  raw_bytes[1],  raw_bytes[2],  raw_bytes[3],
-                    raw_bytes[4],  raw_bytes[5],  raw_bytes[6],  raw_bytes[7],
-                    raw_bytes[8],  raw_bytes[9],  raw_bytes[10], raw_bytes[11],
-                    raw_bytes[12], raw_bytes[13], raw_bytes[14], raw_bytes[15],
-                },
-            );
-            // UUID is always exactly 36 characters, allocate and return
-            return .{ .text = try allocator.dupe(u8, &buf) };
+            return .{ .text = try formatUUID(allocator, raw_bytes) };
         },
 
         // --- Variable-Length Text Types (Binary format is still text) ---
@@ -376,72 +245,213 @@ pub fn decodeBinColumnData(
     };
 }
 
-/// Helper: Convert ArrayResult to PostgreSQL text format
-fn arrayToText(allocator: std.mem.Allocator, arr: @import("array.zig").ArrayResult) ![]const u8 {
-    var buffer: std.ArrayList(u8) = .empty;
-    errdefer buffer.deinit(allocator);
+/// Convert ArrayResult to PostgreSQL array style text format '{{1,2}, {3,4}}'
+pub fn arrayToText(allocator: std.mem.Allocator, arr: ArrayResult) ![]u8 {
+    var res: std.ArrayList(u8) = .empty;
+    _ = try writeArrayRecursive(&res, allocator, arr, 0, 0);
+    return res.toOwnedSlice(allocator);
+}
 
-    const writer = buffer.writer(allocator);
+fn writeArrayRecursive(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    arr: ArrayResult,
+    dim: usize,
+    index: usize,
+) !usize {
+    const dims = arr.dimensions;
+    const ndim = arr.ndim;
 
-    // Handle multi-dimensional arrays
-    if (arr.ndim > 1) {
-        try writer.writeByte('{');
-        // For simplicity, flatten to 1D for now
-        // TODO: Handle proper multi-dimensional formatting
-    } else {
-        try writer.writeByte('{');
-    }
+    const count: usize = @intCast(dims[dim]);
 
-    for (arr.elements, 0..) |elem, i| {
-        if (i > 0) try writer.writeByte(',');
+    var flat_index = index;
 
-        switch (elem) {
-            .null_value => try writer.writeAll("NULL"),
-            .data => |data| {
-                // Decode based on element OID
-                const oid: PgOid = @enumFromInt(arr.element_oid);
-                switch (oid) {
-                    .INT2 => {
-                        const val = std.mem.readInt(i16, data[0..2], .big);
-                        try writer.print("{d}", .{val});
-                    },
-                    .INT4 => {
-                        const val = std.mem.readInt(i32, data[0..4], .big);
-                        try writer.print("{d}", .{val});
-                    },
-                    .INT8 => {
-                        const val = std.mem.readInt(i64, data[0..8], .big);
-                        try writer.print("{d}", .{val});
-                    },
-                    .TEXT, .VARCHAR => {
-                        try writer.writeByte('"');
-                        try writer.writeAll(data);
-                        try writer.writeByte('"');
-                    },
-                    .FLOAT8 => {
-                        const bits = std.mem.readInt(u64, data[0..8], .big);
-                        const val: f64 = @bitCast(bits);
-                        try writer.print("{d}", .{val});
-                    },
-                    .BOOL => {
-                        const val = data[0] != 0;
-                        try writer.writeAll(if (val) "t" else "f");
-                    },
-                    else => {
-                        // Fallback: hex encode
-                        try writer.writeAll("\\x");
-                        for (data) |byte| {
-                            try writer.print("{x:0>2}", .{byte});
+    try out.append(allocator, '{');
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        if (i > 0) try out.append(allocator, ',');
+
+        if (dim + 1 == ndim) {
+            // leaf element
+            const elem = arr.elements[flat_index];
+            switch (elem) {
+                .null_value => try out.appendSlice(allocator, "NULL"),
+                .data => blk: {
+                    const pg_oid: PgOid = @enumFromInt(arr.element_oid);
+
+                    // BYTEA: \xHEXSTRING format
+                    if (pg_oid == PgOid.BYTEA) {
+                        const hex = try elementToText(allocator, pg_oid, elem.data);
+                        defer allocator.free(hex);
+                        try out.appendSlice(allocator, "\\x");
+                        try out.appendSlice(allocator, hex);
+                        break :blk;
+                    }
+
+                    // UUID: formatted string (no quotes needed in array)
+                    if (pg_oid == PgOid.UUID) {
+                        const uuid_str = try elementToText(allocator, pg_oid, elem.data);
+                        defer allocator.free(uuid_str);
+                        try out.appendSlice(allocator, uuid_str);
+                        break :blk;
+                    }
+
+                    // TEXT/VARCHAR: requires quotes and escaping
+                    if (pg_oid == PgOid.TEXT or pg_oid == PgOid.VARCHAR) {
+                        const txt = try elementToText(allocator, pg_oid, elem.data);
+                        defer allocator.free(txt);
+
+                        try out.append(allocator, '"');
+                        for (txt) |c| {
+                            if (c == '"' or c == '\\')
+                                try out.append(allocator, '\\');
+                            try out.append(allocator, c);
                         }
-                    },
-                }
-            },
+                        try out.append(allocator, '"');
+                        break :blk;
+                    }
+
+                    // All other types (INT, FLOAT, BOOL, etc.): just append as-is
+                    const s = try elementToText(allocator, pg_oid, elem.data);
+                    defer allocator.free(s);
+                    try out.appendSlice(allocator, s);
+                },
+            }
+            flat_index += 1;
+        } else {
+            // recurse into next dimension
+            flat_index = try writeArrayRecursive(out, allocator, arr, dim + 1, flat_index);
         }
     }
 
-    try writer.writeByte('}');
+    try out.append(allocator, '}');
 
-    return buffer.toOwnedSlice(allocator);
+    return flat_index;
+}
+
+// Array element decoding
+fn elementToText(allocator: std.mem.Allocator, pg_oid: PgOid, data: []const u8) ![]u8 {
+    // const pgiod: PgOid = @enumFromInt(oid_int);
+    switch (pg_oid) {
+        .INT2 => {
+            const v = std.mem.readInt(i16, data[0..2], .big);
+            return std.fmt.allocPrint(allocator, "{}", .{v});
+        },
+        .INT4 => {
+            const v = std.mem.readInt(i32, data[0..4], .big);
+            return std.fmt.allocPrint(allocator, "{}", .{v});
+        },
+        .INT8 => {
+            const v = std.mem.readInt(i64, data[0..8], .big);
+            return std.fmt.allocPrint(allocator, "{}", .{v});
+        },
+        .FLOAT4 => {
+            const bits = std.mem.readInt(u32, data[0..4], .big);
+            const v: f32 = @bitCast(bits);
+            return std.fmt.allocPrint(allocator, "{}", .{v});
+        },
+        .FLOAT8 => {
+            const bits = std.mem.readInt(u64, data[0..8], .big);
+            const v: f64 = @bitCast(bits);
+            return std.fmt.allocPrint(allocator, "{}", .{v});
+        },
+        .TEXT, .VARCHAR => return allocator.dupe(u8, data),
+        .BYTEA => {
+            // Encode as lowercase hex format
+            return formatBYTEA(allocator, data);
+        },
+        .UUID => {
+            return try formatUUID(allocator, data);
+        },
+        else => return allocator.dupe(u8, data),
+    }
+}
+
+fn formatBYTEA(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    var hex_buf = try allocator.alloc(u8, data.len * 2);
+    var pos: usize = 0;
+    for (data) |b| {
+        const hi: u8 = @intCast((b >> 4) & 0xF);
+        const lo: u8 = @intCast(b & 0xF);
+        hex_buf[pos] = if (hi < 10) '0' + hi else 'a' + hi - 10;
+        pos += 1;
+        hex_buf[pos] = if (lo < 10) '0' + lo else 'a' + lo - 10;
+        pos += 1;
+    }
+    return hex_buf;
+}
+
+// 4-2-2-2-6 hex digit format with dashes, 128bits = 16x8 bits
+fn formatUUID(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    // UUID is 16 bytes
+    var res = try allocator.alloc(u8, 36);
+    var pos: usize = 0;
+
+    for (data, 0..) |b, i| {
+        if (i == 4 or i == 6 or i == 8 or i == 10) {
+            res[pos] = '-';
+            pos += 1;
+        }
+        // Write byte as two hex digits
+        utils.byteToHex(res[pos..][0..2], b);
+        pos += 2;
+    }
+
+    return res;
+}
+
+pub const TupleData = struct {
+    cols: []?[]u8,
+
+    pub fn deinit(self: *TupleData, allocator: std.mem.Allocator) void {
+        for (self.cols) |col| {
+            if (col) |data| {
+                allocator.free(data);
+            }
+        }
+        allocator.free(self.cols);
+    }
+};
+
+pub fn decodeTuple(
+    allocator: std.mem.Allocator,
+    tuple: TupleData,
+    columns: []const RelationMessage.ColumnInfo,
+) !std.ArrayList(Column) {
+    var decoded_columns = std.ArrayList(Column){};
+    errdefer decoded_columns.deinit(allocator);
+
+    if (tuple.cols.len != columns.len) return error.ColumnMismatch;
+
+    // Pre-allocate capacity for all columns
+    try decoded_columns.ensureTotalCapacity(allocator, columns.len);
+
+    for (columns, tuple.cols) |col_info, col_data| {
+        if (col_data) |raw_bytes| {
+            // Log raw text value for debugging
+            log.debug("Column '{s}' (OID={d}): '{s}'", .{ col_info.name, col_info.type_id, raw_bytes });
+
+            const decoded_value = decodeBinColumnData(allocator, col_info.type_id, raw_bytes) catch |err| {
+                log.err("Failed to decode column '{s}' (type_id={d}, bytes={d}): {}", .{ col_info.name, col_info.type_id, raw_bytes.len, err });
+                return err;
+            };
+            // Column name points to RelationMessage which has stable lifetime
+            // No need to duplicate - it lives for the entire relation cache
+            decoded_columns.appendAssumeCapacity(Column{
+                .name = col_info.name,
+                .value = decoded_value,
+            });
+        } else {
+            // Handle NULL values
+            log.debug("Column '{s}' is NULL", .{col_info.name});
+            decoded_columns.appendAssumeCapacity(Column{
+                .name = col_info.name,
+                .value = .null,
+            });
+        }
+    }
+    return decoded_columns;
 }
 
 pub const RelationMessage = struct {
@@ -520,9 +530,8 @@ pub const UpdateMessage = struct {
     new_tuple: TupleData,
 
     pub fn deinit(self: *UpdateMessage, allocator: std.mem.Allocator) void {
-        if (self.old_tuple) |*old| {
-            old.deinit(allocator);
-        }
+        if (self.old_tuple) |*old| old.deinit(allocator);
+
         self.new_tuple.deinit(allocator);
     }
 };
@@ -551,59 +560,6 @@ pub const TruncateMessage = struct {
     options: u8,
     relation_ids: []u32,
 };
-
-pub const TupleData = struct {
-    columns: []?[]const u8,
-
-    pub fn deinit(self: *TupleData, allocator: std.mem.Allocator) void {
-        for (self.columns) |col| {
-            if (col) |data| {
-                allocator.free(data);
-            }
-        }
-        allocator.free(self.columns);
-    }
-};
-
-pub fn decodeTuple(
-    allocator: std.mem.Allocator,
-    tuple: TupleData,
-    columns: []const RelationMessage.ColumnInfo,
-) !std.ArrayList(Column) {
-    var decoded_columns = std.ArrayList(Column){};
-    errdefer decoded_columns.deinit(allocator);
-
-    if (tuple.columns.len != columns.len) return error.ColumnMismatch;
-
-    // Pre-allocate capacity for all columns
-    try decoded_columns.ensureTotalCapacity(allocator, columns.len);
-
-    for (columns, tuple.columns) |col_info, col_data| {
-        if (col_data) |raw_bytes| {
-            // Log raw text value for debugging
-            log.debug("Column '{s}' (OID={d}): '{s}'", .{ col_info.name, col_info.type_id, raw_bytes });
-
-            const decoded_value = decodeBinColumnData(allocator, col_info.type_id, raw_bytes) catch |err| {
-                log.err("Failed to decode column '{s}' (type_id={d}, bytes={d}): {}", .{ col_info.name, col_info.type_id, raw_bytes.len, err });
-                return err;
-            };
-            // Column name points to RelationMessage which has stable lifetime
-            // No need to duplicate - it lives for the entire relation cache
-            decoded_columns.appendAssumeCapacity(Column{
-                .name = col_info.name,
-                .value = decoded_value,
-            });
-        } else {
-            // Handle NULL values
-            log.debug("Column '{s}' is NULL", .{col_info.name});
-            decoded_columns.appendAssumeCapacity(Column{
-                .name = col_info.name,
-                .value = .null,
-            });
-        }
-    }
-    return decoded_columns;
-}
 
 /// Parser state for decoding pgoutput messages
 ///
@@ -830,45 +786,57 @@ pub const Parser = struct {
     // https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-TUPLEDATA
     fn parseTupleData(self: *Parser) !TupleData {
         const num_columns = try self.readU16();
-        var columns = try self.allocator.alloc(?[]const u8, num_columns);
-        errdefer self.allocator.free(columns);
+        const ncols: usize = @intCast(num_columns);
+        var cols_ptr = try self.allocator.alloc(?[]u8, ncols);
+        // errdefer self.allocator.free(cols_ptr);
+        var clean_cols: bool = true;
 
-        var i: usize = 0;
-        while (i < num_columns) : (i += 1) {
-            const col_type = try self.readU8();
-
-            columns[i] = switch (col_type) {
-                'n' => null, // NULL value
-                'u' => null, // Unchanged TOASTed value
-                't' => blk: {
-                    // Text format column data
-                    const len = try self.readU32();
-                    const data = try self.readBytes(len);
-                    log.debug("Column {d}: TEXT format, len={d}", .{ i, len });
-                    break :blk data;
-                },
-                'b' => blk: {
-                    // Binary format column data
-                    const len = try self.readU32();
-                    const data = try self.readBytes(len);
-                    log.debug("Column {d}: BINARY format, len={d}", .{ i, len });
-                    break :blk data;
-                },
-                else => {
-                    log.warn("Unknown column type: {c}", .{col_type});
-                    return error.UnknownColumnType;
-                },
-            };
+        defer {
+            if (clean_cols) {
+                // free each owned val that was allocated
+                for (cols_ptr[0..ncols]) |col| {
+                    if (col) |c| self.allocator.free(c);
+                }
+                self.allocator.free(cols_ptr);
+            }
         }
 
-        return TupleData{ .columns = columns };
+        var i: usize = 0;
+        while (i < ncols) : (i += 1) {
+            const kind_byte = try self.readU8();
+            switch (kind_byte) {
+                'n' => {
+                    cols_ptr[i] = null;
+                },
+                'u' => {
+                    cols_ptr[i] = null;
+                },
+                't' => {
+                    // text format
+                    const len = try self.readU32();
+                    const owned = try self.readBytesOwned(len);
+                    cols_ptr[i] = owned;
+                },
+                'b' => {
+                    // binary format
+                    const len = try self.readU32();
+                    const owned = try self.readBytesOwned(len);
+                    cols_ptr[i] = owned;
+                },
+                else => {
+                    // unknown marker
+                    return error.UnknownColumnType;
+                },
+            }
+        }
+        // success path, do not deallocate cols_ptr
+        clean_cols = false;
+        return TupleData{ .cols = cols_ptr[0..ncols] };
     }
 
     /// Read a single byte
     fn readU8(self: *Parser) !u8 {
-        if (self.pos >= self.data.len) {
-            return error.UnexpectedEndOfData;
-        }
+        if (self.pos >= self.data.len) return error.UnexpectedEndOfData;
         const val = self.data[self.pos];
         self.pos += 1;
         return val;
@@ -876,10 +844,8 @@ pub const Parser = struct {
 
     /// Read a 16-bit unsigned integer in big-endian order
     fn readU16(self: *Parser) !u16 {
-        if (self.pos + 2 > self.data.len) {
-            return error.UnexpectedEndOfData;
-        }
-        const array_ptr = self.data[self.pos..][0..2];
+        if (self.pos + 2 > self.data.len) return error.UnexpectedEndOfData;
+        const array_ptr: *const [2]u8 = self.data[self.pos..][0..2];
         const val = std.mem.readInt(u16, array_ptr, .big);
         self.pos += 2;
         return val;
@@ -887,40 +853,36 @@ pub const Parser = struct {
 
     /// Read a 32-bit unsigned integer in big-endian order
     fn readU32(self: *Parser) !u32 {
-        if (self.pos + 4 > self.data.len) {
-            return error.UnexpectedEndOfData;
-        }
-        const val = std.mem.readInt(u32, self.data[self.pos..][0..4], .big);
+        if (self.pos + 4 > self.data.len) return error.UnexpectedEndOfData;
+        const array_ptr = self.data[self.pos..][0..4];
+        const val = std.mem.readInt(u32, array_ptr, .big);
         self.pos += 4;
         return val;
     }
 
     /// Read a 32-bit signed integer in big-endian order
     fn readI32(self: *Parser) !i32 {
-        if (self.pos + 4 > self.data.len) {
-            return error.UnexpectedEndOfData;
-        }
-        const val = std.mem.readInt(i32, self.data[self.pos..][0..4], .big);
+        if (self.pos + 4 > self.data.len) return error.UnexpectedEndOfData;
+        const array_ptr = self.data[self.pos..][0..4];
+        const val = std.mem.readInt(i32, array_ptr, .big);
         self.pos += 4;
         return val;
     }
 
     /// Read a 64-bit unsigned integer in big-endian order
     fn readU64(self: *Parser) !u64 {
-        if (self.pos + 8 > self.data.len) {
-            return error.UnexpectedEndOfData;
-        }
-        const val = std.mem.readInt(u64, self.data[self.pos..][0..8], .big);
+        if (self.pos + 8 > self.data.len) return error.UnexpectedEndOfData;
+        const array_ptr = self.data[self.pos..][0..8];
+        const val = std.mem.readInt(u64, array_ptr, .big);
         self.pos += 8;
         return val;
     }
 
     /// Read a 64-bit signed integer in big-endian order
     fn readI64(self: *Parser) !i64 {
-        if (self.pos + 8 > self.data.len) {
-            return error.UnexpectedEndOfData;
-        }
-        const val = std.mem.readInt(i64, self.data[self.pos..][0..8], .big);
+        if (self.pos + 8 > self.data.len) return error.UnexpectedEndOfData;
+        const array_ptr = self.data[self.pos..][0..8];
+        const val = std.mem.readInt(i64, array_ptr, .big);
         self.pos += 8;
         return val;
     }
@@ -934,9 +896,7 @@ pub const Parser = struct {
             self.pos += 1;
         }
 
-        if (self.pos >= self.data.len) {
-            return error.UnexpectedEndOfData;
-        }
+        if (self.pos >= self.data.len) return error.UnexpectedEndOfData;
 
         const str = self.data[start..self.pos];
         self.pos += 1; // Skip null terminator
@@ -944,18 +904,317 @@ pub const Parser = struct {
         return try self.allocator.dupe(u8, str);
     }
 
-    /// Read a sequence of bytes of given length
+    /// Read `len` bytes and return an owned byte mutable slice
     ///
     /// Caller is responsible for freeing the returned byte slice
-    fn readBytes(self: *Parser, len: u32) ![]const u8 {
-        const end = self.pos + len;
-        if (end > self.data.len) {
-            return error.UnexpectedEndOfData;
-        }
+    fn readBytesOwned(self: *Parser, len: u32) ![]u8 {
+        const len_usize: usize = @intCast(len);
+        const end = self.pos + len_usize;
+        if (end > self.data.len) return error.UnexpectedEndOfData;
 
         const bytes = self.data[self.pos..end];
         self.pos = end;
 
-        return try self.allocator.dupe(u8, bytes);
+        const dst = try self.allocator.alloc(u8, len_usize);
+        @memcpy(dst, bytes);
+        return dst;
     }
 };
+
+// === Tests ===
+
+const parseArray = array_mod.parseArray;
+
+inline fn writeIntBE(comptime T: type, buf: []u8, value: T, endian: std.builtin.Endian) void {
+    const ptr: *[@divExact(@typeInfo(T).int.bits, 8)]u8 = @ptrCast(buf.ptr);
+    std.mem.writeInt(T, ptr, value, endian);
+}
+
+test "1D int4 → {1,2,3,4}" {
+    const alloc = std.testing.allocator;
+
+    const buf = [_]u8{
+        0, 0, 0, 1, // ndim
+        0, 0, 0, 0, // flags
+        0, 0, 0, 23, // element_oid = INT4
+        0, 0, 0, 4, // dim1_len
+        0, 0, 0, 1, // dim1_lower
+        0, 0, 0, 4,
+        0, 0, 0, 1,
+        0, 0, 0, 4,
+        0, 0, 0, 2,
+        0, 0, 0, 4,
+        0, 0, 0, 3,
+        0, 0, 0, 4,
+        0, 0, 0, 4,
+    };
+
+    var arr = try parseArray(alloc, &buf);
+    defer arr.deinit(alloc);
+
+    const txt = try arrayToText(alloc, arr);
+    defer alloc.free(txt);
+
+    try std.testing.expectEqualStrings("{1,2,3,4}", txt);
+}
+
+test "2D int4 → {{1,2},{3,4}}" {
+    const alloc = std.testing.allocator;
+
+    const buf = [_]u8{
+        0, 0, 0, 2, // ndim = 2
+        0, 0, 0, 0,
+        0, 0, 0, 23, // INT4
+        0, 0, 0, 2, 0, 0, 0, 1, // dim1_len, lower
+        0, 0, 0, 2, 0, 0, 0, 1, // dim2_len, lower
+
+        // (1,1)
+        0, 0, 0, 4, 0, 0, 0, 1,
+        // (1,2)
+        0, 0, 0, 4, 0, 0, 0, 2,
+        // (2,1)
+        0, 0, 0, 4, 0, 0, 0, 3,
+        // (2,2)
+        0, 0, 0, 4, 0, 0, 0, 4,
+    };
+
+    var arr = try parseArray(alloc, &buf);
+    defer arr.deinit(alloc);
+
+    const txt = try arrayToText(alloc, arr);
+    defer alloc.free(txt);
+
+    try std.testing.expectEqualStrings("{{1,2},{3,4}}", txt);
+}
+
+test "3D int4 → {{{1,2},{3,4}},{{5,6},{7,8}}}" {
+    const alloc = std.testing.allocator;
+
+    // 3D: dims = [2,2,2], flattened [1..8]
+    const buf = blk: {
+        var b: [136]u8 = undefined;
+        var pos: usize = 0;
+
+        // ndim = 3
+        writeIntBE(i32, b[pos .. pos + 4], 3, .big);
+        pos += 4;
+        // flags
+        writeIntBE(i32, b[pos .. pos + 4], 0, .big);
+        pos += 4;
+        // oid INT4 = 23
+        writeIntBE(u32, b[pos .. pos + 4], 23, .big);
+        pos += 4;
+
+        // dim1 len=2, lower=1
+        writeIntBE(i32, b[pos .. pos + 4], 2, .big);
+        pos += 4;
+        writeIntBE(i32, b[pos .. pos + 4], 1, .big);
+        pos += 4;
+
+        // dim2 len=2, lower=1
+        writeIntBE(i32, b[pos .. pos + 4], 2, .big);
+        pos += 4;
+        writeIntBE(i32, b[pos .. pos + 4], 1, .big);
+        pos += 4;
+
+        // dim3 len=2, lower=1
+        writeIntBE(i32, b[pos .. pos + 4], 2, .big);
+        pos += 4;
+        writeIntBE(i32, b[pos .. pos + 4], 1, .big);
+        pos += 4;
+
+        var x: i32 = 1;
+        for (0..8) |_| {
+            writeIntBE(i32, b[pos .. pos + 4], 4, .big);
+            pos += 4;
+            writeIntBE(i32, b[pos .. pos + 4], x, .big);
+            pos += 4;
+            x += 1;
+        }
+
+        break :blk b;
+    };
+
+    var arr = try parseArray(alloc, &buf);
+    defer arr.deinit(alloc);
+
+    const txt = try arrayToText(alloc, arr);
+    defer alloc.free(txt);
+
+    try std.testing.expectEqualStrings(
+        "{{{1,2},{3,4}},{{5,6},{7,8}}}",
+        txt,
+    );
+}
+
+test "NULL elements → {1,NULL,3}" {
+    const alloc = std.testing.allocator;
+
+    const buf = [_]u8{
+        0,   0,   0,   1, // ndim = 1
+        0,   0,   0,   0, // flags
+        0,   0,   0,   23, // INT4
+        0,   0,   0,   3, // dim_len = 3 elements
+        0,   0,   0,   1, // dim_lower = 1
+        // Element 1: length=4, value=1
+        0,   0,   0,   4,
+        0,   0,   0,   1,
+        // Element 2: length=-1 (NULL)
+        255, 255, 255, 255,
+        // Element 3: length=4, value=3
+        0,   0,   0,   4,
+        0,   0,   0,   3,
+    };
+
+    var arr = try parseArray(alloc, &buf);
+    defer arr.deinit(alloc);
+
+    const txt = try arrayToText(alloc, arr);
+    defer alloc.free(txt);
+
+    try std.testing.expectEqualStrings("{1,NULL,3}", txt);
+}
+
+test "TEXT array escaping → {\"a\",\"b c\",\"d\\\"e\"}" {
+    const alloc = std.testing.allocator;
+
+    const buf = [_]u8{
+        0, 0, 0, 1,
+        0, 0, 0, 0,
+        0,   0,   0,   25, // TEXT
+        0,   0,   0,   3,
+        0,   0,   0,   1,
+        // "a"
+        0,   0,   0,   1,
+        'a',
+        // "b c"
+        0,   0,   0,
+        3,   'b', ' ', 'c',
+        // "d" e → d\"e
+        0,   0,   0,   3,
+        'd', '"', 'e',
+    };
+
+    var arr = try parseArray(alloc, &buf);
+    defer arr.deinit(alloc);
+
+    const txt = try arrayToText(alloc, arr);
+    defer alloc.free(txt);
+
+    try std.testing.expectEqualStrings(
+        "{\"a\",\"b c\",\"d\\\"e\"}",
+        txt,
+    );
+}
+
+test "BYTEA array → {\\xdeadbeef,\\x01020304}" {
+    const alloc = std.testing.allocator;
+
+    const buf = [_]u8{
+        0, 0, 0, 1, // ndim
+        0, 0, 0, 0,
+        0,    0,    0,    17, // BYTEA
+        0,    0,    0,    2,
+        0,    0,    0,    1,
+
+        // element 1: 4 bytes
+        0,    0,    0,    4,
+        0xDE, 0xAD, 0xBE, 0xEF,
+
+        // element 2: 4 bytes
+        0,    0,    0,    4,
+        0x01, 0x02, 0x03, 0x04,
+    };
+
+    var arr = try parseArray(alloc, &buf);
+    defer arr.deinit(alloc);
+
+    const txt = try arrayToText(alloc, arr);
+    defer alloc.free(txt);
+
+    try std.testing.expectEqualStrings(
+        "{\\xdeadbeef,\\x01020304}",
+        txt,
+    );
+}
+
+test "FLOAT8 array → {1.5,2.25,3.75}" {
+    const alloc = std.testing.allocator;
+
+    var buf: [4 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8]u8 = undefined;
+    var pos: usize = 0;
+
+    // ndim = 1
+    writeIntBE(i32, buf[pos .. pos + 4], 1, .big);
+    pos += 4;
+    writeIntBE(i32, buf[pos .. pos + 4], 0, .big);
+    pos += 4;
+    writeIntBE(u32, buf[pos .. pos + 4], @intFromEnum(PgOid.FLOAT8), .big);
+    pos += 4;
+
+    writeIntBE(i32, buf[pos .. pos + 4], 3, .big);
+    pos += 4;
+    writeIntBE(i32, buf[pos .. pos + 4], 1, .big);
+    pos += 4;
+
+    const floats = [_]f64{ 1.5, 2.25, 3.75 };
+
+    for (floats) |f| {
+        writeIntBE(i32, buf[pos .. pos + 4], 8, .big);
+        pos += 4;
+        const bits: u64 = @bitCast(f);
+        writeIntBE(u64, buf[pos .. pos + 8], bits, .big);
+        pos += 8;
+    }
+
+    var arr = try parseArray(alloc, &buf);
+    defer arr.deinit(alloc);
+
+    const txt = try arrayToText(alloc, arr);
+    defer alloc.free(txt);
+
+    try std.testing.expectEqualStrings("{1.5,2.25,3.75}", txt);
+}
+
+test "UUID array → {uuid1,uuid2}" {
+    const alloc = std.testing.allocator;
+
+    const uuid1 = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
+    const uuid2 = [_]u8{ 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0xFF };
+
+    var buf: [4 + 4 + 4 + 8 + 4 + 16 + 4 + 16]u8 = undefined;
+    var pos: usize = 0;
+
+    writeIntBE(i32, buf[pos .. pos + 4], 1, .big);
+    pos += 4;
+    writeIntBE(i32, buf[pos .. pos + 4], 0, .big);
+    pos += 4;
+    writeIntBE(u32, buf[pos .. pos + 4], @intFromEnum(PgOid.UUID), .big);
+    pos += 4;
+    writeIntBE(i32, buf[pos .. pos + 4], 2, .big);
+    pos += 4;
+    writeIntBE(i32, buf[pos .. pos + 4], 1, .big);
+    pos += 4;
+
+    writeIntBE(i32, buf[pos .. pos + 4], 16, .big);
+    pos += 4;
+    @memcpy(buf[pos .. pos + 16], &uuid1);
+    pos += 16;
+
+    writeIntBE(i32, buf[pos .. pos + 4], 16, .big);
+    pos += 4;
+    @memcpy(buf[pos .. pos + 16], &uuid2);
+    pos += 16;
+
+    var arr = try parseArray(alloc, buf[0..pos]);
+    defer arr.deinit(alloc);
+
+    const out = try arrayToText(alloc, arr);
+    defer alloc.free(out);
+
+    // PostgreSQL format
+    try std.testing.expectEqualStrings(
+        "{00010203-0405-0607-0809-aabbccddeeff,10203040-5060-7080-90a0-b0c0d0e0f0ff}",
+        out,
+    );
+}

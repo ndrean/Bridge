@@ -1,112 +1,77 @@
 const std = @import("std");
 
-/// Thread-safe metrics shared between bridge and HTTP server
+/// Lock-free metrics shared between bridge and HTTP server using atomics
 pub const Metrics = struct {
-    mutex: std.Thread.Mutex,
-    start_time: i64, // Unix timestamp in seconds
+    start_time: i64, // Unix timestamp in seconds (immutable after init)
 
-    // Message counters
-    wal_messages_received: u64,
-    cdc_events_published: u64,
+    // Message counters (atomics for lock-free increment)
+    wal_messages_received: std.atomic.Value(u64),
+    cdc_events_published: std.atomic.Value(u64),
 
-    // LSN tracking
-    last_ack_lsn: u64,
-    current_lsn_hex: [32]u8, // Hex string representation "0/1A2B3C4D"
-    current_lsn_len: u8,
+    // LSN tracking (atomic for lock-free updates)
+    last_ack_lsn: std.atomic.Value(u64),
 
-    // Connection state
-    is_connected: bool,
-    reconnect_count: u32,
-    last_reconnect_time: i64, // Unix timestamp, 0 if never reconnected
+    // Connection state (atomics)
+    is_connected: std.atomic.Value(bool),
+    reconnect_count: std.atomic.Value(u32),
+    last_reconnect_time: std.atomic.Value(i64),
 
-    // Latency tracking (simple)
-    last_processing_time_us: u64, // Microseconds for last message
-
-    // WAL lag metrics
-    slot_active: bool, // Is replication slot active?
-    wal_lag_bytes: u64, // Bytes of WAL retained for this slot
-    last_wal_check_time: i64, // Unix timestamp of last WAL lag check
+    // WAL lag metrics (atomics)
+    slot_active: std.atomic.Value(bool),
+    wal_lag_bytes: std.atomic.Value(u64),
+    last_wal_check_time: std.atomic.Value(i64),
 
     pub fn init() Metrics {
         return .{
-            .mutex = .{},
             .start_time = std.time.timestamp(),
-            .wal_messages_received = 0,
-            .cdc_events_published = 0,
-            .last_ack_lsn = 0,
-            .current_lsn_hex = std.mem.zeroes([32]u8),
-            .current_lsn_len = 0,
-            .is_connected = false,
-            .reconnect_count = 0,
-            .last_reconnect_time = 0,
-            .last_processing_time_us = 0,
-            .slot_active = false,
-            .wal_lag_bytes = 0,
-            .last_wal_check_time = 0,
+            .wal_messages_received = std.atomic.Value(u64).init(0),
+            .cdc_events_published = std.atomic.Value(u64).init(0),
+            .last_ack_lsn = std.atomic.Value(u64).init(0),
+            .is_connected = std.atomic.Value(bool).init(false),
+            .reconnect_count = std.atomic.Value(u32).init(0),
+            .last_reconnect_time = std.atomic.Value(i64).init(0),
+            .slot_active = std.atomic.Value(bool).init(false),
+            .wal_lag_bytes = std.atomic.Value(u64).init(0),
+            .last_wal_check_time = std.atomic.Value(i64).init(0),
         };
     }
 
-    /// Thread-safe increment of WAL message counter
+    /// Lock-free increment of WAL message counter
     pub fn incrementWalMessages(self: *Metrics) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.wal_messages_received += 1;
+        _ = self.wal_messages_received.fetchAdd(1, .monotonic);
     }
 
-    /// Thread-safe increment of CDC events counter
+    /// Lock-free increment of CDC events counter
     pub fn incrementCdcEvents(self: *Metrics) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.cdc_events_published += 1;
+        _ = self.cdc_events_published.fetchAdd(1, .monotonic);
     }
 
-    /// Thread-safe update of LSN position
+    /// Lock-free update of LSN position
     pub fn updateLsn(self: *Metrics, lsn: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.last_ack_lsn = lsn;
-
-        // Format as hex string "0/{x}"
-        const hex_str = std.fmt.bufPrint(&self.current_lsn_hex, "0/{x}", .{lsn}) catch "";
-        self.current_lsn_len = @intCast(hex_str.len);
+        self.last_ack_lsn.store(lsn, .monotonic);
     }
 
-    /// Thread-safe connection state update
+    /// Lock-free connection state update
     pub fn setConnected(self: *Metrics, connected: bool) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.is_connected = connected;
+        self.is_connected.store(connected, .monotonic);
     }
 
-    /// Thread-safe reconnection tracking
+    /// Lock-free reconnection tracking
     pub fn recordReconnect(self: *Metrics) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.reconnect_count += 1;
-        self.last_reconnect_time = std.time.timestamp();
-        self.is_connected = true;
+        _ = self.reconnect_count.fetchAdd(1, .monotonic);
+        self.last_reconnect_time.store(std.time.timestamp(), .monotonic);
+        self.is_connected.store(true, .monotonic);
     }
 
-    /// Thread-safe processing time update
-    pub fn recordProcessingTime(self: *Metrics, microseconds: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.last_processing_time_us = microseconds;
-    }
-
-    /// Thread-safe WAL lag update
+    /// Lock-free WAL lag update
     pub fn updateWalLag(self: *Metrics, slot_active: bool, lag_bytes: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.slot_active = slot_active;
-        self.wal_lag_bytes = lag_bytes;
-        self.last_wal_check_time = std.time.timestamp();
+        self.slot_active.store(slot_active, .monotonic);
+        self.wal_lag_bytes.store(lag_bytes, .monotonic);
+        self.last_wal_check_time.store(std.time.timestamp(), .monotonic);
     }
 
-    /// Get current uptime in seconds (thread-safe read)
+    /// Get current uptime in seconds (lock-free read)
     pub fn getUptimeSeconds(self: *Metrics) i64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         return std.time.timestamp() - self.start_time;
     }
 
@@ -120,32 +85,35 @@ pub const Metrics = struct {
         is_connected: bool,
         reconnect_count: u32,
         last_reconnect_time: i64,
-        last_processing_time_us: u64,
         slot_active: bool,
         wal_lag_bytes: u64,
         last_wal_check_time: i64,
     };
 
-    /// Get a consistent snapshot of all metrics
+    /// Get a lock-free snapshot of all metrics
+    /// Note: snapshot may not be perfectly consistent (values read at slightly different times)
+    /// but this is acceptable for monitoring/observability use case
     pub fn snapshot(self: *Metrics, allocator: std.mem.Allocator) !Snapshot {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        // Read all atomics with monotonic ordering
+        const lsn = self.last_ack_lsn.load(.monotonic);
 
-        const lsn_str = try allocator.dupe(u8, self.current_lsn_hex[0..self.current_lsn_len]);
+        // Format LSN as hex string on-demand
+        var lsn_buf: [32]u8 = undefined;
+        const lsn_str = try std.fmt.bufPrint(&lsn_buf, "0/{x}", .{lsn});
+        const lsn_str_owned = try allocator.dupe(u8, lsn_str);
 
         return .{
             .uptime_seconds = std.time.timestamp() - self.start_time,
-            .wal_messages_received = self.wal_messages_received,
-            .cdc_events_published = self.cdc_events_published,
-            .last_ack_lsn = self.last_ack_lsn,
-            .current_lsn_str = lsn_str,
-            .is_connected = self.is_connected,
-            .reconnect_count = self.reconnect_count,
-            .last_reconnect_time = self.last_reconnect_time,
-            .last_processing_time_us = self.last_processing_time_us,
-            .slot_active = self.slot_active,
-            .wal_lag_bytes = self.wal_lag_bytes,
-            .last_wal_check_time = self.last_wal_check_time,
+            .wal_messages_received = self.wal_messages_received.load(.monotonic),
+            .cdc_events_published = self.cdc_events_published.load(.monotonic),
+            .last_ack_lsn = lsn,
+            .current_lsn_str = lsn_str_owned,
+            .is_connected = self.is_connected.load(.monotonic),
+            .reconnect_count = self.reconnect_count.load(.monotonic),
+            .last_reconnect_time = self.last_reconnect_time.load(.monotonic),
+            .slot_active = self.slot_active.load(.monotonic),
+            .wal_lag_bytes = self.wal_lag_bytes.load(.monotonic),
+            .last_wal_check_time = self.last_wal_check_time.load(.monotonic),
         };
     }
 };

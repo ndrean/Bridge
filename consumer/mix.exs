@@ -41,7 +41,8 @@ defmodule Consumer.MixProject do
       {:postgrex, "~> 0.21.1"},
       {:ecto_sql, "~> 3.13"},
       {:req, "~> 0.5"},
-      {:protobuf, "~> 0.15.0"}
+      {:protobuf, "~> 0.15.0"},
+      {:jason, "~> 1.4"}
     ]
   end
 

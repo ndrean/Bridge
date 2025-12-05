@@ -24,7 +24,7 @@ defmodule PgProducer do
   end
 
   def run_test() do
-    GenServer.call(__MODULE__, :run_test)
+    GenServer.call(__MODULE__, :crud_test)
   end
 
   @impl GenServer
@@ -111,8 +111,8 @@ defmodule PgProducer do
     {:reply, :ok, state}
   end
 
-  def handle_call(:run_test, _, {pid, _} = state) do
-    test(pid)
+  def handle_call(:crud_test, _, {pid, _} = state) do
+    crud_test(pid)
     {:reply, :ok, state}
   end
 
@@ -121,6 +121,7 @@ defmodule PgProducer do
       Postgrex.query!(pid, """
       CREATE TABLE IF NOT EXISTS #{name} (
         id SERIAL PRIMARY KEY,
+        uid UUID DEFAULT gen_random_uuid(),
         age INT,
         temperature FLOAT8,
         price NUMERIC(20,8),
@@ -150,8 +151,8 @@ defmodule PgProducer do
     :ok
   end
 
-  defp test(pid) do
-    insert_result =
+  defp crud_test(pid) do
+    %Postgrex.Result{command: :insert, rows: [[inserted_id]]} =
       Postgrex.query!(
         pid,
         """
@@ -166,17 +167,15 @@ defmodule PgProducer do
           "Sample text",
           ["tag1", "tag2"],
           [[1, 2], [3, 4]],
-          ~s({"key_1":"value_1","key_2":[1,2],"key_3":{"key_4":"value_4","key_5":"value_5"}}),
+          ~s({"key_1":"value_1","key_2":{{1,2}, {3,4}, {5,6}},"key_3":{"key_4":"value_4","key_5":"value_5"}}),
           Decimal.new("123.45")
         ]
       )
 
-    [[inserted_id]] = insert_result.rows
-
-    %Postgrex.Result{} =
+    %Postgrex.Result{command: :select, rows: [[^inserted_id | _]]} =
       Postgrex.query!(pid, "SELECT * FROM test_types WHERE id = $1", [inserted_id])
 
-    %Postgrex.Result{} =
+    %Postgrex.Result{command: :update, rows: [[^inserted_id | _]]} =
       Postgrex.query!(
         pid,
         """
@@ -191,7 +190,8 @@ defmodule PgProducer do
         [31, 37.0, false, Decimal.new("122.9905"), inserted_id]
       )
 
-    Postgrex.query!(pid, "DELETE FROM test_types WHERE id = $1", [inserted_id])
+    %Postgrex.Result{command: :delete} =
+      Postgrex.query!(pid, "DELETE FROM test_types WHERE id = $1", [inserted_id])
   end
 end
 
