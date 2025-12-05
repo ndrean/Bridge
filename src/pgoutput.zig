@@ -5,9 +5,48 @@ const numeric_mod = @import("numeric.zig");
 
 pub const log = std.log.scoped(.pgoutput);
 
-/// Helper: Check if a year is a leap year
-inline fn isLeapYear(year: i32) bool {
-    return (@rem(year, 4) == 0 and @rem(year, 100) != 0) or (@rem(year, 400) == 0);
+/// Convert days since Unix epoch (1970-01-01) to civil calendar date (year, month, day)
+///
+/// This uses the proleptic Gregorian calendar algorithm from Howard Hinnant's date library,
+/// which is what PostgreSQL uses internally for efficient date arithmetic.
+///
+/// Algorithm: http://howardhinnant.github.io/date_algorithms.html#civil_from_days
+inline fn civilFromDays(z: i64) struct { year: i32, month: u8, day: u8 } {
+    // Shift epoch from 1970-01-01 to 0000-03-01 (March 1, year 0)
+    // This makes leap day the last day of the year for simpler arithmetic
+    const z2 = z + 719468;
+
+    // An "era" is a 400-year cycle (146097 days) in the Gregorian calendar
+    const era = @divFloor(z2, 146097);
+    const doe = @as(u32, @intCast(z2 - era * 146097)); // Day of era [0, 146096]
+
+    // Year of era [0, 399]
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+
+    // Compute year: cast era to i32 then multiply
+    const y = @as(i32, @intCast(yoe)) + @as(i32, @intCast(era)) * 400;
+
+    // Day of year [0, 365]
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+
+    // Month pointer: [0=Mar, 1=Apr, ..., 9=Dec, 10=Jan, 11=Feb]
+    const mp = @divFloor(5 * doy + 2, 153);
+
+    // Day of month [1, 31]
+    const d = @as(u8, @intCast(doy - @divFloor(153 * mp + 2, 5) + 1));
+
+    // Convert month pointer to civil month [1=Jan, ..., 12=Dec]
+    // mp: [0=Mar, 1=Apr, ..., 9=Dec, 10=Jan, 11=Feb]
+    const m: u8 = if (mp < 10) @intCast(mp + 3) else @intCast(mp - 9);
+
+    // Adjust year for Jan/Feb (they belong to the next year in our shifted calendar)
+    const year = y + @as(i32, if (m <= 2) 1 else 0);
+
+    return .{
+        .year = year,
+        .month = m,
+        .day = d,
+    };
 }
 
 /// pgoutput protocol parser
@@ -119,17 +158,13 @@ pub const Column = struct {
 
 /// Decodes the raw bytes based on the PostgreSQL type OID (BINARY format).
 ///
-/// This version handles binary-encoded data from PostgreSQL when using
+/// Decodes binary-encoded column data from PostgreSQL when using
 /// START_REPLICATION with binary 'true'.
-/// Returns the same DecodedValue types as decodeColumnData() for compatibility.
 pub fn decodeBinColumnData(
     allocator: std.mem.Allocator,
     type_id: u32,
     raw_bytes: []const u8,
 ) !DecodedValue {
-
-    // _ = @import("jsonb.zig"); // TODO: Use when implementing JSONB binary parsing
-
     const oid: PgOid = @enumFromInt(type_id);
 
     return switch (oid) {
@@ -177,39 +212,19 @@ pub fn decodeBinColumnData(
             const pg_days = std.mem.readInt(i32, raw_bytes[0..4], .big);
 
             // PostgreSQL epoch: 2000-01-01
-            // Convert to Unix timestamp then to date components
+            // Convert to Unix epoch (1970-01-01)
             const PG_EPOCH_DAYS: i64 = 10957; // Days between 1970-01-01 and 2000-01-01
-            const total_unix_days = @as(i64, @intCast(pg_days)) + PG_EPOCH_DAYS;
+            const unix_days = @as(i64, pg_days) + PG_EPOCH_DAYS;
 
-            // Simple date calculation (accounts for leap years)
-            var days = total_unix_days;
-            var year: i32 = 1970;
-
-            // Count years
-            while (true) {
-                const days_in_year: i64 = if (isLeapYear(year)) 366 else 365;
-                if (days < days_in_year) break;
-                days -= days_in_year;
-                year += 1;
-            }
-
-            // Count months
-            const is_leap = isLeapYear(year);
-            const month_days = [12]i32{ 31, if (is_leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-            var month: i32 = 1;
-            for (month_days) |month_len| {
-                if (days < month_len) break;
-                days -= month_len;
-                month += 1;
-            }
-            const day: i32 = @intCast(days + 1);
+            // Use efficient civil calendar algorithm
+            const date = civilFromDays(unix_days);
 
             // Format as YYYY-MM-DD (always 10 chars)
             var buf: [16]u8 = undefined;
             _ = try std.fmt.bufPrint(
                 &buf,
                 "{d:0>4}-{d:0>2}-{d:0>2}",
-                .{ @as(u32, @intCast(year)), @as(u32, @intCast(month)), @as(u32, @intCast(day)) },
+                .{ @as(u32, @intCast(date.year)), date.month, date.day },
             );
 
             return .{ .text = try allocator.dupe(u8, buf[0..10]) };
@@ -225,39 +240,19 @@ pub fn decodeBinColumnData(
             // PostgreSQL epoch: 2000-01-01 00:00:00 UTC
             const PG_EPOCH_SECONDS: i64 = 946684800;
 
-            // Convert PG microsecs to Unix seconds
+            // Convert PG microseconds to Unix seconds and extract remaining microseconds
             const total_seconds = PG_EPOCH_SECONDS + @divFloor(microseconds, 1_000_000);
             const remaining_micros: u32 = @intCast(@abs(@mod(microseconds, 1_000_000)));
 
-            // Manual datetime calculation
-            var seconds = total_seconds;
-            var year: i32 = 1970;
+            // Convert to days for date calculation
+            const unix_days = @divFloor(total_seconds, 86400);
+            const date = civilFromDays(unix_days);
 
-            // Count years
-            while (true) {
-                const seconds_in_year: i64 = if (isLeapYear(year)) 366 * 86400 else 365 * 86400;
-                if (seconds < seconds_in_year) break;
-                seconds -= seconds_in_year;
-                year += 1;
-            }
-
-            // Count months
-            const is_leap = isLeapYear(year);
-            const month_days = [12]i32{ 31, if (is_leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-            var month: i32 = 1;
-            for (month_days) |month_len| {
-                const seconds_in_month: i64 = @as(i64, month_len) * 86400;
-                if (seconds < seconds_in_month) break;
-                seconds -= seconds_in_month;
-                month += 1;
-            }
-
-            const day: i32 = @intCast(@divFloor(seconds, 86400) + 1);
-            seconds = @mod(seconds, 86400);
-            const hour: i32 = @intCast(@divFloor(seconds, 3600));
-            seconds = @mod(seconds, 3600);
-            const minute: i32 = @intCast(@divFloor(seconds, 60));
-            const second: i32 = @intCast(@mod(seconds, 60));
+            // Extract time-of-day from remaining seconds
+            const day_seconds = @mod(total_seconds, 86400);
+            const hour = @divFloor(day_seconds, 3600);
+            const minute = @divFloor(@mod(day_seconds, 3600), 60);
+            const second = @mod(day_seconds, 60);
 
             // Format as ISO 8601: 2025-10-26T10:00:00.000000Z (always 27 chars)
             var buf: [32]u8 = undefined;
@@ -265,12 +260,12 @@ pub fn decodeBinColumnData(
                 &buf,
                 "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}Z",
                 .{
-                    @as(u32, @intCast(year)),
-                    @as(u32, @intCast(month)),
-                    @as(u32, @intCast(day)),
-                    @as(u32, @intCast(hour)),
-                    @as(u32, @intCast(minute)),
-                    @as(u32, @intCast(second)),
+                    @as(u32, @intCast(date.year)),
+                    date.month,
+                    date.day,
+                    @as(u8, @intCast(hour)),
+                    @as(u8, @intCast(minute)),
+                    @as(u8, @intCast(second)),
                     remaining_micros,
                 },
             );
@@ -302,13 +297,18 @@ pub fn decodeBinColumnData(
         .TEXT,
         .VARCHAR,
         .BPCHAR,
-        .BYTEA,
         .JSON,
         => {
             // raw_bytes is from readBytes() which uses arena_allocator
             // We need to dupe with main_allocator so it survives arena cleanup
             const owned = try allocator.dupe(u8, raw_bytes);
             return .{ .text = owned };
+        },
+        .BYTEA => {
+            // raw_bytes is from readBytes() which uses arena_allocator
+            // We need to dupe with main_allocator so it survives arena cleanup
+            const owned = try allocator.dupe(u8, raw_bytes);
+            return .{ .bytea = owned };
         },
 
         // --- NUMERIC (Binary format - use numeric.zig) ---
@@ -317,21 +317,10 @@ pub fn decodeBinColumnData(
             // parseNumeric returns NumericResult { .slice, .allocated }
             // where .slice is a sub-slice of .allocated pointing to the actual data
             //
-            // The issue with dupe+free was that we were freeing result.allocated
-            // immediately after duping result.slice, which could cause issues.
-            //
-            // Better approach: Use realloc to shrink the buffer to exact size.
-            // This avoids the dupe+free dance and is more efficient.
-            const exact_size = result.slice.len;
-            if (allocator.resize(result.allocated, exact_size)) {
-                // Resize succeeded in-place
-                return .{ .numeric = result.allocated[0..exact_size] };
-            } else {
-                // Need to allocate new buffer
-                const owned = try allocator.dupe(u8, result.slice);
-                allocator.free(result.allocated);
-                return .{ .numeric = owned };
-            }
+            // We dupe the slice and free the original buffer
+            const owned = try allocator.dupe(u8, result.slice);
+            allocator.free(result.allocated);
+            return .{ .numeric = owned };
         },
 
         // // --- JSON (text format even in binary mode) ---
@@ -443,129 +432,6 @@ fn arrayToText(allocator: std.mem.Allocator, arr: @import("array.zig").ArrayResu
     return buffer.toOwnedSlice(allocator);
 }
 
-/// Decodes the raw bytes based on the PostgreSQL type OID (TEXT format).
-///
-/// Note: pgoutput sends data in TEXT format by default, not binary!
-/// raw_bytes contains the UTF-8 text representation of the value.
-pub fn decodeColumnData(
-    _: std.mem.Allocator,
-    type_id: u32,
-    raw_bytes: []const u8,
-) !DecodedValue {
-    // What if type_id is not in PgOid?
-    const oid: PgOid = @enumFromInt(type_id);
-    // catch {
-    //     // Fallback for unsupported OIDs (e.g., arrays, custom types, numeric)
-    //     return error.UnsupportedType;
-    // };
-
-    return switch (oid) {
-        // --- 1. Fixed-Width Types (Simple reads) ----------------------
-
-        // BOOL - text format is "t" or "f"
-        .BOOL => {
-            if (raw_bytes.len == 0) return error.InvalidDataLength;
-            return .{ .boolean = raw_bytes[0] == 't' };
-        },
-
-        // INT2 - parse text as integer
-        .INT2 => {
-            const val = try std.fmt.parseInt(i16, raw_bytes, 10);
-            return .{ .int32 = @intCast(val) };
-        },
-
-        // INT4 - parse text as integer
-        .INT4 => {
-            const val = try std.fmt.parseInt(i32, raw_bytes, 10);
-            return .{ .int32 = val };
-        },
-
-        // INT8 - parse text as integer
-        .INT8 => {
-            const val = try std.fmt.parseInt(i64, raw_bytes, 10);
-            return .{ .int64 = val };
-        },
-
-        // TIMESTAMPTZ - parse text timestamp
-        .TIMESTAMPTZ => {
-            // PostgreSQL text format for timestamptz: "2025-11-30 20:13:29.377405+00"
-            // For now, text representation
-            // TODO: Parse into actual timestamp
-            return .{ .text = raw_bytes };
-        },
-
-        // FLOAT8 - parse text as float
-        .FLOAT8 => {
-            const val = try std.fmt.parseFloat(f64, raw_bytes);
-            return .{ .float64 = val };
-        },
-
-        // DATE - parse text date "YYYY-MM-DD"
-        .DATE => {
-            // For now, text representation
-            // TODO: Parse into days since 2000-01-01
-            return .{ .text = raw_bytes };
-        },
-
-        // UUID - text format is "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-        .UUID => {
-            // pgoutput sends UUID in text format, already formatted
-            return .{ .text = raw_bytes };
-        },
-
-        // --- 2. Variable-Length Types (The raw bytes are the value) ---
-
-        // TEXT, VARCHAR, BPCHAR. The bytes are already the UTF-8 text string.
-        .TEXT, .VARCHAR, .BPCHAR => {
-            // Note: The bytes retrieved by parseTupleData are already a dynamically allocated slice
-            // of the text content (assuming it's not TOASTed/unchanged, which current code handles).
-            return .{ .text = raw_bytes };
-        },
-
-        // BYTEA. The bytes are the raw binary content.
-        .BYTEA => {
-            return .{ .text = raw_bytes }; // Representing as raw byte slice
-        },
-
-        // --- 3. Complex Types (TEXT format) ---------------------------------
-
-        // JSONB - text format is already JSON string
-        .JSONB => {
-            return .{ .jsonb = raw_bytes };
-        },
-
-        // NUMERIC - text format is decimal string like "123.456"
-        .NUMERIC => {
-            return .{ .numeric = raw_bytes };
-        },
-
-        // --- 4. Array Types (TEXT format) -----------------------------------
-        // PostgreSQL text array format: {val1,val2,val3} or {{1,2},{3,4}}
-
-        .ARRAY_INT2,
-        .ARRAY_INT4,
-        .ARRAY_INT8,
-        .ARRAY_TEXT,
-        .ARRAY_VARCHAR,
-        .ARRAY_FLOAT4,
-        .ARRAY_FLOAT8,
-        .ARRAY_BOOL,
-        .ARRAY_JSONB,
-        .ARRAY_NUMERIC,
-        .ARRAY_UUID,
-        .ARRAY_TIMESTAMPTZ,
-        => {
-            // Arrays in TEXT format come as PostgreSQL text representation
-            // Examples: {1,2,3}, {"a","b","c"}, {{1,2},{3,4}}
-            return .{ .array = raw_bytes };
-        },
-
-        // --- 5. Unsupported Types -------------------------------------------
-
-        else => return error.UnsupportedType,
-    };
-}
-
 pub const RelationMessage = struct {
     relation_id: u32,
     namespace: []const u8,
@@ -589,25 +455,33 @@ pub const RelationMessage = struct {
         allocator.free(self.columns);
     }
 
-    pub fn clone(self: RelationMessage, allocator: std.mem.Allocator) !RelationMessage {
-        const cloned_namespace = try allocator.dupe(u8, self.namespace);
-        errdefer allocator.free(cloned_namespace);
+    pub fn clone(self: *const RelationMessage, allocator: std.mem.Allocator) !*RelationMessage {
+        var out = try allocator.create(RelationMessage);
+        errdefer allocator.destroy(out);
 
-        const cloned_name = try allocator.dupe(u8, self.name);
-        errdefer allocator.free(cloned_name);
+        out.* = self.*;
 
-        const cloned_columns = try allocator.alloc(ColumnInfo, self.columns.len);
-        errdefer allocator.free(cloned_columns);
+        // Deep copy namespace
+        out.namespace = try allocator.dupe(u8, self.namespace);
+        errdefer allocator.free(out.namespace);
+
+        // Deep copy name
+        out.name = try allocator.dupe(u8, self.name);
+        errdefer allocator.free(out.name);
+
+        // Deep copy columns array
+        out.columns = try allocator.alloc(ColumnInfo, self.columns.len);
+        errdefer allocator.free(out.columns);
 
         for (self.columns, 0..) |col, i| {
             const cloned_col_name = try allocator.dupe(u8, col.name);
             errdefer {
                 // Free previously cloned column names on error
-                for (cloned_columns[0..i]) |c| {
+                for (out.columns[0..i]) |c| {
                     allocator.free(c.name);
                 }
             }
-            cloned_columns[i] = ColumnInfo{
+            out.columns[i] = ColumnInfo{
                 .flags = col.flags,
                 .name = cloned_col_name,
                 .type_id = col.type_id,
@@ -615,13 +489,7 @@ pub const RelationMessage = struct {
             };
         }
 
-        return RelationMessage{
-            .relation_id = self.relation_id,
-            .namespace = cloned_namespace,
-            .name = cloned_name,
-            .replica_identity = self.replica_identity,
-            .columns = cloned_columns,
-        };
+        return out;
     }
 };
 
@@ -741,6 +609,9 @@ pub const Parser = struct {
         };
     }
 
+    /// Parse the next pgoutput message from the data based on message type
+    ///
+    /// Source: https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-MESSAGE-TYPE
     pub fn parse(self: *Parser) !PgOutputMessage {
         if (self.pos >= self.data.len) {
             return error.EndOfData;
@@ -766,6 +637,7 @@ pub const Parser = struct {
         };
     }
 
+    // https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-BEGIN
     fn parseBegin(self: *Parser) !BeginMessage {
         const final_lsn = try self.readU64();
         const timestamp = try self.readI64();
@@ -778,6 +650,7 @@ pub const Parser = struct {
         };
     }
 
+    // https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-COMMIT
     fn parseCommit(self: *Parser) !CommitMessage {
         const flags = try self.readU8();
         const commit_lsn = try self.readU64();
@@ -792,6 +665,7 @@ pub const Parser = struct {
         };
     }
 
+    // https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-RELATION
     fn parseRelation(self: *Parser) !RelationMessage {
         const relation_id = try self.readU32();
         const namespace = try self.readString();
@@ -799,8 +673,11 @@ pub const Parser = struct {
         const replica_identity = try self.readU8();
         const num_columns = try self.readU16();
 
-        var columns = try self.allocator.alloc(RelationMessage.ColumnInfo, num_columns);
-        errdefer self.allocator.free(columns);
+        var columns_ptr = try self.allocator.alloc(
+            RelationMessage.ColumnInfo,
+            num_columns,
+        );
+        errdefer self.allocator.free(columns_ptr);
 
         var i: usize = 0;
         while (i < num_columns) : (i += 1) {
@@ -809,7 +686,7 @@ pub const Parser = struct {
             const type_id = try self.readU32();
             const type_modifier = try self.readI32();
 
-            columns[i] = .{
+            columns_ptr[i] = .{
                 .flags = flags,
                 .name = col_name,
                 .type_id = type_id,
@@ -822,10 +699,11 @@ pub const Parser = struct {
             .namespace = namespace,
             .name = name,
             .replica_identity = replica_identity,
-            .columns = columns,
+            .columns = columns_ptr[0..num_columns],
         };
     }
 
+    // https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-INSERT
     fn parseInsert(self: *Parser) !InsertMessage {
         const relation_id = try self.readU32();
         const tuple_type = try self.readU8();
@@ -843,15 +721,29 @@ pub const Parser = struct {
         };
     }
 
+    // https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-UPDATE
     fn parseUpdate(self: *Parser) !UpdateMessage {
         const relation_id = try self.readU32();
         const key_or_old = try self.readU8();
 
         var old_tuple: ?TupleData = null;
+
         if (key_or_old == 'K' or key_or_old == 'O') {
+            // 'K' = old key tuple, 'O' = old full tuple
             old_tuple = try self.parseTupleData();
-            _ = try self.readU8(); // Read 'N' for new tuple
+
+            // After old tuple, next byte MUST be 'N' for new tuple
+            const new_marker = try self.readU8();
+            if (new_marker != 'N') {
+                log.warn("Expected 'N' (new tuple) after old tuple, got: {c} (0x{x})", .{ new_marker, new_marker });
+                return error.InvalidTupleType;
+            }
+        } else if (key_or_old != 'N') {
+            // If not 'K', 'O', or 'N', this is invalid
+            log.warn("Invalid UPDATE tuple marker: {c} (0x{x}), expected 'K', 'O', or 'N'", .{ key_or_old, key_or_old });
+            return error.InvalidTupleType;
         }
+        // else: key_or_old == 'N', no old tuple, proceed directly to new tuple
 
         const new_tuple = try self.parseTupleData();
 
@@ -862,6 +754,7 @@ pub const Parser = struct {
         };
     }
 
+    // https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-DELETE
     fn parseDelete(self: *Parser) !DeleteMessage {
         const relation_id = try self.readU32();
         const key_or_old = try self.readU8();
@@ -879,6 +772,7 @@ pub const Parser = struct {
         };
     }
 
+    // https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-ORIGIN
     fn parseOrigin(self: *Parser) !OriginMessage {
         const commit_lsn = try self.readU64();
         const name = try self.readString();
@@ -889,6 +783,7 @@ pub const Parser = struct {
         };
     }
 
+    // https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-TYPE
     fn parseType(self: *Parser) !TypeMessage {
         const type_id = try self.readU32();
         const namespace = try self.readString();
@@ -901,6 +796,7 @@ pub const Parser = struct {
         };
     }
 
+    // https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-TRUNCATE
     fn parseTruncate(self: *Parser) !TruncateMessage {
         const options = try self.readU8();
         const num_relations = try self.readU32();
@@ -919,7 +815,7 @@ pub const Parser = struct {
         };
     }
 
-    /// Parse tuple data
+    // https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-TUPLEDATA
     fn parseTupleData(self: *Parser) !TupleData {
         const num_columns = try self.readU16();
         var columns = try self.allocator.alloc(?[]const u8, num_columns);
@@ -956,8 +852,6 @@ pub const Parser = struct {
         return TupleData{ .columns = columns };
     }
 
-    // Low-level read functions
-
     /// Read a single byte
     fn readU8(self: *Parser) !u8 {
         if (self.pos >= self.data.len) {
@@ -973,7 +867,8 @@ pub const Parser = struct {
         if (self.pos + 2 > self.data.len) {
             return error.UnexpectedEndOfData;
         }
-        const val = std.mem.readInt(u16, self.data[self.pos..][0..2], .big);
+        const array_ptr = self.data[self.pos..][0..2];
+        const val = std.mem.readInt(u16, array_ptr, .big);
         self.pos += 2;
         return val;
     }

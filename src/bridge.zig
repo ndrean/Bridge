@@ -376,10 +376,11 @@ pub fn main() !void {
                             .relation => |rel| {
                                 // Relations persist in the map, so clone with main allocator
                                 // (arena will be destroyed at end of scope)
-                                const cloned_rel = try rel.clone(allocator);
+                                const cloned_rel_ptr = try rel.clone(allocator);
+                                defer allocator.destroy(cloned_rel_ptr);
 
                                 // If relation already exists, free the old one first
-                                const result = try relation_map.fetchPut(cloned_rel.relation_id, cloned_rel);
+                                const result = try relation_map.fetchPut(cloned_rel_ptr.relation_id, cloned_rel_ptr.*);
                                 if (result) |old_entry| {
                                     var old_rel = old_entry.value;
                                     old_rel.deinit(allocator);

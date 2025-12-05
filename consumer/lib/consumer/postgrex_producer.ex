@@ -1,6 +1,7 @@
 defmodule PgProducer do
   use GenServer
   require Logger
+  alias Decimal
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -150,11 +151,47 @@ defmodule PgProducer do
   end
 
   defp test(pid) do
+    insert_result =
+      Postgrex.query!(
+        pid,
+        """
+        INSERT INTO test_types (age, temperature, is_true, some_text, tags, matrix, metadata, price)
+        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+        RETURNING id;
+        """,
+        [
+          30,
+          36.6,
+          true,
+          "Sample text",
+          ["tag1", "tag2"],
+          [[1, 2], [3, 4]],
+          ~s({"key_1":"value_1","key_2":[1,2],"key_3":{"key_4":"value_4","key_5":"value_5"}}),
+          Decimal.new("123.45")
+        ]
+      )
+
+    [[inserted_id]] = insert_result.rows
+
     %Postgrex.Result{} =
-      Postgrex.query!(pid, """
-      INSERT INTO test_types (age, temperature, is_true, some_text, tags, matrix, metadata, price)
-      VALUES (30, 36.6, true, 'Sample text', ARRAY['tag1', 'tag2'], ARRAY[[1,2],[3,4]], '{"key_1": "value_1",  "key_2": [1,2], "key_3": {"key_4": "value_4", "key_5": "value_5"}}'::jsonb, 123.45);
-      """)
+      Postgrex.query!(pid, "SELECT * FROM test_types WHERE id = $1", [inserted_id])
+
+    %Postgrex.Result{} =
+      Postgrex.query!(
+        pid,
+        """
+        UPDATE test_types
+           SET age = $1,
+               temperature = $2,
+               is_true = $3,
+               price = $4
+         WHERE id = $5
+        RETURNING id;
+        """,
+        [31, 37.0, false, Decimal.new("122.9905"), inserted_id]
+      )
+
+    Postgrex.query!(pid, "DELETE FROM test_types WHERE id = $1", [inserted_id])
   end
 end
 
