@@ -2,8 +2,21 @@ const std = @import("std");
 const nats_publisher = @import("nats_publisher.zig");
 const pgoutput = @import("pgoutput.zig");
 const msgpack = @import("msgpack");
+const c = @cImport({
+    @cInclude("libpq-fe.h");
+});
+const pg_conn = @import("pg_conn.zig");
 
 pub const log = std.log.scoped(.schema_publisher);
+
+/// Column information from information_schema
+const ColumnInfo = struct {
+    name: []const u8,
+    position: u32,
+    data_type: []const u8,
+    is_nullable: bool,
+    column_default: ?[]const u8,
+};
 
 /// Schema version tracker - uses relation_id as natural version number
 pub const SchemaCache = struct {
@@ -141,4 +154,234 @@ pub fn publishSchema(
     try publisher.flushAsync();
 
     log.info("✅ Schema published: {s} ({d} columns)", .{ relation.name, relation.columns.len });
+}
+
+/// Query and publish initial schemas for all tables to INIT stream
+/// This runs once at bridge startup to ensure consumers have schema information
+pub fn publishInitialSchemas(
+    allocator: std.mem.Allocator,
+    pg_config: *const pg_conn.PgConf,
+    publisher: *nats_publisher.Publisher,
+) !void {
+    log.info("📋 Querying and publishing initial schemas to INIT stream...", .{});
+
+    // Create a separate PostgreSQL connection (NOT replication mode)
+    const conninfo = try pg_config.connInfo(allocator, false);
+    defer allocator.free(conninfo);
+
+    const conn = c.PQconnectdb(conninfo.ptr);
+    if (conn == null) {
+        log.err("Failed to connect to PostgreSQL for schema query", .{});
+        return error.ConnectionFailed;
+    }
+    defer c.PQfinish(conn);
+
+    if (c.PQstatus(conn) != c.CONNECTION_OK) {
+        const err_msg = c.PQerrorMessage(conn);
+        log.err("PostgreSQL connection failed: {s}", .{err_msg});
+        return error.ConnectionFailed;
+    }
+
+    // Query information_schema to get all tables and their columns
+    const query =
+        \\SELECT
+        \\    t.table_schema,
+        \\    t.table_name,
+        \\    c.column_name,
+        \\    c.ordinal_position,
+        \\    c.data_type,
+        \\    c.is_nullable,
+        \\    c.column_default
+        \\FROM information_schema.tables t
+        \\JOIN information_schema.columns c
+        \\    ON t.table_schema = c.table_schema
+        \\    AND t.table_name = c.table_name
+        \\WHERE t.table_schema = 'public'
+        \\    AND t.table_type = 'BASE TABLE'
+        \\ORDER BY t.table_name, c.ordinal_position
+    ;
+
+    const result = c.PQexec(conn, query.ptr);
+    defer c.PQclear(result);
+
+    if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
+        const err_msg = c.PQerrorMessage(conn);
+        log.err("Schema query failed: {s}", .{err_msg});
+        return error.QueryFailed;
+    }
+
+    const num_rows = c.PQntuples(result);
+    if (num_rows == 0) {
+        log.warn("No tables found in public schema", .{});
+        return;
+    }
+
+    // Group columns by table
+    var table_schemas = std.StringHashMap(std.ArrayList(ColumnInfo)).init(allocator);
+    defer {
+        var it = table_schemas.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(allocator);
+        }
+        table_schemas.deinit();
+    }
+
+    // Parse rows and group by table
+    for (0..@intCast(num_rows)) |i| {
+        const table_schema = std.mem.span(c.PQgetvalue(result, @intCast(i), 0));
+        const table_name = std.mem.span(c.PQgetvalue(result, @intCast(i), 1));
+        const column_name = std.mem.span(c.PQgetvalue(result, @intCast(i), 2));
+        const position_str = std.mem.span(c.PQgetvalue(result, @intCast(i), 3));
+        const data_type = std.mem.span(c.PQgetvalue(result, @intCast(i), 4));
+        const is_nullable_str = std.mem.span(c.PQgetvalue(result, @intCast(i), 5));
+        const column_default_ptr = c.PQgetvalue(result, @intCast(i), 6);
+
+        const position = try std.fmt.parseInt(u32, position_str, 10);
+        const is_nullable = std.mem.eql(u8, is_nullable_str, "YES");
+        const column_default = if (c.PQgetisnull(result, @intCast(i), 6) == 1)
+            null
+        else
+            std.mem.span(column_default_ptr);
+
+        // Build full table name: schema.table
+        const full_table_name = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ table_schema, table_name });
+
+        // Get or create column list for this table
+        const entry = try table_schemas.getOrPut(full_table_name);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = std.ArrayList(ColumnInfo){};
+        } else {
+            allocator.free(full_table_name); // Already have this key
+        }
+
+        try entry.value_ptr.append(allocator, .{
+            .name = try allocator.dupe(u8, column_name),
+            .position = position,
+            .data_type = try allocator.dupe(u8, data_type),
+            .is_nullable = is_nullable,
+            .column_default = if (column_default) |d| try allocator.dupe(u8, d) else null,
+        });
+    }
+
+    // Publish each table's schema to init.{table}.schema
+    var it = table_schemas.iterator();
+    while (it.next()) |entry| {
+        const table_name = entry.key_ptr.*;
+        const columns = entry.value_ptr.*;
+        defer {
+            for (columns.items) |col| {
+                allocator.free(col.name);
+                allocator.free(col.data_type);
+                if (col.column_default) |d| allocator.free(d);
+            }
+        }
+
+        try publishTableSchema(allocator, publisher, table_name, columns.items);
+    }
+
+    log.info("✅ Published initial schemas for {d} tables", .{table_schemas.count()});
+}
+
+/// Publish a single table's schema to init.{table}.schema
+fn publishTableSchema(
+    allocator: std.mem.Allocator,
+    publisher: *nats_publisher.Publisher,
+    table_name: []const u8,
+    columns: []const ColumnInfo,
+) !void {
+    // Extract just the table name (remove schema prefix if present)
+    const table_only = blk: {
+        if (std.mem.indexOf(u8, table_name, ".")) |idx| {
+            break :blk table_name[idx + 1 ..];
+        }
+        break :blk table_name;
+    };
+
+    // Build subject: init.{table}.schema
+    const subject = try std.fmt.allocPrint(
+        allocator,
+        "init.{s}.schema\x00",
+        .{table_only},
+    );
+    defer allocator.free(subject);
+    const subject_z: [:0]const u8 = subject[0 .. subject.len - 1 :0];
+
+    // Build MessagePack payload with schema info
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(allocator);
+
+    const ArrayListStream = struct {
+        list: *std.ArrayList(u8),
+        allocator: std.mem.Allocator,
+
+        const WriteError = std.mem.Allocator.Error;
+        const ReadError = error{};
+
+        pub fn write(self: *@This(), bytes: []const u8) WriteError!usize {
+            try self.list.appendSlice(self.allocator, bytes);
+            return bytes.len;
+        }
+
+        pub fn read(self: *@This(), out: []u8) ReadError!usize {
+            _ = self;
+            _ = out;
+            return 0;
+        }
+    };
+
+    var write_stream = ArrayListStream{ .list = &buffer, .allocator = allocator };
+    var read_stream = ArrayListStream{ .list = &buffer, .allocator = allocator };
+
+    var packer = msgpack.Pack(
+        *ArrayListStream,
+        *ArrayListStream,
+        ArrayListStream.WriteError,
+        ArrayListStream.ReadError,
+        ArrayListStream.write,
+        ArrayListStream.read,
+    ).init(&write_stream, &read_stream);
+
+    var schema_map = msgpack.Payload.mapPayload(allocator);
+    defer schema_map.free(allocator);
+
+    // Add schema fields
+    try schema_map.mapPut("table", try msgpack.Payload.strToPayload(table_only, allocator));
+    try schema_map.mapPut("schema", try msgpack.Payload.strToPayload(table_name, allocator));
+    try schema_map.mapPut("timestamp", msgpack.Payload{ .int = std.time.timestamp() });
+
+    // Add columns array
+    var columns_array = try msgpack.Payload.arrPayload(columns.len, allocator);
+    for (columns, 0..) |col, i| {
+        var col_map = msgpack.Payload.mapPayload(allocator);
+        try col_map.mapPut("name", try msgpack.Payload.strToPayload(col.name, allocator));
+        try col_map.mapPut("position", msgpack.Payload{ .int = @intCast(col.position) });
+        try col_map.mapPut("data_type", try msgpack.Payload.strToPayload(col.data_type, allocator));
+        try col_map.mapPut("is_nullable", msgpack.Payload{ .bool = col.is_nullable });
+
+        if (col.column_default) |default_val| {
+            try col_map.mapPut("column_default", try msgpack.Payload.strToPayload(default_val, allocator));
+        } else {
+            try col_map.mapPut("column_default", msgpack.Payload{ .nil = {} });
+        }
+
+        columns_array.arr[i] = col_map;
+    }
+    try schema_map.mapPut("columns", columns_array);
+
+    try packer.write(schema_map);
+    const encoded = buffer.items;
+
+    // Publish to INIT stream
+    const msg_id_buf = try std.fmt.allocPrint(
+        allocator,
+        "init-schema-{s}",
+        .{table_only},
+    );
+    defer allocator.free(msg_id_buf);
+
+    try publisher.publish(subject_z, encoded, msg_id_buf);
+    try publisher.flushAsync();
+
+    log.info("📋 Published initial schema → {s} ({d} columns)", .{ subject_z, columns.len });
 }

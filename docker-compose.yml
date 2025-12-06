@@ -66,6 +66,9 @@ services:
         echo 'Creating NATS JetStream stream: SCHEMA'
         nats stream add SCHEMA --server=nats://nats-server:4222 --subjects='schema.>' --storage=file --retention=limits --max-msgs=1000 --max-bytes=10M --replicas=1 --defaults
         echo 'Stream SCHEMA created successfully'
+        echo 'Creating NATS JetStream stream: INIT'
+        nats stream add INIT --server=nats://nats-server:4222 --subjects='init.>' --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=100G --replicas=1 --defaults
+        echo 'Stream INIT created successfully'
     restart: "no"
 
 volumes:

@@ -14,6 +14,7 @@ const wal_monitor = @import("wal_monitor.zig");
 const pg_conn = @import("pg_conn.zig");
 const args = @import("args.zig");
 const schema_publisher = @import("schema_publisher.zig");
+const snapshot_listener = @import("snapshot_listener.zig");
 
 pub const log = std.log.scoped(.bridge);
 
@@ -241,7 +242,7 @@ pub fn main() !void {
     );
     defer monitor_thread.join();
 
-    // 3. Connect to NATS JetStream
+    // 3. Connect to NATS JetStream (needed by snapshot listener)
     log.info("\nConnecting to NATS JetStream...", .{});
     var publisher = try nats_publisher.Publisher.init(allocator, .{
         .url = "nats://localhost:4222",
@@ -260,6 +261,19 @@ pub fn main() !void {
     var schema_cache = schema_publisher.SchemaCache.init(allocator);
     defer schema_cache.deinit();
     log.info("✅ Schema cache initialized\n", .{});
+
+    // Publish initial schemas to INIT stream
+    try schema_publisher.publishInitialSchemas(allocator, &pg_config, &publisher);
+
+    // 4. Start snapshot listener in background thread
+    log.info("Starting snapshot listener thread...", .{});
+    const snapshot_thread = try std.Thread.spawn(
+        .{},
+        snapshot_listener.listenForSnapshotRequests,
+        .{ allocator, &pg_config, &publisher, &should_stop },
+    );
+    defer snapshot_thread.join();
+    log.info("✅ Snapshot listener thread started\n", .{});
 
     // Find CDC stream for subject pattern generation
     // CDC events are published to subjects like "cdc.table.operation"
