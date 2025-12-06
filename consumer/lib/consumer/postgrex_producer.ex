@@ -167,7 +167,11 @@ defmodule PgProducer do
           "Sample text",
           ["tag1", "tag2"],
           [[1, 2], [3, 4]],
-          ~s({"key_1":"value_1","key_2":{{1,2}, {3,4}, {5,6}},"key_3":{"key_4":"value_4","key_5":"value_5"}}),
+          Jason.encode!(%{
+            "key_1" => "value_1",
+            "key_2" => [[1, 2], [3, 4], [5, 6]],
+            "key_3" => %{"key_4" => "value_4", "key_5" => "value_5"}
+          }),
           Decimal.new("123.45")
         ]
       )

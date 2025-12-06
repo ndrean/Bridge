@@ -165,6 +165,7 @@ pub const AsyncBatchPublisher = struct {
 
         // Persistent batch that accumulates events across iterations
         var batch = std.ArrayList(batch_publisher.CDCEvent){};
+        var current_payload_size: usize = 0; // Track approximate payload size
         defer {
             // Clean up on thread exit
             for (batch.items) |*event| {
@@ -175,9 +176,32 @@ pub const AsyncBatchPublisher = struct {
         }
 
         while (!self.should_stop.load(.seq_cst)) {
-            // Drain up to max_events from the queue
-            while (batch.items.len < self.config.max_events) {
-                const event = self.event_queue.pop() orelse break;
+            // Drain events from the queue until we hit a threshold
+            // Keep draining as long as events are available OR we haven't waited long enough
+            var consecutive_empty_pops: usize = 0;
+            const max_empty_pops_before_flush_check = 10; // Wait for ~10ms of queue being empty
+
+            while (batch.items.len < self.config.max_events and
+                current_payload_size < self.config.max_payload_bytes and
+                consecutive_empty_pops < max_empty_pops_before_flush_check)
+            {
+                const event = self.event_queue.pop() orelse {
+                    // Queue is empty, but might have more events incoming
+                    // Sleep briefly and try again before giving up
+                    consecutive_empty_pops += 1;
+                    if (batch.items.len > 0) {
+                        // We have events in batch, wait a bit for more to arrive
+                        std.Thread.sleep(1 * std.time.ns_per_ms);
+                    }
+                    continue;
+                };
+
+                // Got an event! Reset empty counter
+                consecutive_empty_pops = 0;
+
+                // Approximate payload size (table + operation + subject strings)
+                const event_size = event.table.len + event.operation.len + event.subject.len;
+
                 batch.append(self.allocator, event) catch |err| {
                     log.err("Failed to append to batch: {}", .{err});
                     // Clean up event on error
@@ -185,28 +209,42 @@ pub const AsyncBatchPublisher = struct {
                     mut_event.deinit(self.allocator);
                     break;
                 };
+
+                current_payload_size += event_size;
             }
 
             const now = std.time.milliTimestamp();
             const time_elapsed = now - last_flush_time;
 
-            // Flush if we have events AND (batch is full OR timeout reached)
+            // Flush if we have events AND (batch is full OR payload too large OR timeout reached)
             const should_flush = batch.items.len > 0 and
                 (batch.items.len >= self.config.max_events or
+                    current_payload_size >= self.config.max_payload_bytes or
                     time_elapsed >= self.config.max_wait_ms);
 
             if (should_flush) {
                 batches_processed += 1;
                 log.info("Flush thread processing batch #{d} with {d} events", .{ batches_processed, batch.items.len });
 
-                // flushBatch takes ownership of the batch
-                // We need to transfer ownership and create a new batch
-                const batch_to_flush = batch;
-                batch = std.ArrayList(batch_publisher.CDCEvent){}; // New empty batch
+                // Log the msg_ids of events being flushed
+                if (batch.items.len > 0) {
+                    log.debug("Batch #{d} contains msg_ids: {s} ... {s}", .{
+                        batches_processed,
+                        batch.items[0].msg_id,
+                        batch.items[batch.items.len - 1].msg_id,
+                    });
+                }
 
-                self.flushBatch(batch_to_flush) catch |err| {
+                // Flush the current batch - flushBatch will take ownership and free the buffer
+                // After this, batch.items will point to freed memory, so we reset it
+                self.flushBatch(batch) catch |err| {
                     log.err("Failed to flush batch: {}", .{err});
+                    // On error, flushBatch still freed the buffer, so reset batch
                 };
+
+                // Reset batch to empty state (buffer was freed by flushBatch)
+                batch = std.ArrayList(batch_publisher.CDCEvent){};
+                current_payload_size = 0;
 
                 last_flush_time = now;
             } else if (batch.items.len == 0) {

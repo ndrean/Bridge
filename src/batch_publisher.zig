@@ -5,6 +5,45 @@ const pgoutput = @import("pgoutput.zig");
 
 pub const log = std.log.scoped(.batch_publisher);
 
+/// Convert std.json.Value to msgpack.Payload recursively
+fn jsonValueToMsgpack(value: std.json.Value, allocator: std.mem.Allocator) !msgpack.Payload {
+    return switch (value) {
+        .null => msgpack.Payload{ .nil = {} },
+        .bool => |b| msgpack.Payload{ .bool = b },
+        .integer => |i| msgpack.Payload{ .int = i },
+        .float => |f| msgpack.Payload{ .float = f },
+        .number_string => |s| blk: {
+            // Try to parse as number, fallback to string
+            if (std.fmt.parseInt(i64, s, 10)) |int_val| {
+                break :blk msgpack.Payload{ .int = int_val };
+            } else |_| {
+                if (std.fmt.parseFloat(f64, s)) |float_val| {
+                    break :blk msgpack.Payload{ .float = float_val };
+                } else |_| {
+                    break :blk try msgpack.Payload.strToPayload(s, allocator);
+                }
+            }
+        },
+        .string => |s| try msgpack.Payload.strToPayload(s, allocator),
+        .array => |arr| blk: {
+            var msgpack_arr = try allocator.alloc(msgpack.Payload, arr.items.len);
+            for (arr.items, 0..) |item, i| {
+                msgpack_arr[i] = try jsonValueToMsgpack(item, allocator);
+            }
+            break :blk msgpack.Payload{ .arr = msgpack_arr };
+        },
+        .object => |obj| blk: {
+            var map_payload = msgpack.Payload.mapPayload(allocator);
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                const val = try jsonValueToMsgpack(entry.value_ptr.*, allocator);
+                try map_payload.mapPut(entry.key_ptr.*, val);
+            }
+            break :blk map_payload;
+        },
+    };
+}
+
 /// Configuration for batch publishing
 pub const BatchConfig = struct {
     /// Maximum number of events per batch
@@ -235,7 +274,23 @@ pub const BatchPublisher = struct {
                         .int64 => |v| msgpack.Payload{ .int = v },
                         .float64 => |v| msgpack.Payload{ .float = v },
                         .boolean => |v| msgpack.Payload{ .bool = v },
-                        .text, .bytea, .array, .jsonb, .numeric => |v| try msgpack.Payload.strToPayload(v, self.allocator),
+                        .text, .bytea, .array, .numeric => |v| try msgpack.Payload.strToPayload(v, self.allocator),
+                        .jsonb => |v| blk: {
+                            // Parse JSON and convert to MessagePack native types
+                            const parsed = std.json.parseFromSlice(
+                                std.json.Value,
+                                self.allocator,
+                                v,
+                                .{},
+                            ) catch {
+                                // If parsing fails, fall back to string
+                                break :blk try msgpack.Payload.strToPayload(v, self.allocator);
+                            };
+                            defer parsed.deinit();
+
+                            // Convert JSON Value to MessagePack Payload
+                            break :blk try jsonValueToMsgpack(parsed.value, self.allocator);
+                        },
                         .null => msgpack.Payload{ .nil = {} },
                     };
 
@@ -303,11 +358,23 @@ pub const BatchPublisher = struct {
                             .int64 => |v| msgpack.Payload{ .int = v },
                             .float64 => |v| msgpack.Payload{ .float = v },
                             .boolean => |v| msgpack.Payload{ .bool = v },
-                            .text => |v| try msgpack.Payload.strToPayload(v, encoding_allocator),
-                            .numeric => |v| try msgpack.Payload.strToPayload(v, encoding_allocator),
-                            .jsonb => |v| try msgpack.Payload.strToPayload(v, encoding_allocator),
-                            .array => |v| try msgpack.Payload.strToPayload(v, encoding_allocator),
-                            .bytea => |v| try msgpack.Payload.strToPayload(v, encoding_allocator),
+                            .text, .bytea, .array, .numeric => |v| try msgpack.Payload.strToPayload(v, encoding_allocator),
+                            .jsonb => |v| blk: {
+                                // Parse JSON and convert to MessagePack native types
+                                const parsed = std.json.parseFromSlice(
+                                    std.json.Value,
+                                    encoding_allocator,
+                                    v,
+                                    .{},
+                                ) catch {
+                                    // If parsing fails, fall back to string
+                                    break :blk try msgpack.Payload.strToPayload(v, encoding_allocator);
+                                };
+                                defer parsed.deinit();
+
+                                // Convert JSON Value to MessagePack Payload
+                                break :blk try jsonValueToMsgpack(parsed.value, encoding_allocator);
+                            },
                             .null => msgpack.Payload{ .nil = {} },
                         };
 

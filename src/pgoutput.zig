@@ -213,11 +213,35 @@ pub fn decodeBinColumnData(
 
         // --- JSONB (binary format is version byte + JSON text) ---
         .JSONB => {
-            // PostgreSQL JSONB v1 format: version byte (0x01) + plain JSON text
-            // No complex parsing needed - just skip the version byte
+            // PostgreSQL JSONB binary format can be sent in different ways:
+            // 1. Standard: version byte (0x01) + JSON text
+            // 2. Text output plugin quirk: Sometimes wrapped in quotes: "{"key":"value"}"
             if (raw_bytes.len < 1) return error.InvalidDataLength;
-            const version = raw_bytes[0];
-            if (version != 1) return error.UnsupportedJsonbVersion;
+
+            const first_byte = raw_bytes[0];
+
+            // Check if it starts with a quote (text format wrapper)
+            if (first_byte == '"' and raw_bytes.len >= 2) {
+                // Strip surrounding quotes: "{"key":"value"}" -> {"key":"value"}
+                // Find the closing quote (should be at the end)
+                if (raw_bytes[raw_bytes.len - 1] == '"') {
+                    // Extract the JSON between quotes
+                    const json_text = raw_bytes[1 .. raw_bytes.len - 1];
+                    const owned = try allocator.dupe(u8, json_text);
+                    return .{ .jsonb = owned };
+                } else {
+                    log.warn("JSONB starts with quote but doesn't end with quote", .{});
+                    // Fall through to version byte handling
+                }
+            }
+
+            // Standard binary format: version byte + JSON
+            if (first_byte != 1) {
+                log.warn("Unexpected JSONB first byte: 0x{x:0>2} (expected 0x01 or '\"')", .{first_byte});
+                // Try to use it anyway, might be valid JSON
+                const owned = try allocator.dupe(u8, raw_bytes);
+                return .{ .jsonb = owned };
+            }
 
             // Skip version byte, return JSON text
             const owned = try allocator.dupe(u8, raw_bytes[1..]);

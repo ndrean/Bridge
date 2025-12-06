@@ -42,9 +42,6 @@ pub const Server = struct {
         log.info("  GET  /metrics        - Prometheus metrics", .{});
         log.info("  POST /shutdown       - Graceful shutdown", .{});
         log.info("  GET  /streams/info   - Get NATS stream info", .{});
-        log.info("  POST /streams/create - Create NATS stream", .{});
-        log.info("  POST /streams/delete - Delete NATS stream", .{});
-        log.info("  POST /streams/purge  - Purge NATS stream messages", .{});
 
         while (!self.should_stop.load(.seq_cst)) {
             // Poll with timeout to allow checking shutdown flag
@@ -112,12 +109,12 @@ pub const Server = struct {
             try self.handleShutdown(stream);
         } else if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/streams/info")) {
             try self.handleStreamInfo(stream, path);
-        } else if (std.mem.eql(u8, method, "POST") and std.mem.startsWith(u8, path, "/streams/create")) {
-            try self.handleStreamCreate(stream, path);
-        } else if (std.mem.eql(u8, method, "POST") and std.mem.startsWith(u8, path, "/streams/delete")) {
-            try self.handleStreamDelete(stream, path);
-        } else if (std.mem.eql(u8, method, "POST") and std.mem.startsWith(u8, path, "/streams/purge")) {
-            try self.handleStreamPurge(stream, path);
+            // } else if (std.mem.eql(u8, method, "POST") and std.mem.startsWith(u8, path, "/streams/create")) {
+            // try self.handleStreamCreate(stream, path);
+            // } else if (std.mem.eql(u8, method, "POST") and std.mem.startsWith(u8, path, "/streams/delete")) {
+            // try self.handleStreamDelete(stream, path);
+            // } else if (std.mem.eql(u8, method, "POST") and std.mem.startsWith(u8, path, "/streams/purge")) {
+            // try self.handleStreamPurge(stream, path);
         } else {
             try self.handleNotFound(stream);
         }
@@ -298,65 +295,65 @@ pub const Server = struct {
         }
     }
 
-    fn handleStreamCreate(self: *Server, stream: std.net.Stream, path: []const u8) !void {
-        const stream_name = parseQueryParam(path, "stream") orelse {
-            try sendResponse(stream, "400 Bad Request", "text/plain", "⚠️ Missing 'stream' parameter\n");
-            return;
-        };
+    // fn handleStreamCreate(self: *Server, stream: std.net.Stream, path: []const u8) !void {
+    //     const stream_name = parseQueryParam(path, "stream") orelse {
+    //         try sendResponse(stream, "400 Bad Request", "text/plain", "⚠️ Missing 'stream' parameter\n");
+    //         return;
+    //     };
 
-        const subjects = parseQueryParam(path, "subjects") orelse "cdc.>";
+    //     const subjects = parseQueryParam(path, "subjects") orelse "cdc.>";
 
-        if (self.nats_publisher) |publisher| {
-            // Convert query param strings to null-terminated for C API
-            const stream_name_z = try self.allocator.dupeZ(u8, stream_name);
-            defer self.allocator.free(stream_name_z);
+    //     if (self.nats_publisher) |publisher| {
+    //         // Convert query param strings to null-terminated for C API
+    //         const stream_name_z = try self.allocator.dupeZ(u8, stream_name);
+    //         defer self.allocator.free(stream_name_z);
 
-            const subjects_z = try self.allocator.dupeZ(u8, subjects);
-            defer self.allocator.free(subjects_z);
+    //         const subjects_z = try self.allocator.dupeZ(u8, subjects);
+    //         defer self.allocator.free(subjects_z);
 
-            // Create stream config
-            const config = nats_publisher.StreamConfig{
-                .name = stream_name_z,
-                .subjects = &.{subjects_z},
-            };
+    //         // Create stream config
+    //         const config = nats_publisher.StreamConfig{
+    //             .name = stream_name_z,
+    //             .subjects = &.{subjects_z},
+    //         };
 
-            // Call standalone createStream function
-            nats_publisher.createStream(publisher.js.?, self.allocator, config) catch |err| {
-                var err_buf: [256]u8 = undefined;
-                const err_msg = try std.fmt.bufPrint(&err_buf, "Failed to create stream: {}\n", .{err});
-                try sendResponse(stream, "500 Internal Server Error", "text/plain", err_msg);
-                return;
-            };
+    //         // Call standalone createStream function
+    //         nats_publisher.createStream(publisher.js.?, self.allocator, config) catch |err| {
+    //             var err_buf: [256]u8 = undefined;
+    //             const err_msg = try std.fmt.bufPrint(&err_buf, "Failed to create stream: {}\n", .{err});
+    //             try sendResponse(stream, "500 Internal Server Error", "text/plain", err_msg);
+    //             return;
+    //         };
 
-            var response_buf: [256]u8 = undefined;
-            const response = try std.fmt.bufPrint(&response_buf, "Stream '{s}' created with subjects: {s}\n", .{ stream_name, subjects });
-            try sendResponse(stream, "200 OK", "text/plain", response);
-        } else {
-            try sendResponse(stream, "503 Service Unavailable", "text/plain", "⚠️ NATS publisher not available\n");
-        }
-    }
+    //         var response_buf: [256]u8 = undefined;
+    //         const response = try std.fmt.bufPrint(&response_buf, "Stream '{s}' created with subjects: {s}\n", .{ stream_name, subjects });
+    //         try sendResponse(stream, "200 OK", "text/plain", response);
+    //     } else {
+    //         try sendResponse(stream, "503 Service Unavailable", "text/plain", "⚠️ NATS publisher not available\n");
+    //     }
+    // }
 
-    fn handleStreamDelete(self: *Server, stream: std.net.Stream, path: []const u8) !void {
-        const stream_name = parseQueryParam(path, "stream") orelse {
-            try sendResponse(stream, "400 Bad Request", "text/plain", "Missing 'stream' parameter\n");
-            return;
-        };
+    // fn handleStreamDelete(self: *Server, stream: std.net.Stream, path: []const u8) !void {
+    //     const stream_name = parseQueryParam(path, "stream") orelse {
+    //         try sendResponse(stream, "400 Bad Request", "text/plain", "Missing 'stream' parameter\n");
+    //         return;
+    //     };
 
-        if (self.nats_publisher) |publisher| {
-            publisher.deleteStream(stream_name) catch |err| {
-                var err_buf: [256]u8 = undefined;
-                const err_msg = try std.fmt.bufPrint(&err_buf, "⚠️ Failed to delete stream: {}\n", .{err});
-                try sendResponse(stream, "500 Internal Server Error", "text/plain", err_msg);
-                return;
-            };
+    //     if (self.nats_publisher) |publisher| {
+    //         publisher.deleteStream(stream_name) catch |err| {
+    //             var err_buf: [256]u8 = undefined;
+    //             const err_msg = try std.fmt.bufPrint(&err_buf, "⚠️ Failed to delete stream: {}\n", .{err});
+    //             try sendResponse(stream, "500 Internal Server Error", "text/plain", err_msg);
+    //             return;
+    //         };
 
-            var response_buf: [256]u8 = undefined;
-            const response = try std.fmt.bufPrint(&response_buf, "Stream '{s}' deleted\n", .{stream_name});
-            try sendResponse(stream, "200 OK", "text/plain", response);
-        } else {
-            try sendResponse(stream, "503 Service Unavailable", "text/plain", "⚠️ NATS publisher not available\n");
-        }
-    }
+    //         var response_buf: [256]u8 = undefined;
+    //         const response = try std.fmt.bufPrint(&response_buf, "Stream '{s}' deleted\n", .{stream_name});
+    //         try sendResponse(stream, "200 OK", "text/plain", response);
+    //     } else {
+    //         try sendResponse(stream, "503 Service Unavailable", "text/plain", "⚠️ NATS publisher not available\n");
+    //     }
+    // }
 
     fn handleStreamPurge(self: *Server, stream: std.net.Stream, path: []const u8) !void {
         const stream_name = parseQueryParam(path, "stream") orelse {
