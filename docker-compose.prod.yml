@@ -10,11 +10,11 @@ services:
       - "8080:8080"
     command: >
       bridge
-        --stream CDC
+        --stream CDC,INIT
         --slot cdc_slot
         --publication cdc_pub
         --port 8080
-        --table users,orders,test_types
+        --table users,test_types
     depends_on:
       postgres:
         condition: service_healthy

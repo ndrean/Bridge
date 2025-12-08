@@ -15,8 +15,8 @@ cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_TESTING=OFF \
     -DNATS_BUILD_STREAMING=OFF \
-    -DNATS_BUILD_WITH_TLS=OFF \
     -DCMAKE_INSTALL_PREFIX=../../nats-install
+    # -DNATS_BUILD_WITH_TLS=OFF \
 
 # Build
 cmake --build . --config Release

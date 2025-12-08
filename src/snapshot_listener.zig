@@ -1,156 +1,140 @@
 //! Snapshot request listener and generator
 //!
 //! Runs in a dedicated thread to:
-//! 1. LISTEN for PostgreSQL NOTIFY events on 'snapshot_request' channel
-//! 2. Generate incremental snapshots in chunks
+//! 1. Subscribe to NATS 'snapshot.request.>' subject
+//! 2. Generate incremental snapshots in chunks using COPY CSV
 //! 3. Publish snapshot chunks to NATS INIT stream
 
 const std = @import("std");
 const c = @cImport({
     @cInclude("libpq-fe.h");
+    @cInclude("nats.h");
 });
 const pg_conn = @import("pg_conn.zig");
 const nats_publisher = @import("nats_publisher.zig");
 const config = @import("config.zig");
 const msgpack = @import("msgpack");
+const pg_copy_csv = @import("pg_copy_csv.zig");
 
 pub const log = std.log.scoped(.snapshot_listener);
 
-/// Snapshot request payload from PostgreSQL NOTIFY
-const SnapshotRequest = struct {
-    id: u32,
-    table_name: []const u8,
-    requested_by: ?[]const u8,
+/// Snapshot request context passed to NATS callback
+const SnapshotContext = struct {
+    allocator: std.mem.Allocator,
+    pg_config: *const pg_conn.PgConf,
+    publisher: *nats_publisher.Publisher,
 };
 
-/// Main entry point: Listen for snapshot requests and generate snapshots
+/// NATS message callback for snapshot requests
+fn onSnapshotRequest(
+    _: ?*c.natsConnection,
+    sub: ?*c.natsSubscription,
+    msg: ?*c.natsMsg,
+    closure: ?*anyopaque,
+) callconv(.c) void {
+    _ = sub;
+
+    const ctx: *SnapshotContext = @ptrCast(@alignCast(closure));
+
+    defer c.natsMsg_Destroy(msg);
+
+    // Extract table name from subject: snapshot.request.<table>
+    const subject_ptr = c.natsMsg_GetSubject(msg);
+    const subject = std.mem.span(subject_ptr);
+
+    const table_name = blk: {
+        if (std.mem.startsWith(u8, subject, config.Snapshot.request_subject_prefix)) {
+            break :blk subject[config.Snapshot.request_subject_prefix.len..];
+        }
+        log.err("⚠️ Invalid snapshot request subject: {s}", .{subject});
+        return;
+    };
+
+    log.info("📩 Snapshot request via NATS: table='{s}'", .{table_name});
+
+    // Get request metadata from message payload (MessagePack: requested_by, etc.)
+    const data_ptr = c.natsMsg_GetData(msg);
+    const data_len = c.natsMsg_GetDataLength(msg);
+
+    const requested_by = if (data_len > 0) blk: {
+        const payload = data_ptr[0..@intCast(data_len)];
+        // Try to parse MessagePack for requested_by field
+        // For now, just use "nats-consumer"
+        _ = payload;
+        break :blk "nats-consumer";
+    } else "unknown";
+
+    log.info("🔄 Processing snapshot request for table '{s}' (requested_by: {s})", .{
+        table_name,
+        requested_by,
+    });
+
+    // Generate snapshot ID
+    const snapshot_id = generateSnapshotId(ctx.allocator) catch |err| {
+        log.err("Failed to generate snapshot ID: {}", .{err});
+        return;
+    };
+    defer ctx.allocator.free(snapshot_id);
+
+    // Generate snapshot
+    generateIncrementalSnapshot(
+        ctx.allocator,
+        ctx.pg_config,
+        ctx.publisher,
+        null, // No PostgreSQL connection needed (we create our own)
+        table_name,
+        snapshot_id,
+    ) catch |err| {
+        log.err("Snapshot generation failed for table '{s}': {}", .{ table_name, err });
+        return;
+    };
+
+    log.info("✅ Snapshot request for '{s}' completed successfully", .{table_name});
+}
+
+/// Main entry point: Subscribe to NATS for snapshot requests
 pub fn listenForSnapshotRequests(
     allocator: std.mem.Allocator,
     pg_config: *const pg_conn.PgConf,
     publisher: *nats_publisher.Publisher,
     should_stop: *std.atomic.Value(bool),
 ) !void {
-    log.info("🔔 Starting snapshot listener thread", .{});
+    log.info("🔔 Starting NATS snapshot listener thread", .{});
 
-    // Create a separate PostgreSQL connection (NOT replication mode)
-    const conninfo = try pg_config.connInfo(allocator, false);
-    defer allocator.free(conninfo);
+    // Create context for NATS callback
+    var ctx = SnapshotContext{
+        .allocator = allocator,
+        .pg_config = pg_config,
+        .publisher = publisher,
+    };
 
-    const conn = c.PQconnectdb(conninfo.ptr);
-    if (conn == null) {
-        log.err("Failed to connect to PostgreSQL for snapshot listening", .{});
-        return error.ConnectionFailed;
+    // Subscribe to snapshot.request.> (wildcard for all tables)
+    var sub: ?*c.natsSubscription = null;
+    const status = c.natsConnection_Subscribe(
+        &sub,
+        @ptrCast(publisher.nc),
+        config.Snapshot.request_subject_wildcard,
+        onSnapshotRequest,
+        &ctx,
+    );
+
+    if (status != c.NATS_OK) {
+        log.err("Failed to subscribe to {s}: {s}", .{
+            config.Snapshot.request_subject_wildcard,
+            std.mem.span(c.natsStatus_GetText(status)),
+        });
+        return error.SubscribeFailed;
     }
-    defer c.PQfinish(conn);
+    defer c.natsSubscription_Destroy(sub);
 
-    if (c.PQstatus(conn) != c.CONNECTION_OK) {
-        const err_msg = c.PQerrorMessage(conn);
-        log.err("PostgreSQL connection failed: {s}", .{err_msg});
-        return error.ConnectionFailed;
-    }
+    log.info("🔔 Subscribed to NATS subject 'snapshot.request.>' for snapshot requests", .{});
 
-    // Start listening for snapshot_request notifications
-    const listen_query = "LISTEN snapshot_request";
-    const listen_result = c.PQexec(conn, listen_query.ptr);
-    defer c.PQclear(listen_result);
-
-    if (c.PQresultStatus(listen_result) != c.PGRES_COMMAND_OK) {
-        const err_msg = c.PQerrorMessage(conn);
-        log.err("Failed to LISTEN: {s}", .{err_msg});
-        return error.ListenFailed;
-    }
-
-    log.info("🔔 Listening for snapshot requests on channel 'snapshot_request'", .{});
-
+    // Keep thread alive until stop signal
     while (!should_stop.load(.seq_cst)) {
-        // Check for notifications (non-blocking)
-        _ = c.PQconsumeInput(conn);
-
-        var notify: ?*c.PGnotify = c.PQnotifies(conn);
-        while (notify) |n| {
-            defer c.PQfreemem(n);
-
-            const payload = std.mem.span(n.extra);
-            log.info("📩 Snapshot request notification: {s}", .{payload});
-
-            // Parse JSON payload
-            handleSnapshotRequest(allocator, pg_config, publisher, conn, payload) catch |err| {
-                log.err("Failed to handle snapshot request: {}", .{err});
-            };
-
-            notify = c.PQnotifies(conn);
-        }
-
-        // Sleep before next poll
-        std.Thread.sleep(config.Snapshot.poll_interval_ms * std.time.ns_per_ms);
+        std.Thread.sleep(100 * std.time.ns_per_ms);
     }
 
     log.info("🥁 Snapshot listener thread stopped", .{});
-}
-
-/// Parse snapshot request and generate snapshot
-fn handleSnapshotRequest(
-    allocator: std.mem.Allocator,
-    pg_config: *const pg_conn.PgConf,
-    publisher: *nats_publisher.Publisher,
-    conn: ?*c.PGconn,
-    payload: []const u8,
-) !void {
-    // Parse JSON: {"id": 1, "table_name": "users", "requested_by": "client-123"}
-    const parsed = std.json.parseFromSlice(
-        SnapshotRequest,
-        allocator,
-        payload,
-        .{ .ignore_unknown_fields = true },
-    ) catch |err| {
-        log.err("Failed to parse JSON payload: {}", .{err});
-        return err;
-    };
-    defer parsed.deinit();
-
-    const request = parsed.value;
-
-    log.info("🔄 Processing snapshot request #{d} for table '{s}' (requested_by: {s})", .{
-        request.id,
-        request.table_name,
-        request.requested_by orelse "unknown",
-    });
-
-    // Update status to 'processing'
-    const snapshot_id = try generateSnapshotId(allocator);
-    defer allocator.free(snapshot_id);
-
-    try updateRequestStatus(
-        conn,
-        request.id,
-        "processing",
-        snapshot_id,
-        null,
-    );
-
-    // Generate snapshot
-    generateIncrementalSnapshot(
-        allocator,
-        pg_config,
-        publisher,
-        conn,
-        request.table_name,
-        snapshot_id,
-    ) catch |err| {
-        log.err("Snapshot generation failed for table '{s}': {}", .{ request.table_name, err });
-
-        // Update status to 'failed'
-        const err_msg = try std.fmt.allocPrint(allocator, "Snapshot failed: {}", .{err});
-        defer allocator.free(err_msg);
-
-        try updateRequestStatus(conn, request.id, "failed", snapshot_id, err_msg);
-        return err;
-    };
-
-    // Update status to 'completed'
-    try updateRequestStatus(conn, request.id, "completed", snapshot_id, null);
-
-    log.info("✅ Snapshot request #{d} completed successfully", .{request.id});
 }
 
 /// Generate incremental snapshot in chunks and publish to NATS
@@ -190,44 +174,68 @@ fn generateIncrementalSnapshot(
 
     const lsn_str = std.mem.span(c.PQgetvalue(lsn_result, 0, 0));
 
-    // Query table in chunks
+    // Use COPY CSV format to fetch rows in chunks
     var batch: u32 = 0;
     var total_rows: u64 = 0;
+    var offset_rows: u64 = 0;
 
     while (true) {
-        const offset = batch * config.Snapshot.chunk_size;
-
-        // Build query: SELECT * FROM table ORDER BY id LIMIT chunk_size OFFSET offset
-        const query = try std.fmt.allocPrintSentinel(
+        // Build COPY CSV query with LIMIT/OFFSET for chunking
+        const copy_query = try std.fmt.allocPrintSentinel(
             allocator,
-            "SELECT * FROM {s} ORDER BY id LIMIT {d} OFFSET {d}",
-            .{ table_name, config.Snapshot.chunk_size, offset },
+            "COPY (SELECT * FROM {s} ORDER BY id LIMIT {d} OFFSET {d}) TO STDOUT WITH (FORMAT csv, HEADER true)",
+            .{ table_name, config.Snapshot.chunk_size, offset_rows },
             0,
         );
-        defer allocator.free(query);
+        defer allocator.free(copy_query);
 
-        const chunk_result = c.PQexec(conn, query.ptr);
-        defer c.PQclear(chunk_result);
+        // Parse CSV COPY data
+        var parser = pg_copy_csv.CopyCsvParser.init(allocator, @ptrCast(conn));
+        defer parser.deinit();
 
-        if (c.PQresultStatus(chunk_result) != c.PGRES_TUPLES_OK) {
-            const err_msg = c.PQerrorMessage(conn);
-            log.err("Snapshot query failed: {s}", .{err_msg});
-            return error.QueryFailed;
+        parser.executeCopy(copy_query) catch |err| {
+            log.err("COPY CSV command failed: {}", .{err});
+            return error.CopyFailed;
+        };
+
+        // Collect rows into array
+        var rows_list = std.ArrayList(pg_copy_csv.CsvRow){};
+        defer {
+            for (rows_list.items) |*row| {
+                row.deinit();
+            }
+            rows_list.deinit(allocator);
         }
 
-        const num_rows = c.PQntuples(chunk_result);
+        var row_iterator = parser.rows();
+        while (try row_iterator.next()) |row| {
+            try rows_list.append(allocator, row);
+        }
+
+        const num_rows = rows_list.items.len;
         if (num_rows == 0) break;
 
-        total_rows += @intCast(num_rows);
+        total_rows += num_rows;
 
-        // Encode chunk as MessagePack
-        const encoded = try encodeChunkToMessagePack(chunk_result, allocator);
+        // Get column names from parser header
+        const col_names = parser.columnNames() orelse return error.NoHeader;
+
+        // Encode chunk as MessagePack with metadata wrapper
+        const encoded = try encodeCsvRowsToMessagePack(
+            allocator,
+            rows_list.items,
+            col_names,
+            table_name,
+            snapshot_id,
+            lsn_str,
+            batch,
+        );
         defer allocator.free(encoded);
 
         // Publish chunk to NATS: init.users.snap-1733507200.0
         const subject = try std.fmt.allocPrint(
             allocator,
-            "init.{s}.{s}.{d}\x00",
+            config.Snapshot.data_subject_pattern ++ "\x00",
             .{ table_name, snapshot_id, batch },
         );
         defer allocator.free(subject);
@@ -237,7 +245,7 @@ fn generateIncrementalSnapshot(
         // Message ID for deduplication
         const msg_id_buf = try std.fmt.allocPrint(
             allocator,
-            "init-{s}-{s}-{d}",
+            config.Snapshot.data_msg_id_pattern,
             .{ table_name, snapshot_id, batch },
         );
         defer allocator.free(msg_id_buf);
@@ -245,13 +253,20 @@ fn generateIncrementalSnapshot(
         try publisher.publish(subject_z, encoded, msg_id_buf);
         try publisher.flushAsync();
 
-        log.info("📦 Published snapshot chunk {d} ({d} rows) → {s}", .{
+        log.info("📦 Published snapshot chunk {d} ({d} rows, {d} bytes CSV) → {s}", .{
             batch,
             num_rows,
+            encoded.len,
             subject_z,
         });
 
         batch += 1;
+        offset_rows += num_rows;
+
+        // If we got fewer rows than chunk_size, we're done
+        if (num_rows < config.Snapshot.chunk_size) {
+            break;
+        }
     }
 
     // Publish metadata: init.users.meta
@@ -340,6 +355,90 @@ fn encodeChunkToMessagePack(result: ?*c.PGresult, allocator: std.mem.Allocator) 
     return try buffer.toOwnedSlice(allocator);
 }
 
+/// Encode CSV rows to MessagePack with metadata wrapper
+/// Wraps snapshot data with table name, operation type, LSN, and chunk info
+fn encodeCsvRowsToMessagePack(
+    allocator: std.mem.Allocator,
+    rows: []const pg_copy_csv.CsvRow,
+    col_names: [][]const u8,
+    table_name: []const u8,
+    snapshot_id: []const u8,
+    lsn: []const u8,
+    chunk: u32,
+) ![]const u8 {
+    // Build MessagePack with metadata wrapper
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(allocator);
+
+    const ArrayListStream = struct {
+        list: *std.ArrayList(u8),
+        allocator: std.mem.Allocator,
+
+        const WriteError = std.mem.Allocator.Error;
+        const ReadError = error{};
+
+        pub fn write(self: *@This(), bytes: []const u8) WriteError!usize {
+            try self.list.appendSlice(self.allocator, bytes);
+            return bytes.len;
+        }
+
+        pub fn read(self: *@This(), out: []u8) ReadError!usize {
+            _ = self;
+            _ = out;
+            return 0;
+        }
+    };
+
+    var write_stream = ArrayListStream{ .list = &buffer, .allocator = allocator };
+    var read_stream = ArrayListStream{ .list = &buffer, .allocator = allocator };
+
+    var packer = msgpack.Pack(
+        *ArrayListStream,
+        *ArrayListStream,
+        ArrayListStream.WriteError,
+        ArrayListStream.ReadError,
+        ArrayListStream.write,
+        ArrayListStream.read,
+    ).init(&write_stream, &read_stream);
+
+    // Build data array (array of row maps)
+    var data_array = try msgpack.Payload.arrPayload(rows.len, allocator);
+    // Don't defer free - wrapper_map will own and free this
+
+    for (rows, 0..) |row, row_idx| {
+        var row_map = msgpack.Payload.mapPayload(allocator);
+
+        for (row.fields, 0..) |csv_field, col_idx| {
+            if (col_idx >= col_names.len) continue;
+
+            const col_name = col_names[col_idx];
+
+            if (csv_field.isNull()) {
+                try row_map.mapPut(col_name, msgpack.Payload{ .nil = {} });
+            } else if (csv_field.value) |text_val| {
+                // CSV values are already text, just encode them
+                try row_map.mapPut(col_name, try msgpack.Payload.strToPayload(text_val, allocator));
+            }
+        }
+
+        data_array.arr[row_idx] = row_map;
+    }
+
+    // Build metadata wrapper map (this will own and free data_array)
+    var wrapper_map = msgpack.Payload.mapPayload(allocator);
+    defer wrapper_map.free(allocator);
+
+    try wrapper_map.mapPut("table", try msgpack.Payload.strToPayload(table_name, allocator));
+    try wrapper_map.mapPut("operation", try msgpack.Payload.strToPayload("snapshot", allocator));
+    try wrapper_map.mapPut("snapshot_id", try msgpack.Payload.strToPayload(snapshot_id, allocator));
+    try wrapper_map.mapPut("chunk", msgpack.Payload{ .int = @intCast(chunk) });
+    try wrapper_map.mapPut("lsn", try msgpack.Payload.strToPayload(lsn, allocator));
+    try wrapper_map.mapPut("data", data_array);
+
+    try packer.write(wrapper_map);
+    return try buffer.toOwnedSlice(allocator);
+}
+
 /// Publish snapshot metadata to NATS
 fn publishSnapshotMetadata(
     allocator: std.mem.Allocator,
@@ -350,61 +449,67 @@ fn publishSnapshotMetadata(
     batch_count: u32,
     row_count: u64,
 ) !void {
-    // Build JSON metadata
-    const meta = try std.fmt.allocPrint(
-        allocator,
-        "{{\"snapshot_id\":\"{s}\",\"lsn\":\"{s}\",\"timestamp\":{d},\"batch_count\":{d},\"row_count\":{d},\"table\":\"{s}\"}}",
-        .{ snapshot_id, lsn, std.time.timestamp(), batch_count, row_count, table_name },
-    );
-    defer allocator.free(meta);
+    // Build MessagePack metadata
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(allocator);
+
+    const ArrayListStream = struct {
+        list: *std.ArrayList(u8),
+        allocator: std.mem.Allocator,
+
+        const WriteError = std.mem.Allocator.Error;
+        const ReadError = error{};
+
+        pub fn write(self: *@This(), bytes: []const u8) WriteError!usize {
+            try self.list.appendSlice(self.allocator, bytes);
+            return bytes.len;
+        }
+
+        pub fn read(self: *@This(), out: []u8) ReadError!usize {
+            _ = self;
+            _ = out;
+            return 0;
+        }
+    };
+
+    var write_stream = ArrayListStream{ .list = &buffer, .allocator = allocator };
+    var read_stream = ArrayListStream{ .list = &buffer, .allocator = allocator };
+
+    var packer = msgpack.Pack(
+        *ArrayListStream,
+        *ArrayListStream,
+        ArrayListStream.WriteError,
+        ArrayListStream.ReadError,
+        ArrayListStream.write,
+        ArrayListStream.read,
+    ).init(&write_stream, &read_stream);
+
+    var meta_map = msgpack.Payload.mapPayload(allocator);
+    defer meta_map.free(allocator);
+
+    try meta_map.mapPut("snapshot_id", try msgpack.Payload.strToPayload(snapshot_id, allocator));
+    try meta_map.mapPut("lsn", try msgpack.Payload.strToPayload(lsn, allocator));
+    try meta_map.mapPut("timestamp", msgpack.Payload{ .int = std.time.timestamp() });
+    try meta_map.mapPut("batch_count", msgpack.Payload{ .int = @intCast(batch_count) });
+    try meta_map.mapPut("row_count", msgpack.Payload{ .int = @intCast(row_count) });
+    try meta_map.mapPut("table", try msgpack.Payload.strToPayload(table_name, allocator));
+
+    try packer.write(meta_map);
+    const encoded = buffer.items;
 
     const subject = try std.fmt.allocPrint(
         allocator,
-        "init.{s}.meta\x00",
+        config.Snapshot.meta_subject_pattern ++ "\x00",
         .{table_name},
     );
     defer allocator.free(subject);
 
     const subject_z: [:0]const u8 = subject[0 .. subject.len - 1 :0];
 
-    try publisher.publish(subject_z, meta, null);
+    try publisher.publish(subject_z, encoded, null);
     try publisher.flushAsync();
 
     log.info("📋 Published snapshot metadata → {s}", .{subject_z});
-}
-
-/// Update snapshot request status in database
-fn updateRequestStatus(
-    conn: ?*c.PGconn,
-    request_id: u32,
-    status: []const u8,
-    snapshot_id: []const u8,
-    error_message: ?[]const u8,
-) !void {
-    const query = if (error_message) |err_msg|
-        try std.fmt.allocPrintSentinel(
-            std.heap.c_allocator,
-            "UPDATE snapshot_requests SET status='{s}', snapshot_id='{s}', error_message='{s}', completed_at=NOW() WHERE id={d}",
-            .{ status, snapshot_id, err_msg, request_id },
-            0,
-        )
-    else
-        try std.fmt.allocPrintSentinel(
-            std.heap.c_allocator,
-            "UPDATE snapshot_requests SET status='{s}', snapshot_id='{s}', completed_at=NOW() WHERE id={d}",
-            .{ status, snapshot_id, request_id },
-            0,
-        );
-    defer std.heap.c_allocator.free(query);
-
-    const result = c.PQexec(conn, query.ptr);
-    defer c.PQclear(result);
-
-    if (c.PQresultStatus(result) != c.PGRES_COMMAND_OK) {
-        const err_msg = c.PQerrorMessage(conn);
-        log.err("Failed to update snapshot request status: {s}", .{err_msg});
-        return error.UpdateFailed;
-    }
 }
 
 /// Generate snapshot ID based on current timestamp

@@ -24,48 +24,39 @@ SELECT
   pg_reload_conf ();
 
 -- ============================================================================
--- Snapshot Signaling Table
+-- Read-Only User for CDC Bridge (Optional - for production security)
 -- ============================================================================
--- This table allows consumers to request snapshots by inserting records.
--- The bridge listens for NOTIFY events and generates incremental snapshots.
-CREATE TABLE IF NOT EXISTS snapshot_requests (
-    id SERIAL PRIMARY KEY,
-    table_name TEXT NOT NULL,
-    requested_at TIMESTAMPTZ DEFAULT NOW(),
-    requested_by TEXT,  -- Optional: track which consumer requested (e.g., 'browser-client-123')
-    status TEXT DEFAULT 'pending',  -- 'pending', 'processing', 'completed', 'failed'
-    snapshot_id TEXT,    -- Filled in by bridge when snapshot starts (e.g., 'snap-1733507200')
-    completed_at TIMESTAMPTZ,
-    error_message TEXT   -- If status='failed', store error details here
-);
-
--- Create index for faster lookups
-CREATE INDEX IF NOT EXISTS idx_snapshot_requests_status ON snapshot_requests(status, requested_at);
-CREATE INDEX IF NOT EXISTS idx_snapshot_requests_table ON snapshot_requests(table_name, requested_at DESC);
-
--- Create notification function
--- This function sends a pg_notify whenever a new snapshot request is inserted
-CREATE OR REPLACE FUNCTION notify_snapshot_request()
-RETURNS TRIGGER AS $$
-BEGIN
-    -- Send payload with table name, request ID, and requester
-    PERFORM pg_notify('snapshot_request',
-        json_build_object(
-            'id', NEW.id,
-            'table_name', NEW.table_name,
-            'requested_by', NEW.requested_by
-        )::text
-    );
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
--- Create trigger to auto-notify on INSERT
-DROP TRIGGER IF EXISTS snapshot_request_trigger ON snapshot_requests;
-CREATE TRIGGER snapshot_request_trigger
-AFTER INSERT ON snapshot_requests
-FOR EACH ROW
-EXECUTE FUNCTION notify_snapshot_request();
+-- This section creates a dedicated read-only user for the CDC bridge.
+-- Benefits:
+-- - No write access to tables (except replication slot management)
+-- - Principle of least privilege
+-- - Can be used instead of postgres superuser in production
+--
+-- Uncomment to enable:
+--
+-- CREATE USER bridge_reader WITH PASSWORD 'bridge_password_changeme';
+--
+-- Grant replication privileges (required for logical replication)
+-- ALTER USER bridge_reader WITH REPLICATION;
+--
+-- Grant connect to database
+-- GRANT CONNECT ON DATABASE postgres TO bridge_reader;
+--
+-- Grant usage on schema
+-- GRANT USAGE ON SCHEMA public TO bridge_reader;
+--
+-- Grant SELECT on all tables (current and future)
+-- GRANT SELECT ON ALL TABLES IN SCHEMA public TO bridge_reader;
+-- ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO bridge_reader;
+--
+-- Grant usage on sequences (for reading column metadata)
+-- GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO bridge_reader;
+-- ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE ON SEQUENCES TO bridge_reader;
+--
+-- Note: The user still needs replication privileges to:
+-- 1. Create/drop replication slots (pg_create_logical_replication_slot)
+-- 2. Read from replication slots (pg_logical_slot_get_changes)
+-- 3. Query pg_stat_replication and other replication catalogs
 
 -- ============================================================================
 -- Test Tables

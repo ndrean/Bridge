@@ -449,7 +449,10 @@ pub const BatchPublisher = struct {
         // Log flush timing if it took longer than expected
         const flush_elapsed = std.time.milliTimestamp() - flush_start;
         if (flush_elapsed > 5) {
-            log.warn("Slow flush: {d}ms for {d} events", .{ flush_elapsed, event_count });
+            log.warn(
+                "Slow flush: {d}ms for {d} events",
+                .{ flush_elapsed, event_count },
+            );
         }
 
         // Store confirmed LSN after successful flush

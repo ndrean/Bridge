@@ -8,10 +8,10 @@ const std = @import("std");
 /// PostgreSQL connection and replication configuration
 pub const Postgres = struct {
     /// Default replication slot name
-    pub const default_slot_name = "bridge_slot";
+    pub const default_slot_name = "cdc_slot";
 
     /// Default publication name
-    pub const default_publication_name = "bridge_pub";
+    pub const default_publication_name = "cdc_pub";
 
     /// Connection timeout in milliseconds
     pub const connection_timeout_ms = 5000;
@@ -31,6 +31,7 @@ pub const Postgres = struct {
 /// NATS JetStream configuration
 pub const Nats = struct {
     /// Default NATS server URL
+    pub const default_port = 4222;
     pub const default_url = "nats://127.0.0.1:4222";
 
     /// Maximum reconnection attempts (-1 = infinite)
@@ -55,6 +56,17 @@ pub const Nats = struct {
     pub const subject_cdc_prefix = "cdc";
     pub const subject_schema_prefix = "schema";
     pub const subject_init_prefix = "init";
+
+    /// CDC subject patterns: "cdc.<table>.<operation>"
+    pub const cdc_subject_pattern = "cdc.{s}.{s}";
+
+    /// CDC wildcard subject for subscribing to all CDC events
+    pub const cdc_subject_wildcard = "cdc.>";
+
+    /// Schema KV bucket name
+    pub const schema_kv_bucket = "schemas";
+
+    pub const publisher_max_wait = 10_000; // 10 seconds
 };
 
 /// HTTP metrics server configuration
@@ -98,7 +110,7 @@ pub const WalMonitor = struct {
 
 /// Snapshot generation configuration
 pub const Snapshot = struct {
-    /// PostgreSQL NOTIFY channel for snapshot requests
+    /// PostgreSQL NOTIFY channel for snapshot requests (deprecated - using NATS now)
     pub const notify_channel = "snapshot_request";
 
     /// Rows per snapshot chunk
@@ -113,6 +125,21 @@ pub const Snapshot = struct {
     /// Snapshot polling interval (milliseconds)
     /// How often to check for new snapshot requests via LISTEN/NOTIFY
     pub const poll_interval_ms = 100;
+
+    /// NATS subject prefix for snapshot requests: "snapshot.request.<table>"
+    pub const request_subject_prefix = "snapshot.request.";
+
+    /// NATS subject wildcard for subscribing to all snapshot requests
+    pub const request_subject_wildcard = "snapshot.request.>";
+
+    /// NATS subject pattern for data chunks: "init.<table>.<snapshot_id>.<chunk>"
+    pub const data_subject_pattern = "init.{s}.{s}.{d}";
+
+    /// NATS subject pattern for metadata: "init.<table>.meta"
+    pub const meta_subject_pattern = "init.{s}.meta";
+
+    /// Message ID pattern for data chunks: "init-<table>-<snapshot_id>-<chunk>"
+    pub const data_msg_id_pattern = "init-{s}-{s}-{d}";
 };
 
 /// Logging and metrics configuration
@@ -132,7 +159,6 @@ pub const Retry = struct {
 
     /// NATS reconnection is handled by NATS client library
     /// See Nats.reconnect_wait_ms and Nats.max_reconnect_attempts
-
     /// Exponential backoff base (for future use)
     pub const backoff_base_ms = 1000;
 

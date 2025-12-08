@@ -1,13 +1,11 @@
 //! Replication setup tasks, including creating/dropping replication slots and publications,
 const std = @import("std");
-const pg_conn = @import("pg_conn.zig");
-
-pub const log = std.log.scoped(.replication_setup);
-
 const c = @cImport({
     @cInclude("libpq-fe.h");
 });
+const pg_conn = @import("pg_conn.zig");
 
+pub const log = std.log.scoped(.replication_setup);
 /// Struct to handle replication setup tasks and includes get current WAL LSN.
 ///
 /// Includes creating|droping replication slots and publications.
@@ -33,9 +31,12 @@ pub const ReplicationSetup = struct {
         const conn = try self.connect();
         defer c.PQfinish(conn);
 
-        const check_result = try runQuery(conn, check_query);
+        const check_result = try runQuery(
+            conn,
+            check_query,
+        );
         defer c.PQclear(check_result);
-        log.info("Checking for replication slot '{s}'...", .{slot_name});
+        log.debug("Checking for replication slot '{s}'...", .{slot_name});
 
         const exists = c.PQntuples(check_result) > 0;
 

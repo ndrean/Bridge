@@ -3,19 +3,18 @@
 //! Handles connecting to PostgreSQL in replication mode, starting replication from a slot,
 //! receiving WAL messages ('k' and ''), and sending status updates.
 const std = @import("std");
-const pg_conn = @import("pg_conn.zig");
-
-pub const log = std.log.scoped(.wal_stream);
-
-// Import libpq for PostgreSQL replication protocol
 const c = @cImport({
     @cInclude("libpq-fe.h");
 });
+const pg_conn = @import("pg_conn.zig");
+const Conf = @import("config.zig");
+
+pub const log = std.log.scoped(.wal_stream);
 
 pub const StreamConfig = struct {
     pg_config: *const pg_conn.PgConf,
-    slot_name: [:0]const u8 = "bridge_stream_slot",
-    publication_name: [:0]const u8 = "bridge_stream_pub",
+    slot_name: [:0]const u8 = Conf.Postgres.default_slot_name, // "cdc_slot"
+    publication_name: [:0]const u8 = Conf.Postgres.default_publication_name, // "cdc_pub"
 };
 
 pub const ReplicationStream = struct {

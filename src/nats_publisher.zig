@@ -1,17 +1,22 @@
+//! NATS/JetStream Publisher Module for Schemas and table snapshots
+//!
+//! The user should use `publish` to send messages to NATS JetStream streams, followed by `flushAsync` to get the ACKs from the NATS server.
+//!
+//! This is crucial to ensure that the Schema and Snapshot messages are reliably delivered to NATS JetStream.
 const std = @import("std");
-
-pub const log = std.log.scoped(.nats_pub);
-
-// Import NATS C library
 const c = @cImport({
     @cInclude("nats.h");
 });
+const Conf = @import("config.zig");
+const Metrics = @import("metrics.zig").Metrics;
+
+pub const log = std.log.scoped(.nats_pub);
 
 /// NATS Publisher Configuration
 pub const PublisherConfig = struct {
-    url: [:0]const u8 = "nats://127.0.0.1:4222",
-    max_reconnect_attempts: i32 = -1, // -1 = infinite
-    reconnect_wait_ms: i64 = 2000, // 2 seconds between attempts
+    url: [:0]const u8 = Conf.Nats.default_url,
+    max_reconnect_attempts: i32 = Conf.Nats.max_reconnect_attempts, // -1 = infinite
+    reconnect_wait_ms: i64 = Conf.Nats.reconnect_wait_ms, // 2 seconds between attempts
 };
 
 /// JetStream Stream Configuration
@@ -122,15 +127,17 @@ pub const Publisher = struct {
     js: ?*c.jsCtx = null,
     nats_host: [:0]const u8 = "",
     is_connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    metrics: ?*@import("metrics.zig").Metrics = null, // Optional metrics tracking
+    metrics: ?*Metrics = null, // Optional metrics tracking
 
     pub fn init(allocator: std.mem.Allocator, config: PublisherConfig) !Publisher {
         const nats_uri = std.process.getEnvVarOwned(allocator, "NATS_HOST") catch |err| blk: {
-            log.info("NATS_HOST env var not set ({t}), using default 127.0.0.1", .{err});
+            log.info("NATS_HOST Env Var not set ({t}), using default 127.0.0.1", .{err});
             break :blk try allocator.dupe(u8, "127.0.0.1");
+            // need a uniform allocation since we allocate when reading env var
         };
         defer allocator.free(nats_uri);
 
+        // Docker ready-made NATS URL null terminated string
         const url: [:0]const u8 = try std.fmt.allocPrintSentinel(
             allocator,
             "nats://{s}:4222",
@@ -154,7 +161,10 @@ pub const Publisher = struct {
         // Create options
         status = c.natsOptions_Create(&opts);
         if (status != c.NATS_OK) {
-            log.err("🔴 Failed to create NATS options: {s}", .{c.natsStatus_GetText(status)});
+            log.err(
+                "🔴 Failed to create NATS options: {s}",
+                .{c.natsStatus_GetText(status)},
+            );
             return error.NatsOptionsCreateFailed;
         }
         defer c.natsOptions_Destroy(opts);
@@ -162,48 +172,87 @@ pub const Publisher = struct {
         // Set server URL
         status = c.natsOptions_SetURL(opts, self.nats_host.ptr);
         if (status != c.NATS_OK) {
-            log.err("🔴 Failed to set NATS URL: {s}", .{c.natsStatus_GetText(status)});
+            log.err(
+                "🔴 Failed to set NATS URL: {s}",
+                .{c.natsStatus_GetText(status)},
+            );
             return error.NatsSetURLFailed;
         }
 
         // Enable automatic reconnection
-        status = c.natsOptions_SetMaxReconnect(opts, self.config.max_reconnect_attempts);
+        status = c.natsOptions_SetMaxReconnect(
+            opts,
+            self.config.max_reconnect_attempts,
+        );
         if (status != c.NATS_OK) {
-            log.err("🔴 Failed to set max reconnect attempts: {s}", .{c.natsStatus_GetText(status)});
+            log.err(
+                "🔴 Failed to set max reconnect attempts: {s}",
+                .{c.natsStatus_GetText(status)},
+            );
             return error.NatsOptionsSetFailed;
         }
 
-        status = c.natsOptions_SetReconnectWait(opts, self.config.reconnect_wait_ms);
+        status = c.natsOptions_SetReconnectWait(
+            opts,
+            self.config.reconnect_wait_ms,
+        );
         if (status != c.NATS_OK) {
-            log.err("🔴 Failed to set reconnect wait time: {s}", .{c.natsStatus_GetText(status)});
+            log.err(
+                "🔴 Failed to set reconnect wait time: {s}",
+                .{c.natsStatus_GetText(status)},
+            );
             return error.NatsOptionsSetFailed;
         }
 
         // Set connection event callbacks (pass metrics pointer via user_data)
         const metrics_ptr = if (self.metrics) |m| @as(?*anyopaque, @ptrCast(m)) else null;
 
-        status = c.natsOptions_SetDisconnectedCB(opts, disconnectedCallback, metrics_ptr);
+        status = c.natsOptions_SetDisconnectedCB(
+            opts,
+            disconnectedCallback,
+            metrics_ptr,
+        );
         if (status != c.NATS_OK) {
-            log.err("🔴 Failed to set disconnected callback: {s}", .{c.natsStatus_GetText(status)});
+            log.err(
+                "🔴 Failed to set disconnected callback: {s}",
+                .{c.natsStatus_GetText(status)},
+            );
             return error.NatsOptionsSetFailed;
         }
 
-        status = c.natsOptions_SetReconnectedCB(opts, reconnectedCallback, metrics_ptr);
+        status = c.natsOptions_SetReconnectedCB(
+            opts,
+            reconnectedCallback,
+            metrics_ptr,
+        );
         if (status != c.NATS_OK) {
-            log.err("🔴 Failed to set reconnected callback: {s}", .{c.natsStatus_GetText(status)});
+            log.err(
+                "🔴 Failed to set reconnected callback: {s}",
+                .{c.natsStatus_GetText(status)},
+            );
             return error.NatsOptionsSetFailed;
         }
 
-        status = c.natsOptions_SetClosedCB(opts, closedCallback, null);
+        status = c.natsOptions_SetClosedCB(
+            opts,
+            closedCallback,
+            null,
+        );
         if (status != c.NATS_OK) {
-            log.err("🔴 Failed to set closed callback: {s}", .{c.natsStatus_GetText(status)});
+            log.err(
+                "🔴 Failed to set closed callback: {s}",
+                .{c.natsStatus_GetText(status)},
+            );
             return error.NatsOptionsSetFailed;
         }
 
         // Allow reconnection to same server
         status = c.natsOptions_SetAllowReconnect(opts, true);
         if (status != c.NATS_OK) {
-            log.err("🔴 Failed to enable reconnection: {s}", .{c.natsStatus_GetText(status)});
+            log.err(
+                "🔴 Failed to enable reconnection: {s}",
+                .{c.natsStatus_GetText(status)},
+            );
             return error.NatsOptionsSetFailed;
         }
 
@@ -216,7 +265,10 @@ pub const Publisher = struct {
         // Connect to NATS
         status = c.natsConnection_Connect(&self.nc, opts);
         if (status != c.NATS_OK) {
-            log.err("🔴 Failed to connect to NATS: {s}", .{c.natsStatus_GetText(status)});
+            log.err(
+                "🔴 Failed to connect to NATS: {s}",
+                .{c.natsStatus_GetText(status)},
+            );
             return error.NatsConnectionFailed;
         }
 
@@ -224,9 +276,16 @@ pub const Publisher = struct {
         self.is_connected.store(true, .seq_cst);
 
         // Get JetStream context
-        status = c.natsConnection_JetStream(&self.js, self.nc, null);
+        status = c.natsConnection_JetStream(
+            &self.js,
+            self.nc,
+            null,
+        );
         if (status != c.NATS_OK) {
-            log.err("🔴 Failed to get JetStream context: {s}", .{c.natsStatus_GetText(status)});
+            log.err(
+                "🔴 Failed to get JetStream context: {s}",
+                .{c.natsStatus_GetText(status)},
+            );
             self.deinit();
             return error.JetStreamContextFailed;
         }
@@ -277,11 +336,17 @@ pub const Publisher = struct {
     /// - subject: Full subject name (without prefix)
     /// - data: Message payload
     /// - msg_id: Optional unique message ID for idempotent delivery
-    pub fn publish(self: *Publisher, subject: []const u8, data: []const u8, msg_id: ?[]const u8) !void {
+    pub fn publish(
+        self: *Publisher,
+        subject: []const u8,
+        data: []const u8,
+        msg_id: ?[]const u8,
+    ) !void {
         if (self.js == null) {
             return error.NotConnected;
         }
 
+        // Convert subject to null-terminated string for C API
         const subject_cstr = try self.allocator.dupeZ(u8, subject);
         defer self.allocator.free(subject_cstr);
 
@@ -294,7 +359,10 @@ pub const Publisher = struct {
             // Initialize options
             const init_status = c.jsPubOptions_Init(&opts_storage);
             if (init_status != c.NATS_OK) {
-                log.err("🔴 Failed to initialize jsPubOptions: {d}", .{init_status});
+                log.err(
+                    "🔴 Failed to initialize jsPubOptions: {d}",
+                    .{init_status},
+                );
                 return error.InitFailed;
             }
 
@@ -315,7 +383,10 @@ pub const Publisher = struct {
         );
 
         if (status != c.NATS_OK) {
-            log.err("🔴 Failed to publish async: {s}", .{c.natsStatus_GetText(status)});
+            log.err(
+                "🔴 Failed to publish async: {s}",
+                .{c.natsStatus_GetText(status)},
+            );
             return error.PublishFailed;
         }
     }
@@ -339,11 +410,12 @@ pub const Publisher = struct {
         var opts: c.jsPubOptions = undefined;
         const init_status = c.jsPubOptions_Init(&opts);
         if (init_status != c.NATS_OK) {
-            log.err("Failed to initialize jsPubOptions for flush", .{});
+            log.err("🔴 Failed to initialize jsPubOptions for flush", .{});
             return error.InitFailed;
         }
-        opts.MaxWait = 10_000; // 10 seconds timeout (allows ~5 reconnection attempts)
+        opts.MaxWait = Conf.Nats.publisher_max_wait; // 10 seconds timeout (allows ~5 reconnection attempts)
 
+        // blocking until completion acknowledgment from NATS server
         const status = c.js_PublishAsyncComplete(self.js, &opts);
         if (status != c.NATS_OK) {
             const status_text = c.natsStatus_GetText(status);
@@ -352,36 +424,60 @@ pub const Publisher = struct {
             if (self.nc) |nc| {
                 const conn_status = c.natsConnection_Status(nc);
                 if (conn_status == c.NATS_CONN_STATUS_RECONNECTING) {
-                    log.warn("🔴 Flush timeout while NATS reconnecting: {s}", .{status_text});
+                    log.warn(
+                        "🔴 Flush timeout while NATS reconnecting: {s}",
+                        .{status_text},
+                    );
                 } else if (conn_status == c.NATS_CONN_STATUS_DISCONNECTED) {
                     log.err("🔴 Flush failed - NATS disconnected: {s}", .{status_text});
                 } else if (conn_status == c.NATS_CONN_STATUS_CLOSED) {
-                    log.err("🔴 Flush failed - NATS connection closed: {s}", .{status_text});
+                    log.err(
+                        "🔴 Flush failed - NATS connection closed: {s}",
+                        .{status_text},
+                    );
                 } else {
-                    log.err("🔴 Async publish completion failed: {s}", .{status_text});
+                    log.err(
+                        "🔴 Async publish completion failed: {s}",
+                        .{status_text},
+                    );
                 }
             } else {
-                log.err("🔴 Async publish completion failed: {s}", .{status_text});
+                log.err(
+                    "🔴 Async publish completion failed: {s}",
+                    .{status_text},
+                );
             }
 
             return error.FlushFailed;
         }
-        log.debug("✅ Async publishes flushed successfully", .{});
+        log.debug("Async publishes flushed successfully", .{});
     }
 
-    /// Get stream information as JSON
+    /// Get stream information as JSON from the JetStream server
+    ///
+    /// Used in the http_server "/streams/info" endpoint.
+    ///
+    /// Caller is responsible for freeing the returned memory.
     pub fn getStreamInfo(self: *Publisher, stream_name: []const u8) ![]const u8 {
         if (self.js == null) {
             return error.NotConnected;
         }
 
+        // Convert stream name to null-terminated string for the C API
         const stream_name_z = try self.allocator.dupeZ(u8, stream_name);
         defer self.allocator.free(stream_name_z);
 
         var stream_info: ?*c.jsStreamInfo = null;
         var js_err: c.jsErrCode = 0;
 
-        const status = c.js_GetStreamInfo(&stream_info, self.js, stream_name_z.ptr, null, &js_err);
+        const status = c.js_GetStreamInfo(
+            &stream_info,
+            self.js,
+            stream_name_z.ptr,
+            null,
+            &js_err,
+        );
+
         if (status != c.NATS_OK) {
             return error.StreamNotFound;
         }
@@ -395,7 +491,7 @@ pub const Publisher = struct {
         const json = try std.fmt.bufPrint(&buffer,
             \\{{"name":"{s}","messages":{d},"bytes":{d},"first_seq":{d},"last_seq":{d},"consumer_count":{d}}}
         , .{
-            std.mem.span(config.Name),
+            std.mem.span(config.Name), // no allocation, a ref to the C string
             info.State.Msgs,
             info.State.Bytes,
             info.State.FirstSeq,
@@ -403,35 +499,16 @@ pub const Publisher = struct {
             info.State.Consumers,
         });
 
-        return try self.allocator.dupe(u8, json);
+        return try self.allocator.dupe(u8, json); // new allocation
     }
 
-    /// Delete a stream
-    pub fn deleteStream(self: *Publisher, stream_name: []const u8) !void {
-        if (self.js == null) {
-            return error.NotConnected;
-        }
-
-        const stream_name_z = try self.allocator.dupeZ(u8, stream_name);
-        defer self.allocator.free(stream_name_z);
-
-        var js_err: c.jsErrCode = 0;
-        const status = c.js_DeleteStream(self.js, stream_name_z.ptr, null, &js_err);
-
-        if (status != c.NATS_OK) {
-            log.err("🔴 Failed to delete stream: {s}", .{c.natsStatus_GetText(status)});
-            return error.DeleteStreamFailed;
-        }
-
-        log.info("☑️ Stream '{s}' deleted", .{stream_name});
-    }
-
-    /// Purge all messages from a stream
+    /// Helper: Purge all messages from a stream
     pub fn purgeStream(self: *Publisher, stream_name: []const u8) !void {
         if (self.js == null) {
             return error.NotConnected;
         }
 
+        // Null terminate stream name for C API
         const stream_name_z = try self.allocator.dupeZ(u8, stream_name);
         defer self.allocator.free(stream_name_z);
 
@@ -450,103 +527,38 @@ pub const Publisher = struct {
 /// Ensure a JetStream stream exists (check-or-fail-fast)
 ///
 /// This validates that the stream exists and is accessible.
-/// Use this when infrastructure (e.g., nats-init container) creates streams.
-/// The bridge should only verify prerequisites, not create them.
-pub fn ensureStream(js: *c.jsCtx, allocator: std.mem.Allocator, stream_name: [:0]const u8) !void {
-    _ = allocator;
-    log.info("Checking JetStream stream '{s}' exists...", .{stream_name});
+/// The infrastructure (e.g., nats-init container) creates streams.
+pub fn ensureStream(js: *c.jsCtx, allocator: std.mem.Allocator, stream_name: []const u8) !void {
+    log.debug("Checking JetStream stream '{s}' exists...", .{stream_name});
+
+    // Convert slice into Null terminated stream name for C API
+    const stream_name_z = try allocator.dupeZ(u8, stream_name);
+    defer allocator.free(stream_name_z);
 
     var js_err: c.jsErrCode = 0;
     var stream_info: ?*c.jsStreamInfo = null;
 
     // Try to get existing stream info
-    const status = c.js_GetStreamInfo(&stream_info, js, stream_name.ptr, null, &js_err);
+    const status = c.js_GetStreamInfo(
+        &stream_info,
+        js,
+        stream_name_z.ptr,
+        null,
+        &js_err,
+    );
 
     if (status == c.NATS_OK) {
-        log.info("✓ Stream '{s}' found and accessible", .{stream_name});
+        log.debug("Stream '{s}' found and accessible", .{stream_name});
         c.jsStreamInfo_Destroy(stream_info);
         return;
     }
 
     // Stream doesn't exist or not accessible
     const status_text = c.natsStatus_GetText(status);
-    log.err("🔴 Stream '{s}' not found or inaccessible: {s}", .{ stream_name, status_text });
-    log.err("   Ensure the stream is created by infrastructure (e.g., nats-init container)", .{});
+    log.err(
+        "🔴 Stream '{s}' not found or inaccessible: {s}. Ensure the stream is created by infrastructure (e.g., nats-init container)",
+        .{ stream_name, status_text },
+    );
+
     return error.StreamNotFound;
-}
-
-/// Create or update a JetStream stream
-///
-/// This is a standalone function to keep stream management separate from the Publisher.
-/// Call this after connecting to configure your streams.
-///
-/// NOTE: Prefer using ensureStream() for production deployments where infrastructure
-/// (e.g., nats-init) creates streams. This function is useful for development/testing.
-pub fn createStream(js: *c.jsCtx, allocator: std.mem.Allocator, config: StreamConfig) !void {
-    log.info("Creating JetStream stream '{s}'...", .{config.name});
-
-    var js_err: c.jsErrCode = 0;
-    var stream_info: ?*c.jsStreamInfo = null;
-    var status: c.natsStatus = undefined;
-
-    // Try to get existing stream info
-    status = c.js_GetStreamInfo(&stream_info, js, config.name.ptr, null, &js_err);
-
-    if (status == c.NATS_OK) {
-        log.info("Stream '{s}' already exists", .{config.name});
-        c.jsStreamInfo_Destroy(stream_info);
-        return;
-    }
-
-    // Create stream configuration
-    var stream_cfg: c.jsStreamConfig = undefined;
-    status = c.jsStreamConfig_Init(&stream_cfg);
-    if (status != c.NATS_OK) {
-        log.err("Failed to init stream config: {s}", .{c.natsStatus_GetText(status)});
-        return error.StreamConfigInitFailed;
-    }
-
-    stream_cfg.Name = @constCast(config.name.ptr);
-
-    // Convert subjects to C array
-    var subjects_cstrs = try allocator.alloc([:0]const u8, config.subjects.len);
-    defer allocator.free(subjects_cstrs);
-
-    var subjects_ptrs = try allocator.alloc([*c]const u8, config.subjects.len);
-    defer allocator.free(subjects_ptrs);
-
-    for (config.subjects, 0..) |subject, i| {
-        subjects_cstrs[i] = try allocator.dupeZ(u8, subject);
-        subjects_ptrs[i] = subjects_cstrs[i].ptr;
-    }
-    defer for (subjects_cstrs) |cstr| allocator.free(cstr);
-
-    stream_cfg.Subjects = subjects_ptrs.ptr;
-    stream_cfg.SubjectsLen = @intCast(config.subjects.len);
-
-    // Set retention and limits
-    stream_cfg.Retention = config.retention.toC();
-    stream_cfg.MaxMsgs = config.max_msgs;
-    stream_cfg.MaxBytes = config.max_bytes;
-    stream_cfg.MaxAge = config.max_age_ns;
-    stream_cfg.Storage = config.storage.toC();
-    stream_cfg.Replicas = config.replicas;
-
-    // Create the stream
-    status = c.js_AddStream(&stream_info, js, &stream_cfg, null, &js_err);
-    if (status != c.NATS_OK) {
-        const status_text = c.natsStatus_GetText(status);
-        const last_error = c.nats_GetLastError(null);
-        const last_error_text = if (last_error) |err| std.mem.span(err) else "none";
-
-        if (js_err != 0) {
-            log.err("JetStream error: {s} (js_err: {d}, status: {d}, last_error: {s})", .{ status_text, js_err, status, last_error_text });
-        } else {
-            log.err("Failed to create stream: {s} (status: {d}, last_error: {s})", .{ status_text, status, last_error_text });
-        }
-        return error.StreamCreateFailed;
-    }
-
-    log.info("✓ JetStream stream '{s}' created", .{config.name});
-    c.jsStreamInfo_Destroy(stream_info);
 }

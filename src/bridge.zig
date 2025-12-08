@@ -31,15 +31,11 @@ fn initStreams(
     log.info("Verifying {d} NATS JetStream stream(s)...", .{stream_names.len});
 
     for (stream_names) |stream_name| {
-        const stream_name_z = try allocator.dupeZ(u8, stream_name);
-        defer allocator.free(stream_name_z);
-
-        // Verify stream exists and is accessible (fail-fast if not)
-        try nats_publisher.ensureStream(publisher.js.?, allocator, stream_name_z);
+        try nats_publisher.ensureStream(publisher.js.?, allocator, stream_name);
         log.info("  ✅ Stream '{s}' verified", .{stream_name});
     }
 
-    log.info("✅ All NATS JetStream streams verified\n", .{});
+    // log.info("✅ All NATS JetStream streams verified\n", .{});
 }
 
 /// Helper to process and publish a CDC event (INSERT/UPDATE/DELETE)
@@ -60,7 +56,7 @@ fn processCdcEvent(
         tuple_data,
         rel.columns,
     ) catch |err| {
-        log.warn("Failed to decode tuple: {}", .{err});
+        log.warn("⚠️ Failed to decode tuple: {}", .{err});
         return;
     };
     // NOTE: addEvent() takes ownership of decoded_values.
@@ -80,7 +76,7 @@ fn processCdcEvent(
         decoded_values.deinit(main_allocator);
     }
 
-    // Extract ID value for logging (if present) - use stack buffer
+    // Extract ID value for logging (if present)
     // Optimize: check length first before memcmp (most column names aren't "id")
     var id_buf: [64]u8 = undefined;
     const id_str = blk: {
@@ -99,7 +95,6 @@ fn processCdcEvent(
     };
 
     // Convert operation to lowercase for NATS subject
-    // Optimize: operation is always INSERT/UPDATE/DELETE, use lookup table
     const operation_lower = switch (operation[0]) {
         'I' => "insert", // INSERT
         'U' => "update", // UPDATE
@@ -107,7 +102,7 @@ fn processCdcEvent(
         else => unreachable, // Only these 3 operations exist in CDC
     };
 
-    // Create NATS subject - use stack buffer
+    // Create NATS subject
     var subject_buf: [128]u8 = undefined;
     const subject = try std.fmt.bufPrintZ(
         &subject_buf,
@@ -115,7 +110,7 @@ fn processCdcEvent(
         .{ subject_prefix, rel.name, operation_lower },
     );
 
-    // Generate message ID from WAL LSN for idempotent delivery - use stack buffer
+    // Generate message ID from WAL LSN for idempotent delivery
     var msg_id_buf: [128]u8 = undefined;
     const msg_id = try std.fmt.bufPrint(
         &msg_id_buf,
@@ -124,7 +119,16 @@ fn processCdcEvent(
     );
 
     // Add to batch publisher with column data, relation_id, and LSN
-    try batch_pub.addEvent(subject, rel.name, operation, msg_id, rel.relation_id, decoded_values, wal_end);
+    try batch_pub.addEvent(
+        subject,
+        rel.name,
+        operation,
+        msg_id,
+        rel.relation_id,
+        decoded_values,
+        wal_end,
+    );
+
     metrics.incrementCdcEvents();
 
     // Log single line with table, operation, and ID
@@ -225,25 +229,25 @@ pub fn main() !void {
     const pub_name_z = try allocator.dupeZ(u8, parsed_args.publication_name);
     defer allocator.free(pub_name_z);
 
-    log.info("\nStarting PostgreSQL replication_slot and publication...", .{});
+    log.info("Starting PostgreSQL replication_slot and publication...", .{});
     try replication.createSlot(slot_name_z);
     try replication.createPublication(pub_name_z, parsed_args.tables);
 
     // 2. Start WAL lag monitor in background thread
-    const monitor_config = wal_monitor.Config{
+    const wal_monitor_config = wal_monitor.WalConfig{
         .pg_config = &pg_config,
         .slot_name = parsed_args.slot_name,
         .check_interval_seconds = 30,
     };
     const monitor_thread = try std.Thread.spawn(
         .{},
-        wal_monitor.monitorWalLag,
-        .{ &metrics, monitor_config, &should_stop, allocator },
+        wal_monitor.monitorWALlag,
+        .{ &metrics, wal_monitor_config, &should_stop, allocator },
     );
     defer monitor_thread.join();
 
     // 3. Connect to NATS JetStream (needed by snapshot listener)
-    log.info("\nConnecting to NATS JetStream...", .{});
+    log.debug("Connecting to NATS JetStream...", .{});
     var publisher = try nats_publisher.Publisher.init(allocator, .{
         .url = "nats://localhost:4222",
     });
@@ -260,7 +264,7 @@ pub fn main() !void {
     // Initialize schema cache for tracking relation_id changes
     var schema_cache = schema_publisher.SchemaCache.init(allocator);
     defer schema_cache.deinit();
-    log.info("✅ Schema cache initialized\n", .{});
+    log.debug("Schema cache initialized\n", .{});
 
     // Publish initial schemas to INIT stream
     try schema_publisher.publishInitialSchemas(allocator, &pg_config, &publisher);
@@ -323,13 +327,13 @@ pub fn main() !void {
     log.info("✅ Async batch publishing enabled (max {d} events or {d}ms or {d}KB)\n", .{ batch_config.max_events, batch_config.max_wait_ms, batch_config.max_payload_bytes / 1024 });
 
     // Get current LSN to skip historical data
-    log.info(" \nGetting current LSN position...", .{});
+    log.info("Getting current LSN position...", .{});
     const current_lsn = try wal_monitor.getCurrentLSN(allocator, &pg_config);
     defer allocator.free(current_lsn);
     log.info("▶️ Current LSN: {s}\n", .{current_lsn});
 
     // Connect to replication stream starting from current LSN
-    log.info(" 4. Connecting to WAL replication stream...", .{});
+    log.info("Connecting to WAL replication stream...", .{});
     var pg_stream = wal_stream.ReplicationStream.init(
         allocator,
         .{

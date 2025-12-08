@@ -126,7 +126,10 @@ pub const AsyncBatchPublisher = struct {
 
                     // Log warning on first retry, then periodically
                     if (retry_count == 1 or retry_count % 100 == 0) {
-                        log.warn("Event queue full! Applying backpressure (retry #{d}). Queue capacity: 4096", .{retry_count});
+                        log.warn(
+                            "⚠️ Event queue full! Applying backpressure (retry #{d}). Queue capacity: 4096",
+                            .{retry_count},
+                        );
                     }
 
                     // Yield CPU to flush thread
@@ -145,7 +148,7 @@ pub const AsyncBatchPublisher = struct {
             break;
         }
 
-        log.debug("✅ Event added to lock-free queue", .{});
+        log.debug("Event added to lock-free queue", .{});
     }
 
     /// Get the last LSN that was successfully confirmed by NATS
@@ -167,7 +170,7 @@ pub const AsyncBatchPublisher = struct {
 
     /// Background thread that continuously drains events from lock-free queue and flushes to NATS
     fn flushLoop(self: *AsyncBatchPublisher) void {
-        log.info("Lock-free flush thread started", .{});
+        log.info("ℹ️ Lock-free flush thread started", .{});
 
         var batches_processed: usize = 0;
         var last_flush_time = std.time.milliTimestamp();
@@ -195,7 +198,7 @@ pub const AsyncBatchPublisher = struct {
                 const event_size = event.table.len + event.operation.len + event.subject.len;
 
                 batch.append(self.allocator, event) catch |err| {
-                    log.err("Failed to append to batch: {}", .{err});
+                    log.err("⚠️ Failed to append to batch: {}", .{err});
                     // Clean up event on error
                     var mut_event = event;
                     mut_event.deinit(self.allocator);
@@ -229,7 +232,7 @@ pub const AsyncBatchPublisher = struct {
 
                 // Flush the current batch - this will free the events but retain capacity
                 self.flushBatch(&batch) catch |err| {
-                    log.err("Failed to flush batch: {}", .{err});
+                    log.err("⚠️ Failed to flush batch: {}", .{err});
                 };
 
                 // Clear the batch (capacity is retained for reuse)
@@ -252,7 +255,7 @@ pub const AsyncBatchPublisher = struct {
         // Drain remaining events into the existing batch
         while (self.event_queue.pop()) |event| {
             batch.append(self.allocator, event) catch |err| {
-                log.err("Failed to append final event: {}", .{err});
+                log.err("⚠️ Failed to append final event: {}", .{err});
                 var mut_event = event;
                 mut_event.deinit(self.allocator);
                 break;
@@ -262,7 +265,7 @@ pub const AsyncBatchPublisher = struct {
         if (batch.items.len > 0) {
             log.info("Flushing final batch with {d} events", .{batch.items.len});
             self.flushBatch(&batch) catch |err| {
-                log.err("Failed to flush final batch: {}", .{err});
+                log.err("⚠️ Failed to flush final batch: {}", .{err});
             };
         }
     }
@@ -322,9 +325,9 @@ pub const AsyncBatchPublisher = struct {
 
         // Log flush timing
         const flush_elapsed = std.time.milliTimestamp() - flush_start;
-        log.info("✓ Flushed {d} events in {d}ms", .{ event_count, flush_elapsed });
+        log.info("Flushed {d} events in {d}ms", .{ event_count, flush_elapsed });
         if (flush_elapsed > 5) {
-            log.warn("Slow flush: {d}ms for {d} events", .{ flush_elapsed, event_count });
+            log.warn("⚠️ Slow flush: {d}ms for {d} events", .{ flush_elapsed, event_count });
         }
     }
 };

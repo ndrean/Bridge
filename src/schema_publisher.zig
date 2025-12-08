@@ -1,5 +1,7 @@
 const std = @import("std");
+const config = @import("config.zig");
 const nats_publisher = @import("nats_publisher.zig");
+const nats_kv = @import("nats_kv.zig");
 const pgoutput = @import("pgoutput.zig");
 const msgpack = @import("msgpack");
 const c = @cImport({
@@ -156,14 +158,14 @@ pub fn publishSchema(
     log.info("✅ Schema published: {s} ({d} columns)", .{ relation.name, relation.columns.len });
 }
 
-/// Query and publish initial schemas for all tables to INIT stream
+/// Query and publish initial schemas for all tables to NATS KV
 /// This runs once at bridge startup to ensure consumers have schema information
 pub fn publishInitialSchemas(
     allocator: std.mem.Allocator,
     pg_config: *const pg_conn.PgConf,
     publisher: *nats_publisher.Publisher,
 ) !void {
-    log.info("📋 Querying and publishing initial schemas to INIT stream...", .{});
+    log.info("📋 Querying and publishing initial schemas to NATS KV...", .{});
 
     // Create a separate PostgreSQL connection (NOT replication mode)
     const conninfo = try pg_config.connInfo(allocator, false);
@@ -283,7 +285,7 @@ pub fn publishInitialSchemas(
     log.info("✅ Published initial schemas for {d} tables", .{table_schemas.count()});
 }
 
-/// Publish a single table's schema to init.{table}.schema
+/// Publish a single table's schema to NATS KV store
 fn publishTableSchema(
     allocator: std.mem.Allocator,
     publisher: *nats_publisher.Publisher,
@@ -297,15 +299,6 @@ fn publishTableSchema(
         }
         break :blk table_name;
     };
-
-    // Build subject: init.{table}.schema
-    const subject = try std.fmt.allocPrint(
-        allocator,
-        "init.{s}.schema\x00",
-        .{table_only},
-    );
-    defer allocator.free(subject);
-    const subject_z: [:0]const u8 = subject[0 .. subject.len - 1 :0];
 
     // Build MessagePack payload with schema info
     var buffer = std.ArrayList(u8).empty;
@@ -372,16 +365,20 @@ fn publishTableSchema(
     try packer.write(schema_map);
     const encoded = buffer.items;
 
-    // Publish to INIT stream
-    const msg_id_buf = try std.fmt.allocPrint(
-        allocator,
-        "init-schema-{s}",
-        .{table_only},
-    );
-    defer allocator.free(msg_id_buf);
+    // Open KV store for schemas
+    var kv_store = try nats_kv.KVStore.open(publisher.js, config.Nats.schema_kv_bucket, allocator);
+    defer kv_store.deinit();
 
-    try publisher.publish(subject_z, encoded, msg_id_buf);
-    try publisher.flushAsync();
+    // Put schema into KV with key: table_name
+    const key = try std.fmt.allocPrintSentinel(allocator, "{s}", .{table_only}, 0);
+    defer allocator.free(key);
 
-    log.info("📋 Published initial schema → {s} ({d} columns)", .{ subject_z, columns.len });
+    const revision = try kv_store.put(key, encoded);
+
+    log.info("📋 Published schema to KV → schemas.{s} ({d} columns, {d} bytes, revision={d})", .{
+        table_only,
+        columns.len,
+        encoded.len,
+        revision,
+    });
 }

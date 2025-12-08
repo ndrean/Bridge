@@ -7,14 +7,15 @@ const c = @cImport({
 });
 const pg_conn = @import("pg_conn.zig");
 const metrics_mod = @import("metrics.zig");
+const Conf = @import("config.zig");
 
 pub const log = std.log.scoped(.wal_monitor);
 
 /// Configuration for WAL monitoring
-pub const Config = struct {
+pub const WalConfig = struct {
     pg_config: *const pg_conn.PgConf,
-    slot_name: []const u8,
-    check_interval_seconds: u32 = 30,
+    slot_name: []const u8, // via CLI arg
+    check_interval_seconds: u32 = Conf.WalMonitor.default_check_interval_seconds, // 30s
 };
 
 /// Get current WAL LSN position
@@ -64,9 +65,9 @@ pub fn getCurrentLSN(allocator: std.mem.Allocator, pg_conf: *const pg_conn.PgCon
 }
 
 /// Background thread that periodically checks WAL lag
-pub fn monitorWalLag(
+pub fn monitorWALlag(
     metrics: *metrics_mod.Metrics,
-    config: Config,
+    config: WalConfig,
     should_stop: *std.atomic.Value(bool),
     allocator: std.mem.Allocator,
 ) !void {
@@ -91,7 +92,7 @@ pub fn monitorWalLag(
 
 fn checkWalLag(
     metrics: *metrics_mod.Metrics,
-    config: Config,
+    config: WalConfig,
     allocator: std.mem.Allocator,
 ) !void {
     // Build connection string

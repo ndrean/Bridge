@@ -1,19 +1,20 @@
 # Multi-stage build for production
-# Using debian:bookworm-slim for glibc support with smaller footprint
+# Using alpine:3.22 for minimal footprint with musl libc
+ARG BASE_IMAGE=alpine:3.22
 
-FROM debian:bookworm-slim AS builder
+FROM ${BASE_IMAGE} AS builder
 
-RUN apt-get update && apt-get install -y \
+RUN apk add --no-cache \
     curl \
-    xz-utils \
+    xz \
     git \
     cmake \
     make \
     gcc \
     g++ \
-    libpq-dev \
-    postgresql-server-dev-all \
-    && rm -rf /var/lib/apt/lists/*
+    musl-dev \
+    postgresql-dev \
+    openssl-dev
 
 # Download and install Zig 0.15.2 (matching local development version)
 # Detect architecture and download appropriate version
@@ -39,13 +40,13 @@ RUN rm -rf libs/nats-install libs/nats.c/build libs/libpq-install zig-out zig-ca
 
 RUN zig build -Doptimize=ReleaseFast
 
-FROM debian:bookworm-slim
+FROM ${BASE_IMAGE}
 
 # Install only runtime PostgreSQL library
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq5 \
+RUN apk add --no-cache \
+    libpq \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    openssl-dev 
 
 COPY --from=builder /build/zig-out/bin/bridge /usr/local/bin/bridge
 

@@ -1,6 +1,7 @@
 //! Command-line arguments parsing for CDC Bridge application
 const std = @import("std");
-
+const pg = @import("config.zig").Postgres;
+const nats = @import("config.zig").Nats;
 const log = std.log.scoped(.args);
 
 /// Command-line arguments structure
@@ -16,10 +17,10 @@ pub const Args = struct {
         // Parse command-line arguments
         var args = try std.process.argsWithAllocator(allocator);
         _ = args.skip(); // Skip program name
-        var streams: []const []const u8 = &.{"CDC"}; // default: CDC stream only
-        var http_port: u16 = 8080; // default
-        var slot_name: []const u8 = "bridge_slot"; // default
-        var publication_name: []const u8 = "bridge_pub"; // default
+        var streams: []const []const u8 = &.{ "CDC", "INIT" }; // default
+        var http_port: u16 = 6543; // default
+        var slot_name: []const u8 = pg.default_slot_name; // default
+        var publication_name: []const u8 = pg.default_publication_name; // default
         var tables: []const []const u8 = &.{}; // default: all tables
 
         while (args.next()) |arg| {

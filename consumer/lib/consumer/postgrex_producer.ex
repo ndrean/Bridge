@@ -105,6 +105,12 @@ defmodule PgProducer do
     {:reply, :ok, state}
   end
 
+  # def snap_request(pid) do
+  #   Postgrex.query!(pid, """
+  #   INSERT INTO snapshot_requests (table_name, requested_by) VALUES ('users', 'elixir-consumer');
+  #   """)
+  # end
+
   defp create_table("test_types" = name, pid) do
     %Postgrex.Result{} =
       Postgrex.query!(pid, """

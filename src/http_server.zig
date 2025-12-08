@@ -41,7 +41,7 @@ pub const Server = struct {
         log.info("  GET  /status         - Bridge status (JSON)", .{});
         log.info("  GET  /metrics        - Prometheus metrics", .{});
         log.info("  POST /shutdown       - Graceful shutdown", .{});
-        log.info("  GET  /streams/info   - Get NATS stream info", .{});
+        log.info("  GET  /streams/info?stream=NAME   - NATS stream info", .{});
 
         while (!self.should_stop.load(.seq_cst)) {
             // Poll with timeout to allow checking shutdown flag
@@ -82,7 +82,6 @@ pub const Server = struct {
     fn handleRequest(self: *Server, stream: std.net.Stream) !void {
         var buffer: [2048]u8 = undefined;
 
-        // Read request line
         const bytes_read = try stream.read(&buffer);
         if (bytes_read == 0) return;
 
@@ -109,19 +108,18 @@ pub const Server = struct {
             try self.handleShutdown(stream);
         } else if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/streams/info")) {
             try self.handleStreamInfo(stream, path);
-            // } else if (std.mem.eql(u8, method, "POST") and std.mem.startsWith(u8, path, "/streams/create")) {
-            // try self.handleStreamCreate(stream, path);
-            // } else if (std.mem.eql(u8, method, "POST") and std.mem.startsWith(u8, path, "/streams/delete")) {
-            // try self.handleStreamDelete(stream, path);
-            // } else if (std.mem.eql(u8, method, "POST") and std.mem.startsWith(u8, path, "/streams/purge")) {
-            // try self.handleStreamPurge(stream, path);
         } else {
             try self.handleNotFound(stream);
         }
     }
 
-    fn sendResponse(stream: std.net.Stream, status: []const u8, content_type: []const u8, body: []const u8) !void {
-        var response_buffer: [8192]u8 = undefined;
+    fn sendResponse(
+        stream: std.net.Stream,
+        status: []const u8,
+        content_type: []const u8,
+        body: []const u8,
+    ) !void {
+        var response_buffer: [4096]u8 = undefined;
         const response = try std.fmt.bufPrint(&response_buffer,
             \\HTTP/1.1 {s}
             \\Content-Type: {s}
@@ -134,9 +132,15 @@ pub const Server = struct {
         _ = try stream.writeAll(response);
     }
 
+    // handlers ----------------------------------------------------
     fn handleHealth(self: *Server, stream: std.net.Stream) !void {
         _ = self;
-        try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}\n");
+        try sendResponse(
+            stream,
+            "200 OK",
+            "application/json",
+            "{\"status\":\"ok\"}\n",
+        );
     }
 
     fn handleStatus(self: *Server, stream: std.net.Stream) !void {
@@ -176,10 +180,20 @@ pub const Server = struct {
                 snap.wal_lag_bytes / (1024 * 1024), // Convert to MB
             });
 
-            try sendResponse(stream, "200 OK", "application/json", status_json);
+            try sendResponse(
+                stream,
+                "200 OK",
+                "application/json",
+                status_json,
+            );
         } else {
             // Fallback if no metrics available
-            try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"no_metrics\"}\n");
+            try sendResponse(
+                stream,
+                "200 OK",
+                "application/json",
+                "{\"status\":\"no_metrics\"}\n",
+            );
         }
     }
 
@@ -190,7 +204,7 @@ pub const Server = struct {
             defer self.allocator.free(snap.current_lsn_str);
 
             // Format Prometheus text format
-            var buffer: [8192]u8 = undefined;
+            var buffer: [4096]u8 = undefined;
             const prom_metrics = try std.fmt.bufPrint(&buffer,
                 \\# HELP bridge_uptime_seconds Time since bridge started
                 \\# TYPE bridge_uptime_seconds gauge
@@ -240,10 +254,20 @@ pub const Server = struct {
                 snap.wal_lag_bytes,
             });
 
-            try sendResponse(stream, "200 OK", "text/plain; version=0.0.4", prom_metrics);
+            try sendResponse(
+                stream,
+                "200 OK",
+                "text/plain",
+                prom_metrics,
+            );
         } else {
             // Empty metrics if not available
-            try sendResponse(stream, "200 OK", "text/plain; version=0.0.4", "# No metrics available\n");
+            try sendResponse(
+                stream,
+                "200 OK",
+                "text/plain;",
+                "# ⚠️ No metrics available\n",
+            );
         }
     }
 
@@ -253,22 +277,31 @@ pub const Server = struct {
         // Set shutdown flag
         self.should_stop.store(true, .seq_cst);
 
-        try sendResponse(stream, "200 OK", "text/plain", "Shutdown initiated\n");
+        try sendResponse(
+            stream,
+            "200 OK",
+            "text/plain",
+            "Shutdown initiated\n",
+        );
     }
 
     fn handleNotFound(self: *Server, stream: std.net.Stream) !void {
         _ = self;
-        try sendResponse(stream, "404 Not Found", "text/plain", "Not Found\n");
+        try sendResponse(
+            stream,
+            "404 Not Found",
+            "text/plain",
+            "Not Found\n",
+        );
     }
 
-    // NATS Stream Management Endpoints
+    // NATS Stream Management Endpoints. "path?key=value&..."
 
     fn parseQueryParam(path: []const u8, param_name: []const u8) ?[]const u8 {
         const query_start = std.mem.indexOf(u8, path, "?") orelse return null;
-        const query = path[query_start + 1 ..];
 
-        var params = std.mem.splitScalar(u8, query, '&');
-        while (params.next()) |param| {
+        var it = std.mem.splitScalar(u8, path[query_start + 1 ..], '&');
+        while (it.next()) |param| {
             if (std.mem.indexOf(u8, param, "=")) |eq_pos| {
                 const key = param[0..eq_pos];
                 const value = param[eq_pos + 1 ..];
@@ -282,7 +315,12 @@ pub const Server = struct {
 
     fn handleStreamInfo(self: *Server, stream: std.net.Stream, path: []const u8) !void {
         const stream_name = parseQueryParam(path, "stream") orelse {
-            try sendResponse(stream, "400 Bad Request", "text/plain", "⚠️ Missing 'stream' parameter\n");
+            try sendResponse(
+                stream,
+                "400 Bad Request",
+                "text/plain",
+                "⚠️ Missing 'stream' parameter\n",
+            );
             return;
         };
 
@@ -302,69 +340,14 @@ pub const Server = struct {
         }
     }
 
-    // fn handleStreamCreate(self: *Server, stream: std.net.Stream, path: []const u8) !void {
-    //     const stream_name = parseQueryParam(path, "stream") orelse {
-    //         try sendResponse(stream, "400 Bad Request", "text/plain", "⚠️ Missing 'stream' parameter\n");
-    //         return;
-    //     };
-
-    //     const subjects = parseQueryParam(path, "subjects") orelse "cdc.>";
-
-    //     if (self.nats_publisher) |publisher| {
-    //         // Convert query param strings to null-terminated for C API
-    //         const stream_name_z = try self.allocator.dupeZ(u8, stream_name);
-    //         defer self.allocator.free(stream_name_z);
-
-    //         const subjects_z = try self.allocator.dupeZ(u8, subjects);
-    //         defer self.allocator.free(subjects_z);
-
-    //         // Create stream config
-    //         const config = nats_publisher.StreamConfig{
-    //             .name = stream_name_z,
-    //             .subjects = &.{subjects_z},
-    //         };
-
-    //         // Call standalone createStream function
-    //         nats_publisher.createStream(publisher.js.?, self.allocator, config) catch |err| {
-    //             var err_buf: [256]u8 = undefined;
-    //             const err_msg = try std.fmt.bufPrint(&err_buf, "Failed to create stream: {}\n", .{err});
-    //             try sendResponse(stream, "500 Internal Server Error", "text/plain", err_msg);
-    //             return;
-    //         };
-
-    //         var response_buf: [256]u8 = undefined;
-    //         const response = try std.fmt.bufPrint(&response_buf, "Stream '{s}' created with subjects: {s}\n", .{ stream_name, subjects });
-    //         try sendResponse(stream, "200 OK", "text/plain", response);
-    //     } else {
-    //         try sendResponse(stream, "503 Service Unavailable", "text/plain", "⚠️ NATS publisher not available\n");
-    //     }
-    // }
-
-    // fn handleStreamDelete(self: *Server, stream: std.net.Stream, path: []const u8) !void {
-    //     const stream_name = parseQueryParam(path, "stream") orelse {
-    //         try sendResponse(stream, "400 Bad Request", "text/plain", "Missing 'stream' parameter\n");
-    //         return;
-    //     };
-
-    //     if (self.nats_publisher) |publisher| {
-    //         publisher.deleteStream(stream_name) catch |err| {
-    //             var err_buf: [256]u8 = undefined;
-    //             const err_msg = try std.fmt.bufPrint(&err_buf, "⚠️ Failed to delete stream: {}\n", .{err});
-    //             try sendResponse(stream, "500 Internal Server Error", "text/plain", err_msg);
-    //             return;
-    //         };
-
-    //         var response_buf: [256]u8 = undefined;
-    //         const response = try std.fmt.bufPrint(&response_buf, "Stream '{s}' deleted\n", .{stream_name});
-    //         try sendResponse(stream, "200 OK", "text/plain", response);
-    //     } else {
-    //         try sendResponse(stream, "503 Service Unavailable", "text/plain", "⚠️ NATS publisher not available\n");
-    //     }
-    // }
-
     fn handleStreamPurge(self: *Server, stream: std.net.Stream, path: []const u8) !void {
         const stream_name = parseQueryParam(path, "stream") orelse {
-            try sendResponse(stream, "400 Bad Request", "text/plain", "⚠️ Missing 'stream' parameter\n");
+            try sendResponse(
+                stream,
+                "400 Bad Request",
+                "text/plain",
+                "⚠️ Missing 'stream' parameter\n",
+            );
             return;
         };
 

@@ -8,12 +8,12 @@ defmodule Consumer.Application do
   def start(_type, _args) do
     children = [
       Producer.Repo,
+      {Gnat.ConnectionSupervisor, gnat_supervisor_settings()},
       {Task, fn -> :setup_jet_stream end},
       {PgProducer, args()},
-      {Gnat.ConnectionSupervisor, gnat_supervisor_settings()},
       # JetStream pull consumer for CDC events
-      {Consumer.Cdc, consumer_cdc_settings()},
-      {Consumer.Schema, consumer_schema_settings()}
+      {Consumer.Init, consumer_init_settings()},
+      {Consumer.Cdc, consumer_cdc_settings()}
     ]
 
     opts = [strategy: :one_for_one, name: Consumer.Supervisor]
@@ -23,23 +23,26 @@ defmodule Consumer.Application do
   def setup_jet_stream do
     {:ok, %{created: _}} =
       Gnat.Jetstream.API.Stream.create(:gnat, %Gnat.Jetstream.API.Stream{
+        name: "INIT",
+        subjects: ["init.>"]
+      })
+
+    {:ok, %{created: _}} = Gnat.Jetstream.API.Stream.info(:gnat, "INIT")
+
+    {:ok, %{created: _}} =
+      Gnat.Jetstream.API.Stream.create(:gnat, %Gnat.Jetstream.API.Stream{
         name: "CDC",
         subjects: ["cdc.>"]
       })
 
     {:ok, %{created: _}} = Gnat.Jetstream.API.Stream.info(:gnat, "CDC")
-
-    {:ok, %{created: _}} =
-      Gnat.Jetstream.API.Stream.create(:gnat, %Gnat.Jetstream.API.Stream{
-        name: "SCHEMA",
-        subjects: ["schema.>"]
-      })
-
-    {:ok, %{created: _}} = Gnat.Jetstream.API.Stream.info(:gnat, "SCHEMA")
   end
 
   defp get_tables do
-    System.get_env("TABLES") |> String.split(",") |> Enum.map(&String.trim/1)
+    case System.get_env("TABLES") do
+      nil -> ["users", "test_types"]
+      tables_str -> String.split(tables_str, ",") |> Enum.map(&String.trim/1)
+    end
   end
 
   defp args do
@@ -67,16 +70,17 @@ defmodule Consumer.Application do
     }
   end
 
-  defp consumer_schema_settings do
+  defp consumer_init_settings do
     %Gnat.Jetstream.API.Consumer{
       # consumer position tracking is persisted
-      durable_name: "ex_schema_consumer",
-      stream_name: "SCHEMA",
+      durable_name: "ex_init_consumer",
+      stream_name: "INIT",
       ack_policy: :explicit,
       # 60 seconds in nanoseconds
       ack_wait: 60_000_000_000,
       max_deliver: 3,
-      filter_subject: "schema.>"
+      filter_subject: "init.>",
+      deliver_policy: :all
     }
   end
 
@@ -85,7 +89,15 @@ defmodule Consumer.Application do
       name: :gnat,
       backoff_period: 4_000,
       connection_settings: [
-        %{host: "127.0.0.1", port: 4222}
+        %{
+          host: "127.0.0.1",
+          port: 4222
+          #   tls: %{
+          #   required: true,
+          #   verify: true,
+          #   cacertfile: "/path/to/ca.pem"
+          # }
+        }
       ]
     }
   end
