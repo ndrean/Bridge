@@ -43,6 +43,9 @@ pub const Nats = struct {
     /// Async publish flush timeout (milliseconds)
     /// Must be >= reconnect_wait_ms * max attempts
     pub const flush_timeout_ms = 10_000; // 10 seconds
+    pub const nats_flush_interval_seconds = 5; // 5 seconds
+    pub const status_update_interval_seconds = 1; // 1 second
+    pub const status_update_byte_threshold: u64 = 1024 * 1024; // 1MB
 
     /// JetStream stream names
     pub const stream_cdc = "CDC";
@@ -67,12 +70,17 @@ pub const Nats = struct {
     pub const schema_kv_bucket = "schemas";
 
     pub const publisher_max_wait = 10_000; // 10 seconds
+
+    /// JetStream stream default configuration
+    pub const stream_max_msgs = 1_000_000; // Maximum messages per stream
+    pub const stream_max_bytes = 1024 * 1024 * 1024; // 1GB maximum stream size
+    pub const stream_max_age_ns = 60 * 1_000_000_000; // 1 minute retention in nanoseconds
 };
 
 /// HTTP metrics server configuration
 pub const Http = struct {
     /// Default HTTP port for metrics endpoint
-    pub const default_port = 8080;
+    pub const default_port = 9090;
 
     /// HTTP server bind address
     pub const bind_address = "0.0.0.0";
@@ -87,13 +95,14 @@ pub const Http = struct {
 /// Batch publishing configuration
 pub const Batch = struct {
     /// Maximum events per batch
-    pub const max_events = 100;
+    pub const max_events = 500;
 
     /// Maximum batch age before force flush (milliseconds)
     pub const max_age_ms = 100;
 
     /// Size of the ring buffer (must be power of 2)
     pub const ring_buffer_size = 4096;
+    pub const max_payload_bytes = 256 * 1024; // 256KB
 };
 
 /// WAL monitoring configuration
@@ -108,13 +117,19 @@ pub const WalMonitor = struct {
     pub const critical_threshold_bytes = 1024 * 1024 * 1024; // 1GB
 };
 
+pub const Bridge = struct {
+    /// Maximum size of a single CDC message (bytes)
+    pub const max_cdc_message_size_bytes = 900 * 1024; // 900KB
+    pub const keepalive_interval_seconds = 30;
+};
+
 /// Snapshot generation configuration
 pub const Snapshot = struct {
     /// PostgreSQL NOTIFY channel for snapshot requests (deprecated - using NATS now)
     pub const notify_channel = "snapshot_request";
 
     /// Rows per snapshot chunk
-    pub const chunk_size = 1000;
+    pub const chunk_size = 10_000;
 
     /// Snapshot ID prefix
     pub const id_prefix = "snap";
@@ -132,11 +147,11 @@ pub const Snapshot = struct {
     /// NATS subject wildcard for subscribing to all snapshot requests
     pub const request_subject_wildcard = "snapshot.request.>";
 
-    /// NATS subject pattern for data chunks: "init.<table>.<snapshot_id>.<chunk>"
-    pub const data_subject_pattern = "init.{s}.{s}.{d}";
+    /// NATS subject pattern for data chunks: "init.snap.<table>.<snapshot_id>.<chunk>"
+    pub const data_subject_pattern = "init.snap.{s}.{s}.{d}";
 
-    /// NATS subject pattern for metadata: "init.<table>.meta"
-    pub const meta_subject_pattern = "init.{s}.meta";
+    /// NATS subject pattern for metadata: "init.meta.<table>"
+    pub const meta_subject_pattern = "init.meta.{s}";
 
     /// Message ID pattern for data chunks: "init-<table>-<snapshot_id>-<chunk>"
     pub const data_msg_id_pattern = "init-{s}-{s}-{d}";
@@ -150,6 +165,7 @@ pub const Metrics = struct {
 
     /// Enable debug logging
     pub const debug_enabled = false;
+    pub const metric_log_interval_seconds = 15;
 };
 
 /// Reconnection and retry configuration

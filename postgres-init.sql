@@ -24,35 +24,45 @@ SELECT
   pg_reload_conf ();
 
 -- ============================================================================
--- Read-Only User for CDC Bridge (Optional - for production security)
+-- Read-Only User for CDC Bridge (Production Security)
 -- ============================================================================
 -- This section creates a dedicated read-only user for the CDC bridge.
 -- Benefits:
 -- - No write access to tables (except replication slot management)
 -- - Principle of least privilege
 -- - Can be used instead of postgres superuser in production
---
--- Uncomment to enable:
---
--- CREATE USER bridge_reader WITH PASSWORD 'bridge_password_changeme';
---
+
+-- Create bridge_reader user with password
+CREATE USER bridge_reader WITH PASSWORD 'bridge_password_changeme';
+
 -- Grant replication privileges (required for logical replication)
--- ALTER USER bridge_reader WITH REPLICATION;
---
+ALTER USER bridge_reader WITH REPLICATION;
+
+-- Limit concurrent connections from bridge user
+ALTER USER bridge_reader CONNECTION LIMIT 5;
+
+-- Note: bridge_reader does NOT need SUPERUSER privilege because:
+-- 1. The publication is pre-created below by postgres superuser
+-- 2. The replication slot can be created by any user with REPLICATION privilege
+-- This is the recommended production security model.
+
 -- Grant connect to database
--- GRANT CONNECT ON DATABASE postgres TO bridge_reader;
---
+GRANT CONNECT ON DATABASE postgres TO bridge_reader;
+
+-- Grant CREATE privilege (required for creating publications and replication slots)
+GRANT CREATE ON DATABASE postgres TO bridge_reader;
+
 -- Grant usage on schema
--- GRANT USAGE ON SCHEMA public TO bridge_reader;
---
+GRANT USAGE ON SCHEMA public TO bridge_reader;
+
 -- Grant SELECT on all tables (current and future)
--- GRANT SELECT ON ALL TABLES IN SCHEMA public TO bridge_reader;
--- ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO bridge_reader;
---
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO bridge_reader;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO bridge_reader;
+
 -- Grant usage on sequences (for reading column metadata)
--- GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO bridge_reader;
--- ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE ON SEQUENCES TO bridge_reader;
---
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO bridge_reader;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON SEQUENCES TO bridge_reader;
+
 -- Note: The user still needs replication privileges to:
 -- 1. Create/drop replication slots (pg_create_logical_replication_slot)
 -- 2. Read from replication slots (pg_logical_slot_get_changes)
@@ -84,3 +94,8 @@ CREATE TABLE IF NOT EXISTS users (
     email TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Create publication for all tables AFTER tables exist
+DROP PUBLICATION IF EXISTS cdc_pub;
+
+CREATE PUBLICATION cdc_pub FOR ALL TABLES;

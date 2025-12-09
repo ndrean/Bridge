@@ -4,16 +4,15 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: bridge
-    networks:
-      - cdc-bridge
+
     ports:
-      - "8080:8080"
+      - "9090:9090"
     command: >
       bridge
         --stream CDC,INIT
-        --slot cdc_slot
-        --publication cdc_pub
-        --port 8080
+        --slot ${BRIDGE_CDC_SLOT:- "cdc_slot"}
+        --publication ${BRIDGE_CDC_PUBLICATION:- "cdc_pub"}
+        --port 9090
         --table users,test_types
     depends_on:
       postgres:
@@ -22,7 +21,16 @@ services:
         condition: service_completed_successfully
     environment:
       POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: postgres
       NATS_HOST: nats-server
+      NATS_USER: ${NATS_USER}
+      NATS_PASSWORD: ${NATS_PASSWORD}
+      LOG_LEVEL: info
+    networks:
+      - cdc-bridge
     restart: unless-stopped
 
   postgres:

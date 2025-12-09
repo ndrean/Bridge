@@ -13,11 +13,21 @@ pub const ReplicationSetup = struct {
     allocator: std.mem.Allocator,
     pg_config: pg_conn.PgConf,
 
-    /// Create a replication slot if it doesn't exist
+    /// Create a replication slot if it doesn't exist (hybrid: try create, fallback to verify)
+    ///
+    /// This function attempts to create a replication slot. If it already exists, it verifies
+    /// and continues. If creation fails due to permissions, it checks if the slot exists
+    /// (perhaps created by an admin) and uses it.
+    ///
+    /// Privilege requirements:
+    /// - To CREATE: Requires REPLICATION privilege
+    /// - To VERIFY: Requires ability to query pg_replication_slots
     pub fn createSlot(
         self: *const ReplicationSetup,
         slot_name: []const u8,
     ) !void {
+        const conn = try self.connect();
+        defer c.PQfinish(conn);
 
         // Check if slot exists
         const check_query = try std.fmt.allocPrintSentinel(
@@ -27,9 +37,6 @@ pub const ReplicationSetup = struct {
             0,
         );
         defer self.allocator.free(check_query);
-
-        const conn = try self.connect();
-        defer c.PQfinish(conn);
 
         const check_result = try runQuery(
             conn,
@@ -45,7 +52,7 @@ pub const ReplicationSetup = struct {
             return;
         }
 
-        // Create the slot
+        // Try to create the slot
         const create_query = try std.fmt.allocPrintSentinel(
             self.allocator,
             "SELECT pg_create_logical_replication_slot('{s}', 'pgoutput')",
@@ -54,14 +61,45 @@ pub const ReplicationSetup = struct {
         );
         defer self.allocator.free(create_query);
 
-        const create_result = try runQuery(conn, create_query);
+        const create_result = runQuery(conn, create_query) catch |err| {
+            // Creation failed - check if slot now exists (race condition or permission issue)
+            const recheck_result = runQuery(conn, check_query) catch {
+                log.err("🔴 Failed to create replication slot '{s}' and cannot verify existence", .{slot_name});
+                log.err("   → Ensure an admin has created the slot or grant REPLICATION privilege", .{});
+                return err;
+            };
+            defer c.PQclear(recheck_result);
+
+            if (c.PQntuples(recheck_result) > 0) {
+                log.info("✅ Replication slot '{s}' exists (created externally)", .{slot_name});
+                return;
+            }
+
+            log.err("🔴 Failed to create replication slot '{s}'", .{slot_name});
+            log.err("   → Ask your database administrator to run:", .{});
+            log.err("      SELECT pg_create_logical_replication_slot('{s}', 'pgoutput');", .{slot_name});
+            return err;
+        };
         defer c.PQclear(create_result);
 
         log.info("✅ Replication slot '{s}' created", .{slot_name});
     }
 
-    /// Create a publication if it doesn't exist on given tables.
-    /// ALL TABLES if tables is empty or list of table names.
+    /// Create a publication if it doesn't exist (hybrid: try create, fallback to verify)
+    ///
+    /// This function attempts to create a FOR ALL TABLES publication. If creation fails
+    /// due to permissions, it checks if the publication exists (perhaps created by an admin)
+    /// and uses it. The tables parameter is for informational/logging purposes only.
+    ///
+    /// Privilege requirements:
+    /// - To CREATE FOR ALL TABLES: Requires SUPERUSER privilege
+    /// - To CREATE FOR TABLE: Requires ownership of each table
+    /// - To VERIFY: Requires ability to query pg_publication
+    ///
+    /// Production deployment recommendation:
+    /// Have your database administrator pre-create the publication:
+    ///   CREATE PUBLICATION cdc_pub FOR ALL TABLES;
+    /// Then the bridge only needs REPLICATION privilege to use it.
     pub fn createPublication(
         self: *const ReplicationSetup,
         pub_name: []const u8,
@@ -85,50 +123,76 @@ pub const ReplicationSetup = struct {
         const exists = c.PQntuples(check_result) > 0;
 
         if (exists) {
-            if (tables.len == 0) {
-                log.info("✅  Publication '{s}' already exists, listening on ALL TABLES", .{pub_name});
-            } else {
-                const table_list = try std.mem.join(self.allocator, ", ", tables);
-                defer self.allocator.free(table_list);
-                log.info("✅ Publication '{s}' already exists, listening on tables: {s}", .{ pub_name, table_list });
-            }
+            log.info("✅  Publication '{s}' already exists, listening on ALL TABLES", .{pub_name});
             return;
         }
 
-        // Create publication
-        const create_query = if (tables.len == 0)
-            try std.fmt.allocPrintSentinel(
-                self.allocator,
-                "CREATE PUBLICATION {s} FOR ALL TABLES",
-                .{pub_name},
-                0,
-            )
-        else blk: {
-            // Join tables with ", "
-            const table_list = try std.mem.join(self.allocator, ", ", tables);
-            defer self.allocator.free(table_list);
-
-            const query = try std.fmt.allocPrint(
-                self.allocator,
-                "CREATE PUBLICATION {s} FOR TABLE {s}",
-                .{ pub_name, table_list },
-            );
-            defer self.allocator.free(query);
-
-            break :blk try self.allocator.dupeZ(u8, query);
-        };
+        // Try to create publication with FOR ALL TABLES
+        // This requires SUPERUSER privilege
+        const create_query = try std.fmt.allocPrintSentinel(
+            self.allocator,
+            "CREATE PUBLICATION {s} FOR ALL TABLES",
+            .{pub_name},
+            0,
+        );
         defer self.allocator.free(create_query);
 
-        const create_result = try runQuery(conn, create_query);
+        const create_result = runQuery(conn, create_query) catch |err| {
+            // Creation failed - check if publication now exists (race condition)
+            const recheck_result = runQuery(conn, check_query) catch {
+                log.err("🔴 Failed to create publication '{s}' and cannot verify existence", .{pub_name});
+                log.err("   → Ensure an admin has created the publication or grant SUPERUSER privilege", .{});
+                return err;
+            };
+            defer c.PQclear(recheck_result);
+
+            if (c.PQntuples(recheck_result) > 0) {
+                log.info("✅ Publication '{s}' exists (created externally)", .{pub_name});
+                return;
+            }
+
+            log.err("🔴 Failed to create publication '{s}'", .{pub_name});
+            log.err("   → Ask your database administrator to run:", .{});
+            log.err("      CREATE PUBLICATION {s} FOR ALL TABLES;", .{pub_name});
+            log.err("   → Or grant SUPERUSER privilege to the bridge user (not recommended for production)", .{});
+            return err;
+        };
         defer c.PQclear(create_result);
 
-        if (tables.len == 0) {
-            log.info("✅ Publication '{s}' created for ALL TABLES", .{pub_name});
-        } else {
+        if (tables.len > 0) {
             const table_list = try std.mem.join(self.allocator, ", ", tables);
             defer self.allocator.free(table_list);
-            log.info("✅ Publication '{s}' created for tables: {s}", .{ pub_name, table_list });
+            log.info("✅ Publication '{s}' created for ALL TABLES (monitoring: {s})", .{ pub_name, table_list });
+        } else {
+            log.info("✅ Publication '{s}' created for ALL TABLES", .{pub_name});
         }
+
+        // OPTION: Table-specific publications (PRESERVED BUT COMMENTED OUT)
+        // Uncomment this block if you need table-specific publications instead of FOR ALL TABLES
+        // WARNING: Requires ownership of each table listed
+        //
+        // const create_query = if (tables.len == 0)
+        //     try std.fmt.allocPrintSentinel(
+        //         self.allocator,
+        //         "CREATE PUBLICATION {s} FOR ALL TABLES",
+        //         .{pub_name},
+        //         0,
+        //     )
+        // else blk: {
+        //     // Join tables with ", "
+        //     const table_list = try std.mem.join(self.allocator, ", ", tables);
+        //     defer self.allocator.free(table_list);
+        //
+        //     const query = try std.fmt.allocPrint(
+        //         self.allocator,
+        //         "CREATE PUBLICATION {s} FOR TABLE {s}",
+        //         .{ pub_name, table_list },
+        //     );
+        //     defer self.allocator.free(query);
+        //
+        //     break :blk try self.allocator.dupeZ(u8, query);
+        // };
+        // defer self.allocator.free(create_query);
     }
 
     /// Drop a replication slot

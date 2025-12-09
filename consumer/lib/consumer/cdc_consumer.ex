@@ -30,7 +30,7 @@ defmodule Consumer.Cdc do
 
   @impl true
   def handle_message(message, state) do
-    :ok
+    # dbg(message.topic)
 
     try do
       # Decode MessagePack payload

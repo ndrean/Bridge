@@ -1,6 +1,7 @@
 //! Bridge application that streams PostgreSQL CDC events to NATS JetStream using pgoutput format
 const std = @import("std");
 const posix = std.posix;
+const Config = @import("config.zig");
 const wal_stream = @import("wal_stream.zig");
 const pgoutput = @import("pgoutput.zig");
 const nats_publisher = @import("nats_publisher.zig");
@@ -103,7 +104,7 @@ fn processCdcEvent(
     };
 
     // Create NATS subject
-    var subject_buf: [128]u8 = undefined;
+    var subject_buf: [Config.Buffers.subject_buffer_size]u8 = undefined;
     const subject = try std.fmt.bufPrintZ(
         &subject_buf,
         "{s}.{s}.{s}",
@@ -111,7 +112,7 @@ fn processCdcEvent(
     );
 
     // Generate message ID from WAL LSN for idempotent delivery
-    var msg_id_buf: [128]u8 = undefined;
+    var msg_id_buf: [Config.Buffers.msg_id_buffer_size]u8 = undefined;
     const msg_id = try std.fmt.bufPrint(
         &msg_id_buf,
         "{x}-{s}-{s}",
@@ -249,7 +250,7 @@ pub fn main() !void {
     // 3. Connect to NATS JetStream (needed by snapshot listener)
     log.debug("Connecting to NATS JetStream...", .{});
     var publisher = try nats_publisher.Publisher.init(allocator, .{
-        .url = "nats://localhost:4222",
+        .url = Config.Nats.default_url,
     });
     defer publisher.deinit();
 
@@ -298,11 +299,11 @@ pub fn main() !void {
     // Generate subject pattern from CDC stream name for publishing
     // Convert stream name to lowercase and use as subject prefix
     // Example: CDC -> "cdc.>" subjects
-    var subject_buf: [128]u8 = undefined;
+    var subject_buf: [Config.Buffers.subject_buffer_size]u8 = undefined;
     const subject_str = try std.fmt.bufPrint(&subject_buf, "{s}.>", .{cdc_stream_name});
 
     // Convert to lowercase for subject pattern
-    var lower_subject_buf: [128]u8 = undefined;
+    var lower_subject_buf: [Config.Buffers.subject_buffer_size]u8 = undefined;
     const lower_subject = blk: {
         if (subject_str.len > lower_subject_buf.len) return error.SubjectTooLong;
         for (subject_str, 0..) |c, i| {
@@ -316,9 +317,9 @@ pub fn main() !void {
 
     // Initialize async batch publisher (with dedicated flush thread)
     const batch_config = batch_publisher.BatchConfig{
-        .max_events = 500, // Larger batches = fewer flushes = higher throughput
-        .max_wait_ms = 100,
-        .max_payload_bytes = 128 * 1024, // Increase payload limit for larger batches
+        .max_events = Config.Batch.max_events,
+        .max_wait_ms = Config.Batch.max_age_ms,
+        .max_payload_bytes = Config.Batch.max_payload_bytes,
     };
     var batch_pub = try async_batch_publisher.AsyncBatchPublisher.init(allocator, &publisher, batch_config);
     defer batch_pub.deinit();
@@ -364,26 +365,28 @@ pub fn main() !void {
         break :blk lower_subject;
     };
 
+    // <--- Metrics setup
     var msg_count: u32 = 0;
     var cdc_events: u32 = 0;
     var last_lsn: u64 = 0;
     var last_ack_lsn: u64 = 0; // Track last acknowledged LSN for keepalives
     var last_keepalive_time = std.time.timestamp(); // Track last keepalive sent
-    const keepalive_interval_seconds: i64 = 30; // Send keepalive every 30 seconds
+    const keepalive_interval_seconds: i64 = Config.Bridge.keepalive_interval_seconds; // Send keepalive every 30 seconds
 
     // Status update batching to reduce PostgreSQL round trips
     var bytes_since_ack: u64 = 0; // Track bytes processed since last ack
     var last_status_update_time = std.time.timestamp();
-    const status_update_interval_seconds: i64 = 1; // Send status update every 1 second (reduced for visibility)
-    const status_update_byte_threshold: u64 = 1024 * 1024; // Or after 1MB of data (better than message count)
+    const status_update_interval_seconds: i64 = Config.Nats.status_update_interval_seconds; // Send status update every 1 second (reduced for visibility)
+    const status_update_byte_threshold: u64 = Config.Nats.status_update_byte_threshold; // Or after 1MB of data (better than message count)
 
     // NATS async publish flushing
     var last_nats_flush_time = std.time.timestamp();
-    const nats_flush_interval_seconds: i64 = 5; // Flush NATS async publishes every 5 seconds
+    const nats_flush_interval_seconds: i64 = Config.Nats.nats_flush_interval_seconds; // Flush NATS async publishes every 5 seconds
 
     // Periodic structured metric logging for Grafana Alloy/Loki
     var last_metric_log_time = std.time.timestamp();
-    const metric_log_interval_seconds: i64 = 15; // Log metrics every 15 seconds
+    const metric_log_interval_seconds: i64 = Config.Metrics.metric_log_interval_seconds; // Log metrics every 15 seconds
+    // --->
 
     // Track relation metadata (table info)
     var relation_map = std.AutoHashMap(u32, pgoutput.RelationMessage).init(allocator);
@@ -462,7 +465,7 @@ pub fn main() !void {
                                     var old_rel = old_entry.value;
                                     old_rel.deinit(allocator);
                                 }
-                                // log.info("RELATION: {s}.{s} (id={d}, {d} columns)", .{ rel.namespace, rel.name, rel.relation_id, rel.columns.len });
+                                log.debug("RELATION: {s}.{s} (id={d}, {d} columns)", .{ rel.namespace, rel.name, rel.relation_id, rel.columns.len });
                             },
                             .begin => |b| {
                                 log.info("BEGIN: xid={d} lsn={x}", .{ b.xid, b.final_lsn });
@@ -644,7 +647,7 @@ pub fn main() !void {
             // Get latest LSN and reconnect
             const reconnect_lsn = wal_monitor.getCurrentLSN(allocator, &pg_config) catch |lsn_err| {
                 log.err("Failed to get LSN for reconnect: {}", .{lsn_err});
-                std.Thread.sleep(5000 * std.time.ns_per_ms); // Wait longer before retry
+                std.Thread.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
                 continue;
             };
             defer allocator.free(reconnect_lsn);
@@ -655,13 +658,13 @@ pub fn main() !void {
             // Reconnect to replication stream
             pg_stream.connect() catch |conn_err| {
                 log.err("Failed to reconnect: {}", .{conn_err});
-                std.Thread.sleep(5000 * std.time.ns_per_ms);
+                std.Thread.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
                 continue;
             };
 
             pg_stream.startStreaming(reconnect_lsn) catch |stream_err| {
                 log.err("Failed to restart streaming: {}", .{stream_err});
-                std.Thread.sleep(5000 * std.time.ns_per_ms);
+                std.Thread.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
                 continue;
             };
 

@@ -1,21 +1,126 @@
-# Standalone PostgreSQL CDC Bridge to NATS
+# POSTGRESQL-to-NATS bridge server
 
-A Change Data Capture (CDC) bridge that streams PostgreSQL changes to NATS JetStream in `Zig`.
+A Zig project to build a PostgreSQL bridge opiniated server to:
+
+- stream Change Data Capture (CDC) to NATS JetStream
+- bootstrap a PostgreSQL table via a NATS server
+- MessagePack encoding
 
 ```mermaid
 flowchart LR
-    Code[PostgreSQL] <-.->|WAL slot <br> pgoutput| Bridge -.-> |stream| NATS.IO/JetStream <-.-> Consumers
+    Code[PostgreSQL] <-.-> Bridge_server -.-> NATS/JetStream <-.-> Consumers
 ```
 
-It is designed to use by default NATS/JetStream, with:
-**one port**, **one slot**, **one stream**.
+It uses the streams `CDC` and `INIT` to which NATS/JS consumers should subscribe or publish to.
+
+The message are encoded with `MessagePack`.
+
+It uses a NATS KV store with a bucket name "schemas" to hold the schemas of the tables of interest.
+
+Consumers subscribe to the stream `INIT` and will receive on connection:
+
+- the schemas through the topic `init.schema`:
+  
+```json
+// topic: init.schema.<table>
+%{"columns" => 
+  [
+    %{"column_default" => "nextval('users_id_seq'::regclass)", "data_type" => "integer", "is_nullable" => false, "name" => "id", "position" => 1}, 
+    %{"column_default" => nil, "data_type" => "text", "is_nullable" => false, "name" => "name", "position" => 2}, 
+    %{"column_default" => nil, "data_type" => "text", "is_nullable" => true, "name" => "email", "position" => 3}, 
+    %{"column_default" => "now()", "data_type" => "timestamp with time zone", "is_nullable" => true, "name" => "created_at", "position" => 4}
+  ],
+  "schema" => "public.users", 
+  "table" => "users", 
+  "timestamp" => 1765201228
+}
+```
+
+- metadata for the topic `init.meta` and a full snpashot of the table of interest for the topic `init.<table>`
+  
+```json
+//topic: init.meta.<table>
+%{
+  "batch_count" => 4,
+  "lsn" => "0/191BFD0",
+  "row_count" => 4000,
+  "snapshot_id" => "snap-1765208480",
+  "table" => "users",
+  "timestamp" => 1765208480
+}
+
+// topic: init.snap.<table>.snap-<snap-id>.<chunk_id>
+%{
+  "chunk" => 3,
+  "data" => [
+    %{
+      "created_at" => "2025-12-08 13:45:21.719719+00",
+      "email" => "user-0-2001@example.com",
+      "id" => "3001",
+      "name" => "User-0-2001"
+    },
+    ...
+  ]
+}%
+```
+
 
 ```sh
-./bridge --port 9090 -slot rt_slot --publication rt_pub --stream CDC_RT
+./bridge --port 9090 --table tab_1,tab_2 --stream CDC,INIT --slot bridge
 ```
 
-If you need a new one, you assign a new HTTP port, replication slot and NATS stream.
+> [!NOTE] PostgreSQL replication slots are single threaded. If you need more replicas, open another port and another slot.
 
+It provides basic telemetry to monitor the WAL lag size, via logs to SDTOUT and Prometheus ready at the endpoint ":9090/metrics".
+
+## Setup/Features
+
+The NATS/JS setup should create the two streams.
+PostgreSQL should contain the tables of interest.
+
+JetStream must be enabled and a KV store should be created
+
+Example of NATS setup:
+
+```yml
+nats-init:
+    image: natsio/nats-box:latest
+    container_name: nats-init
+    networks:
+      - cdc-bridge
+    depends_on:
+      - nats-server
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        until nats server check connection --server=nats://nats-server:4222 2>/dev/null; do
+          sleep 1
+        done
+
+        nats stream add CDC --server=nats://nats-server:4222 --subjects='cdc.>' --storage=file --retention=limits --max-age=1m --max-msgs=1000000 --max-bytes=1G --replicas=1 --defaults || true
+
+        nats stream add INIT --server=nats://nats-server:4222 --subjects='init.>' --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=100G --replicas=1 --defaults || true
+ 
+        nats kv add schemas --server=nats://nats-server:4222 --history=10 --replicas=1 || true
+ 
+        exit 0
+    restart: "no"
+
+```
+
+## Features
+
+- PostgreSQL logical replication setup (replication slots & publications)
+- NATS/JetStream integration for reliable message streaming
+- Self-contained build using vendored nats.c library
+- **MessagePack encoding** - Binary format for efficient serialization
+- **Graceful shutdown** - Signal handling (SIGINT/SIGTERM)
+- **Non-blocking I/O** - Efficient polling with 10ms sleep when idle
+- **Automatic reconnection** - Handles connection failures with exponential backoff
+- **Arena allocator** - Optimized temporary allocations per message
+  
 ## Architecture
 
 batch_publisher.zig: Return max LSN from flush operations
@@ -651,72 +756,9 @@ docker exec -it postgres psql -U postgres -c "
 "
 ```
 
-## Protobuf
-
-The decoderbufs protobuf schema is **universal/generic**.
-It's designed to represent CDC events for _ANY_ table structure.
-
-Here's how it works: The schema defines generic structures like:
-
-- RowMessage - represents a single row change
-- DatumMessage - represents a column value with metadata
-- Column names and types are included dynamically in each message
-
-So when you get an INSERT on the users table, the protobuf message contains:
-
-```proto
-RowMessage {
-  operation: INSERT
-  table: "users"
-  new_tuple: [
-    DatumMessage { column_name: "id", column_type: INT4, datum_int32: 123 },
-    DatumMessage { column_name: "name", column_type: TEXT, datum_string: "User 123" },
-    DatumMessage { column_name: "email", column_type: TEXT, datum_string: "user123@example.com" }
-  ]
-}
-```
-
-The same schema works for the orders table:
-
-```proto
-RowMessage {
-  operation: INSERT
-  table: "orders"
-  new_tuple: [
-    DatumMessage { column_name: "id", column_type: INT4, datum_int32: 456 },
-    DatumMessage { column_name: "user_id", column_type: INT4, datum_int32: 123 },
-    DatumMessage { column_name: "total", column_type: NUMERIC, datum_double: 99.99 }
-  ]
-}
-```
-
-What you need:
-
-- The decoderbufs .proto schema file (from Debezium project)
-- Use `zig-protobuf` to generate Zig code from that schema: `zig build gen-proto`
-- Use the same generated code for all tables
-- provides `RowMessage` struct with `declde()` method, and all necessary types.
-- you make a _pb_parser.zig_ wrapper around protobuf with helpers to convert operations and datum values to strings.
-
-It's a generic CDC format that works for any table schema without requiring custom protobuf definitions per table.
-
-**What the Protobuf Schema Provides**:  The RowMessage struct contains:
-
-- table: Table name (e.g., "users", "orders")
-- op: Operation type (INSERT, UPDATE, DELETE)
-- new_tuple: Array of DatumMessage with actual column values for INSERT/UPDATE
-- old_tuple: Array of DatumMessage with old values for UPDATE/DELETE
-- transaction_id, commit_time: Transaction metadata
-
-Each DatumMessage has:
-
-- column_name: "id", "name", "email", etc.
-- column_type: PostgreSQL type OID
-- datum: Union of typed values (int32, int64, float, double, bool, string, bytes, point)
-
 ## Notes
 
-- The nats.c library is built without NATS Streaming (STAN) support
+- The nats.c library is built with TLS enabled.
 - The library is statically linked to avoid runtime dependencies
 - PostgreSQL logical replication requires `wal_level=logical`
 - All C code is compiled with `-std=c11`
@@ -732,7 +774,6 @@ ps aux | grep bridge | grep -v grep
 This project uses:
 
 - nats.c (Apache 2.0)
-- pg.zig (MIT)
 - zig-msgpack (MIT)
 
 ## SCSCP

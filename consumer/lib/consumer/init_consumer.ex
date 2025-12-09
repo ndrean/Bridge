@@ -28,10 +28,13 @@ defmodule Consumer.Init do
          :ok <- ensure_stream_exists(consumer_config),
          :ok <- create_consumer(consumer_config),
          # Fetch schemas from KV store
-         :ok <- fetch_schemas_from_kv(),
+         {:ok, schemas} <- fetch_schemas_from_kv(),
+         #  do something with schemas, like run migration if needed
+         :ok <- maybe_run_migration(schemas),
          # Check if we need to request snapshots
          :ok <- check_and_request_snapshots_if_needed(stream_name) do
-      {:ok, nil, connection_name: :gnat, stream_name: stream_name, consumer_name: consumer_name}
+      {:ok, schemas,
+       connection_name: :gnat, stream_name: stream_name, consumer_name: consumer_name}
     else
       {:error, reason} ->
         Logger.error("[INIT Consumer] 🔴 Initialization failed: #{inspect(reason)}")
@@ -41,10 +44,17 @@ defmodule Consumer.Init do
 
   @impl true
   def handle_message(message, state) do
+    # dbg(message.topic)
+
     try do
       # Decode MessagePack payload
-      decoded = Msgpax.unpack!(message.body)
-      dbg(decoded)
+      Task.Supervisor.start_child(MyTaskSupervisor, fn ->
+        _decoded = Msgpax.unpack!(message.body)
+        # TODO: insert into DB based on schema in state
+        Logger.info("[INIT Consumer] Processed snapshot chunk message")
+      end)
+
+      # dbg(decoded)
 
       {:ack, state}
     rescue
@@ -53,6 +63,12 @@ defmodule Consumer.Init do
         # Negative acknowledgment - will be redelivered
         {:nack, state}
     end
+  end
+
+  defp maybe_run_migration(_schemas) do
+    # Placeholder for migration logic based on fetched schemas
+    Logger.info("[INIT Consumer] Maybe run migrations")
+    :ok
   end
 
   defp fetch_schemas_from_kv do
@@ -65,45 +81,29 @@ defmodule Consumer.Init do
       end
 
     # Fetch schema for each table from KV
-    Enum.each(tables, fn table_name ->
-      case Gnat.Jetstream.API.KV.get_value(:gnat, "schemas", table_name) do
-        schema_data when is_binary(schema_data) ->
-          # Decode MessagePack schema
-          case Msgpax.unpack(schema_data) do
-            {:ok, schema} ->
-              Logger.info(
-                "[INIT Consumer] Fetched schema from KV for table '#{table_name}': \n#{inspect(schema)}\n"
-              )
+    schemas =
+      Enum.reduce(tables, [], fn table_name, acc ->
+        case Gnat.Jetstream.API.KV.get_value(:gnat, "schemas", table_name) do
+          schema_data when is_binary(schema_data) ->
+            case Msgpax.unpack(schema_data) do
+              {:ok, schema} ->
+                Logger.info(
+                  "[INIT Consumer] Fetched schema from KV for table '#{table_name}': \n#{inspect(schema)}\n"
+                )
 
-              :ok
+                [schema | acc]
 
-            {:error, reason} ->
-              Logger.error(
-                "[INIT Consumer] 🔴 Failed to decode schema for '#{table_name}': #{inspect(reason)}"
-              )
+              _ ->
+                [:err | acc]
+            end
 
-              {:error, reason}
-          end
+          _ ->
+            Logger.error("[INIT Consumer] 🔴 Failed to fetch schema from KV for '#{table_name}'")
+            [:err | acc]
+        end
+      end)
 
-        {:error, :not_found} ->
-          Logger.warning("[INIT Consumer] 🔴 Schema not found in KV for table '#{table_name}'")
-          {:error, :not_found}
-
-        {:error, reason} ->
-          Logger.error(
-            "[INIT Consumer] 🔴 Failed to fetch schema from KV for '#{table_name}': #{inspect(reason)}"
-          )
-
-          {:error, reason}
-
-        other ->
-          Logger.warning(
-            "[INIT Consumer] 🔴 Unexpected KV response for '#{table_name}': #{inspect(other)}"
-          )
-
-          {:error, other}
-      end
-    end)
+    {:ok, schemas}
   end
 
   defp ensure_jetstream_enabled do
@@ -195,7 +195,7 @@ defmodule Consumer.Init do
 
     # Request snapshot for each table
     Enum.each(tables, fn table_name ->
-      :ok = Gnat.pub(:gnat, "snapshot.request." <> table_name, "") |> dbg()
+      :ok = Gnat.pub(:gnat, "snapshot.request." <> table_name, "")
       Logger.info("[INIT Consumer] ℹ️ Requested snapshot for table #{table_name}")
     end)
 

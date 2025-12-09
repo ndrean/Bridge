@@ -1,4 +1,5 @@
 //! PostgreSQL configuration and connection management.
+//!
 //! Methods for PG init configuration and connection_string, and connection management.
 const std = @import("std");
 

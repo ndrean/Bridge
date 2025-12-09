@@ -3,6 +3,7 @@ const batch_publisher = @import("batch_publisher.zig");
 const nats_publisher = @import("nats_publisher.zig");
 const pgoutput = @import("pgoutput.zig");
 const SPSCQueue = @import("spsc_queue.zig").SPSCQueue;
+const Config = @import("config.zig");
 
 pub const log = std.log.scoped(.async_batch_publisher);
 
@@ -32,7 +33,7 @@ pub const AsyncBatchPublisher = struct {
     ) !AsyncBatchPublisher {
         // Initialize lock-free queue with power-of-2 capacity
         // 4096 events = can buffer ~8 batches worth of events at max_events=500
-        const event_queue = try SPSCQueue(batch_publisher.CDCEvent).init(allocator, 4096);
+        const event_queue = try SPSCQueue(batch_publisher.CDCEvent).init(allocator, Config.Batch.ring_buffer_size);
 
         return AsyncBatchPublisher{
             .allocator = allocator,
@@ -127,8 +128,8 @@ pub const AsyncBatchPublisher = struct {
                     // Log warning on first retry, then periodically
                     if (retry_count == 1 or retry_count % 100 == 0) {
                         log.warn(
-                            "⚠️ Event queue full! Applying backpressure (retry #{d}). Queue capacity: 4096",
-                            .{retry_count},
+                            "⚠️ Event queue full! Applying backpressure (retry #{d}). Queue capacity: {d}",
+                            .{ retry_count, Config.Batch.ring_buffer_size },
                         );
                     }
 

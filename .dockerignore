@@ -17,3 +17,11 @@ nats-data/
 # Docker
 postgres-data/
 /consumer/
+src/test_files/
+src/proto/
+scripts/
+.lexical/
+*.md
+*.tar.gz
+.dockerignore
+.env.example

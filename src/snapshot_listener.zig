@@ -232,7 +232,7 @@ fn generateIncrementalSnapshot(
         );
         defer allocator.free(encoded);
 
-        // Publish chunk to NATS: init.users.snap-1733507200.0
+        // Publish chunk to NATS: init.snap.users.snap-1733507200.0
         const subject = try std.fmt.allocPrint(
             allocator,
             config.Snapshot.data_subject_pattern ++ "\x00",

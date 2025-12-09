@@ -8,8 +8,8 @@ defmodule Consumer.Application do
   def start(_type, _args) do
     children = [
       Producer.Repo,
+      {Task.Supervisor, name: MyTaskSupervisor},
       {Gnat.ConnectionSupervisor, gnat_supervisor_settings()},
-      {Task, fn -> :setup_jet_stream end},
       {PgProducer, args()},
       # JetStream pull consumer for CDC events
       {Consumer.Init, consumer_init_settings()},
@@ -18,24 +18,6 @@ defmodule Consumer.Application do
 
     opts = [strategy: :one_for_one, name: Consumer.Supervisor]
     Supervisor.start_link(children, opts)
-  end
-
-  def setup_jet_stream do
-    {:ok, %{created: _}} =
-      Gnat.Jetstream.API.Stream.create(:gnat, %Gnat.Jetstream.API.Stream{
-        name: "INIT",
-        subjects: ["init.>"]
-      })
-
-    {:ok, %{created: _}} = Gnat.Jetstream.API.Stream.info(:gnat, "INIT")
-
-    {:ok, %{created: _}} =
-      Gnat.Jetstream.API.Stream.create(:gnat, %Gnat.Jetstream.API.Stream{
-        name: "CDC",
-        subjects: ["cdc.>"]
-      })
-
-    {:ok, %{created: _}} = Gnat.Jetstream.API.Stream.info(:gnat, "CDC")
   end
 
   defp get_tables do
@@ -47,11 +29,11 @@ defmodule Consumer.Application do
 
   defp args do
     [
-      hostname: System.get_env("PG_HOST") || "localhost",
-      port: String.to_integer(System.get_env("PG_PORT") || "5432"),
+      hostname: System.get_env("POSTGRES_HOST") || "localhost",
+      port: String.to_integer(System.get_env("POSTGRES_PORT") || "5432"),
       username: System.get_env("PG_USER") || "postgres",
       password: System.get_env("PG_PASSWORD") || "postgres",
-      database: System.get_env("PG_DB") || "postgres",
+      database: System.get_env("POSTGRES_DB") || "postgres",
       name: PgEx,
       tables: get_tables() || ["users", "orders"]
     ]
@@ -66,6 +48,8 @@ defmodule Consumer.Application do
       # 60 seconds in nanoseconds
       ack_wait: 60_000_000_000,
       max_deliver: 3,
+      max_batch: 100,
+      deliver_policy: :all,
       filter_subject: "cdc.>"
     }
   end
@@ -80,7 +64,8 @@ defmodule Consumer.Application do
       ack_wait: 60_000_000_000,
       max_deliver: 3,
       filter_subject: "init.>",
-      deliver_policy: :all
+      deliver_policy: :all,
+      max_batch: 100
     }
   end
 
@@ -90,8 +75,10 @@ defmodule Consumer.Application do
       backoff_period: 4_000,
       connection_settings: [
         %{
-          host: "127.0.0.1",
-          port: 4222
+          host: System.get_env("NATS_HOST") || "127.0.0.1",
+          port: String.to_integer(System.get_env("NATS_PORT") || "4222"),
+          username: System.get_env("NATS_USER"),
+          password: System.get_env("NATS_PASSWORD")
           #   tls: %{
           #   required: true,
           #   verify: true,

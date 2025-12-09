@@ -24,9 +24,9 @@ pub const StreamConfig = struct {
     name: [:0]const u8,
     subjects: []const []const u8,
     retention: RetentionPolicy = .limits,
-    max_msgs: i64 = 1_000_000,
-    max_bytes: i64 = 1024 * 1024 * 1024, // 1GB
-    max_age_ns: i64 = 60 * 1_000_000_000, // 1 min in ns
+    max_msgs: i64 = Conf.Nats.stream_max_msgs,
+    max_bytes: i64 = Conf.Nats.stream_max_bytes,
+    max_age_ns: i64 = Conf.Nats.stream_max_age_ns,
     storage: StorageType = .file, // persisted on file system
     replicas: i32 = 1,
 
@@ -137,13 +137,32 @@ pub const Publisher = struct {
         };
         defer allocator.free(nats_uri);
 
-        // Docker ready-made NATS URL null terminated string
-        const url: [:0]const u8 = try std.fmt.allocPrintSentinel(
-            allocator,
-            "nats://{s}:4222",
-            .{nats_uri},
-            0,
-        );
+        // Read optional NATS authentication credentials
+        const nats_user = std.process.getEnvVarOwned(allocator, "NATS_USER") catch null;
+        defer if (nats_user) |u| allocator.free(u);
+
+        const nats_password = std.process.getEnvVarOwned(allocator, "NATS_PASSWORD") catch null;
+        defer if (nats_password) |p| allocator.free(p);
+
+        // Build NATS URL with optional authentication
+        const url: [:0]const u8 = if (nats_user != null and nats_password != null)
+            try std.fmt.allocPrintSentinel(
+                allocator,
+                "nats://{s}:{s}@{s}:4222",
+                .{ nats_user.?, nats_password.?, nats_uri },
+                0,
+            )
+        else
+            try std.fmt.allocPrintSentinel(
+                allocator,
+                "nats://{s}:4222",
+                .{nats_uri},
+                0,
+            );
+
+        if (nats_user != null and nats_password != null) {
+            log.info("NATS authentication enabled for user: {s}", .{nats_user.?});
+        }
 
         return Publisher{
             .allocator = allocator,

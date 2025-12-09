@@ -2,6 +2,7 @@ const std = @import("std");
 const nats_publisher = @import("nats_publisher.zig");
 const msgpack = @import("msgpack");
 const pgoutput = @import("pgoutput.zig");
+const Config = @import("config.zig");
 
 pub const log = std.log.scoped(.batch_publisher);
 
@@ -47,9 +48,9 @@ fn jsonValueToMsgpack(value: std.json.Value, allocator: std.mem.Allocator) !msgp
 /// Configuration for batch publishing
 pub const BatchConfig = struct {
     /// Maximum number of events per batch
-    max_events: usize = 100,
+    max_events: usize = Config.Batch.max_events,
     /// Maximum time to wait before flushing (milliseconds)
-    max_wait_ms: i64 = 100,
+    max_wait_ms: i64 = Config.Batch.max_age_ms,
     /// Maximum payload size in bytes
     max_payload_bytes: usize = 128 * 1024, // 128KB
 };

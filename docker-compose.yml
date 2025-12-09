@@ -7,8 +7,9 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_USER: postgres
       POSTGRES_DB: postgres
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/
       - ./postgres-init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -36,9 +37,10 @@ services:
     ports:
       - "4222:4222" # Client connections
       - "8222:8222" # HTTP monitoring
-    command: -js  -sd /data -m 8222
+    command: -js -m 8222 -c /etc/nats/nats-server.conf
     volumes:
       - nats-data:/data
+      - ./nats-server.conf:/etc/nats/nats-server.conf:ro
     restart: unless-stopped
     networks:
       - cdc-bridge
@@ -54,21 +56,26 @@ services:
       - sh
       - -c
       - |
-        echo 'Waiting for NATS server...'
-        until nats server check connection --server=nats://nats-server:4222 2>/dev/null; do
-          echo 'NATS not ready yet, retrying in 1s...'
-          sleep 1
+        set -e
+        echo 'Waiting for NATS server to start...'
+        sleep 5
+        echo 'Attempting to connect to NATS server...'
+        until nats server check connection --server=nats://bridge_user:bridge_secure_password@nats-server:4222 2>/dev/null; do
+          echo 'NATS not ready yet, retrying in 2s...'
+          sleep 2
         done
         echo 'NATS server is ready!'
         echo 'Creating NATS JetStream stream: CDC'
-        nats stream add CDC --server=nats://nats-server:4222 --subjects='cdc.>' --storage=file --retention=limits --max-age=1m --max-msgs=1000000 --max-bytes=1G --replicas=1 --defaults
+        nats stream add CDC --server=nats://bridge_user:bridge_secure_password@nats-server:4222 --subjects='cdc.>' --storage=file --retention=limits --max-age=1m --max-msgs=1000000 --max-bytes=1G --replicas=1 --defaults || true
         echo 'Stream CDC created successfully'
         echo 'Creating NATS JetStream stream: INIT'
-        nats stream add INIT --server=nats://nats-server:4222 --subjects='init.>' --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=100G --replicas=1 --defaults
+        nats stream add INIT --server=nats://bridge_user:bridge_secure_password@nats-server:4222 --subjects='init.>' --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --defaults || true
         echo 'Stream INIT created successfully'
         echo 'Creating NATS KV bucket: schemas'
-        nats kv add schemas --server=nats://nats-server:4222 --history=10 --replicas=1
+        nats kv add schemas --server=nats://bridge_user:bridge_secure_password@nats-server:4222 --history=10 --replicas=1 || true
         echo 'KV bucket schemas created successfully'
+        echo 'NATS initialization complete - exiting'
+        exit 0
     restart: "no"
 
 volumes:
