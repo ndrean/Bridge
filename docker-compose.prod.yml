@@ -1,34 +1,70 @@
 services:
+  bridge-init:
+    image: postgres:18
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./init.sh:/init.sh:ro
+    env_file:
+      - .env.prod
+    environment:
+      # Use superuser credentials to create publication
+      PGHOST: ${PG_HOST}
+      PGPORT: ${PG_PORT}
+      PGUSER: ${PG_USER}
+      PGPASSWORD: ${PG_PASSWORD}
+      PGDATABASE: postgres
+      # Pass bridge user credentials to init script
+      POSTGRES_BRIDGE_USER: ${POSTGRES_BRIDGE_USER}
+      POSTGRES_BRIDGE_PASSWORD: ${POSTGRES_BRIDGE_PASSWORD}
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -ex
+        echo "[bridge-init] Command section started!"
+        echo "[bridge-init] Waiting for Postgres to be ready..."
+        until pg_isready -h $${PGHOST} -p $${PGPORT} -U $${PGUSER}; do
+          echo "  Postgres not ready, waiting..."
+          sleep 2
+        done
+
+        echo "[bridge-init] Running initialization script..."
+        bash /init.sh
+
+        echo "[bridge-init] Initialization complete!"
+    networks:
+      - cdc-bridge
+    restart: "no"
+
   bridge:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: bridge
-
     ports:
-      - "9090:9090"
-    command: >
-      bridge
-        --stream CDC,INIT
-        --slot ${BRIDGE_CDC_SLOT:- "cdc_slot"}
-        --publication ${BRIDGE_CDC_PUBLICATION:- "cdc_pub"}
-        --port 9090
-        --table users,test_types
+      - "${BRIDGE_PORT}:${BRIDGE_PORT}"
     depends_on:
+      bridge-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       nats-init:
         condition: service_completed_successfully
-    environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
-      POSTGRES_DB: postgres
-      NATS_HOST: nats-server
-      NATS_USER: ${NATS_USER}
-      NATS_PASSWORD: ${NATS_PASSWORD}
-      LOG_LEVEL: info
+    env_file:
+      - .env.prod
+    command:
+      - "--stream"
+      - "CDC,INIT"
+      - "--slot"
+      - "${BRIDGE_CDC_SLOT}"
+      - "--publication"
+      - "${BRIDGE_CDC_PUBLICATION}"
+      - "--port"
+      - "${BRIDGE_PORT}"
+      - "--table"
+      - "users,test_types"
     networks:
       - cdc-bridge
     restart: unless-stopped

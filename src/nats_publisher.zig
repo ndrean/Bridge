@@ -138,10 +138,10 @@ pub const Publisher = struct {
         defer allocator.free(nats_uri);
 
         // Read optional NATS authentication credentials
-        const nats_user = std.process.getEnvVarOwned(allocator, "NATS_USER") catch null;
+        const nats_user = std.process.getEnvVarOwned(allocator, "NATS_BRIDGE_USER") catch null;
         defer if (nats_user) |u| allocator.free(u);
 
-        const nats_password = std.process.getEnvVarOwned(allocator, "NATS_PASSWORD") catch null;
+        const nats_password = std.process.getEnvVarOwned(allocator, "NATS_BRIDGE_PASSWORD") catch null;
         defer if (nats_password) |p| allocator.free(p);
 
         // Build NATS URL with optional authentication

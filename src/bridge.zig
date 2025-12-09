@@ -232,7 +232,11 @@ pub fn main() !void {
 
     log.info("Starting PostgreSQL replication_slot and publication...", .{});
     try replication.createSlot(slot_name_z);
-    try replication.createPublication(pub_name_z, parsed_args.tables);
+    replication.checkPublication(pub_name_z) catch |err| {
+        log.err("🔴 Failed to verify publication: {}", .{err});
+        return;
+    };
+    // , parsed_args.tables);
 
     // 2. Start WAL lag monitor in background thread
     const wal_monitor_config = wal_monitor.WalConfig{

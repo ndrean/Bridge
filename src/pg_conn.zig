@@ -45,33 +45,48 @@ pub const PgConf = struct {
     /// Setup PostgreSQL connection configuration from environment variables
     ///
     /// Returns a PgConf with owned strings. Caller must call deinit() to free.
+    ///
+    /// Environment variables (matches .env.prod naming):
+    /// - PG_HOST: PostgreSQL host
+    /// - PG_PORT: PostgreSQL port
+    /// - POSTGRES_BRIDGE_USER: Bridge user (fallback to PG_USER)
+    /// - POSTGRES_BRIDGE_PASSWORD: Bridge password (fallback to PG_PASSWORD)
+    /// - PG_DB: Database name
     pub fn init_from_env(allocator: std.mem.Allocator) !PgConf {
-        const pg_host = std.process.getEnvVarOwned(allocator, "POSTGRES_HOST") catch |err| blk: {
-            log.info("POSTGRES_HOST env var not set ({t}), using default 127.0.0.1", .{err});
+        const pg_host = std.process.getEnvVarOwned(allocator, "PG_HOST") catch |err| blk: {
+            log.info("PG_HOST env var not set ({t}), using default 127.0.0.1", .{err});
             break :blk try allocator.dupe(u8, "127.0.0.1");
         };
         errdefer allocator.free(pg_host);
 
-        const port_str = std.process.getEnvVarOwned(allocator, "POSTGRES_PORT") catch |err| blk: {
-            log.info("POSTGRES_PORT env var not set ({t}), using default 5432", .{err});
+        const port_str = std.process.getEnvVarOwned(allocator, "PG_PORT") catch |err| blk: {
+            log.info("PG_PORT env var not set ({t}), using default 5432", .{err});
             break :blk try allocator.dupe(u8, "5432");
         };
         defer allocator.free(port_str); // Port string only needed for parsing
 
-        const user_name = std.process.getEnvVarOwned(allocator, "POSTGRES_USER") catch |err| blk: {
-            log.info("POSTGRES_USER env var not set ({t}), using default username", .{err});
-            break :blk try allocator.dupe(u8, "postgres");
+        // Try bridge-specific user first, fallback to PG_USER
+        const user_name = std.process.getEnvVarOwned(allocator, "POSTGRES_BRIDGE_USER") catch blk: {
+            const generic_user = std.process.getEnvVarOwned(allocator, "PG_USER") catch |err| blk2: {
+                log.info("POSTGRES_BRIDGE_USER and PG_USER env vars not set ({t}), using default username", .{err});
+                break :blk2 try allocator.dupe(u8, "postgres");
+            };
+            break :blk generic_user;
         };
         errdefer allocator.free(user_name);
 
-        const password = std.process.getEnvVarOwned(allocator, "POSTGRES_PASSWORD") catch |err| blk: {
-            log.info("POSTGRES_PASSWORD env var not set ({}), using **** ", .{err});
-            break :blk try allocator.dupe(u8, "postgres");
+        // Try bridge-specific password first, fallback to PG_PASSWORD
+        const password = std.process.getEnvVarOwned(allocator, "POSTGRES_BRIDGE_PASSWORD") catch blk: {
+            const generic_password = std.process.getEnvVarOwned(allocator, "PG_PASSWORD") catch |err| blk2: {
+                log.info("POSTGRES_BRIDGE_PASSWORD and PG_PASSWORD env vars not set ({}), using default", .{err});
+                break :blk2 try allocator.dupe(u8, "postgres");
+            };
+            break :blk generic_password;
         };
         errdefer allocator.free(password);
 
-        const database = std.process.getEnvVarOwned(allocator, "POSTGRES_DB") catch |err| blk: {
-            log.info("POSTGRES_DB env var not set ({}), using default postgres", .{err});
+        const database = std.process.getEnvVarOwned(allocator, "PG_DB") catch |err| blk: {
+            log.info("PG_DB env var not set ({}), using default postgres", .{err});
             break :blk try allocator.dupe(u8, "postgres");
         };
         errdefer allocator.free(database);

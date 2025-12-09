@@ -85,25 +85,22 @@ pub const ReplicationSetup = struct {
         log.info("✅ Replication slot '{s}' created", .{slot_name});
     }
 
-    /// Create a publication if it doesn't exist (hybrid: try create, fallback to verify)
+    /// Check that a publication exists (production: admin pre-creates it)
     ///
-    /// This function attempts to create a FOR ALL TABLES publication. If creation fails
-    /// due to permissions, it checks if the publication exists (perhaps created by an admin)
-    /// and uses it. The tables parameter is for informational/logging purposes only.
+    /// In production, the database administrator should pre-create the publication
+    /// using SUPERUSER privileges. This function only verifies it exists.
+    ///
+    /// The bridge user only needs REPLICATION privilege to use an existing publication.
+    ///
+    /// Production deployment:
+    ///   CREATE PUBLICATION cdc_pub FOR ALL TABLES;
     ///
     /// Privilege requirements:
-    /// - To CREATE FOR ALL TABLES: Requires SUPERUSER privilege
-    /// - To CREATE FOR TABLE: Requires ownership of each table
     /// - To VERIFY: Requires ability to query pg_publication
-    ///
-    /// Production deployment recommendation:
-    /// Have your database administrator pre-create the publication:
-    ///   CREATE PUBLICATION cdc_pub FOR ALL TABLES;
-    /// Then the bridge only needs REPLICATION privilege to use it.
-    pub fn createPublication(
+    /// - To USE: Requires REPLICATION privilege
+    pub fn checkPublication(
         self: *const ReplicationSetup,
         pub_name: []const u8,
-        tables: []const []const u8,
     ) !void {
         const conn = try self.connect();
         defer c.PQfinish(conn);
@@ -123,49 +120,55 @@ pub const ReplicationSetup = struct {
         const exists = c.PQntuples(check_result) > 0;
 
         if (exists) {
-            log.info("✅  Publication '{s}' already exists, listening on ALL TABLES", .{pub_name});
+            log.info("✅  Publication '{s}' verified (pre-created by admin)", .{pub_name});
             return;
         }
 
+        // Publication doesn't exist - admin must create it
+        log.err("🔴 Publication '{s}' not found", .{pub_name});
+        log.err("   → Ask your database administrator to run:", .{});
+        log.err("      CREATE PUBLICATION {s} FOR ALL TABLES;", .{pub_name});
+        return error.PublicationNotFound;
+
         // Try to create publication with FOR ALL TABLES
         // This requires SUPERUSER privilege
-        const create_query = try std.fmt.allocPrintSentinel(
-            self.allocator,
-            "CREATE PUBLICATION {s} FOR ALL TABLES",
-            .{pub_name},
-            0,
-        );
-        defer self.allocator.free(create_query);
+        // const create_query = try std.fmt.allocPrintSentinel(
+        //     self.allocator,
+        //     "CREATE PUBLICATION {s} FOR ALL TABLES",
+        //     .{pub_name},
+        //     0,
+        // );
+        // defer self.allocator.free(create_query);
 
-        const create_result = runQuery(conn, create_query) catch |err| {
-            // Creation failed - check if publication now exists (race condition)
-            const recheck_result = runQuery(conn, check_query) catch {
-                log.err("🔴 Failed to create publication '{s}' and cannot verify existence", .{pub_name});
-                log.err("   → Ensure an admin has created the publication or grant SUPERUSER privilege", .{});
-                return err;
-            };
-            defer c.PQclear(recheck_result);
+        // const create_result = runQuery(conn, create_query) catch |err| {
+        //     // Creation failed - check if publication now exists (race condition)
+        //     const recheck_result = runQuery(conn, check_query) catch {
+        //         log.err("🔴 Failed to create publication '{s}' and cannot verify existence", .{pub_name});
+        //         log.err("   → Ensure an admin has created the publication or grant SUPERUSER privilege", .{});
+        //         return err;
+        //     };
+        //     defer c.PQclear(recheck_result);
 
-            if (c.PQntuples(recheck_result) > 0) {
-                log.info("✅ Publication '{s}' exists (created externally)", .{pub_name});
-                return;
-            }
+        //     if (c.PQntuples(recheck_result) > 0) {
+        //         log.info("✅ Publication '{s}' exists (created externally)", .{pub_name});
+        //         return;
+        //     }
 
-            log.err("🔴 Failed to create publication '{s}'", .{pub_name});
-            log.err("   → Ask your database administrator to run:", .{});
-            log.err("      CREATE PUBLICATION {s} FOR ALL TABLES;", .{pub_name});
-            log.err("   → Or grant SUPERUSER privilege to the bridge user (not recommended for production)", .{});
-            return err;
-        };
-        defer c.PQclear(create_result);
+        //     log.err("🔴 Failed to create publication '{s}'", .{pub_name});
+        //     log.err("   → Ask your database administrator to run:", .{});
+        //     log.err("      CREATE PUBLICATION {s} FOR ALL TABLES;", .{pub_name});
+        //     log.err("   → Or grant SUPERUSER privilege to the bridge user (not recommended for production)", .{});
+        //     return err;
+        // };
+        // defer c.PQclear(create_result);
 
-        if (tables.len > 0) {
-            const table_list = try std.mem.join(self.allocator, ", ", tables);
-            defer self.allocator.free(table_list);
-            log.info("✅ Publication '{s}' created for ALL TABLES (monitoring: {s})", .{ pub_name, table_list });
-        } else {
-            log.info("✅ Publication '{s}' created for ALL TABLES", .{pub_name});
-        }
+        // if (tables.len > 0) {
+        //     const table_list = try std.mem.join(self.allocator, ", ", tables);
+        //     defer self.allocator.free(table_list);
+        //     log.info("✅ Publication '{s}' created for ALL TABLES (monitoring: {s})", .{ pub_name, table_list });
+        // } else {
+        //     log.info("✅ Publication '{s}' created for ALL TABLES", .{pub_name});
+        // }
 
         // OPTION: Table-specific publications (PRESERVED BUT COMMENTED OUT)
         // Uncomment this block if you need table-specific publications instead of FOR ALL TABLES
