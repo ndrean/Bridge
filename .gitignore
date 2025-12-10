@@ -17,5 +17,6 @@ libs/
 # Docker
 postgres-data/
 *.tar.gz
+*.tar.xz
 
 src/test_files/
