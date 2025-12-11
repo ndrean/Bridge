@@ -11,6 +11,7 @@ pub const Server = struct {
     should_stop: *std.atomic.Value(bool),
     metrics: ?*metrics_mod.Metrics,
     nats_publisher: ?*nats_publisher.Publisher,
+    thread: ?std.Thread = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -25,7 +26,30 @@ pub const Server = struct {
             .should_stop = should_stop,
             .metrics = metrics,
             .nats_publisher = nats_pub,
+            .thread = null,
         };
+    }
+
+    /// Start the HTTP server thread
+    pub fn start(self: *Server) !void {
+        if (self.thread != null) {
+            return error.AlreadyStarted;
+        }
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    /// Join the HTTP server thread (waits for completion)
+    pub fn join(self: *Server) void {
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+    }
+
+    /// Deinit - cleanup resources (call after join)
+    pub fn deinit(self: *Server) void {
+        // No resources to clean up currently
+        _ = self;
     }
 
     /// Run the HTTP server (in a separate thread)

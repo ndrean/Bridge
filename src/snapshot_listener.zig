@@ -12,6 +12,7 @@ const c = @cImport({
 });
 const pg_conn = @import("pg_conn.zig");
 const nats_publisher = @import("nats_publisher.zig");
+const publication_mod = @import("publication.zig");
 const config = @import("config.zig");
 const msgpack = @import("msgpack");
 const pg_copy_csv = @import("pg_copy_csv.zig");
@@ -23,7 +24,123 @@ const SnapshotContext = struct {
     allocator: std.mem.Allocator,
     pg_config: *const pg_conn.PgConf,
     publisher: *nats_publisher.Publisher,
+    monitored_tables: []const []const u8,
 };
+
+/// Snapshot listener with thread management
+pub const SnapshotListener = struct {
+    allocator: std.mem.Allocator,
+    pg_config: *const pg_conn.PgConf,
+    publisher: *nats_publisher.Publisher,
+    should_stop: *std.atomic.Value(bool),
+    monitored_tables: []const []const u8,
+    thread: ?std.Thread = null,
+
+    /// Initialize snapshot listener (does not start the thread)
+    pub fn init(
+        allocator: std.mem.Allocator,
+        pg_config: *const pg_conn.PgConf,
+        publisher: *nats_publisher.Publisher,
+        should_stop: *std.atomic.Value(bool),
+        monitored_tables: []const []const u8,
+    ) SnapshotListener {
+        return .{
+            .allocator = allocator,
+            .pg_config = pg_config,
+            .publisher = publisher,
+            .should_stop = should_stop,
+            .monitored_tables = monitored_tables,
+            .thread = null,
+        };
+    }
+
+    /// Start the snapshot listener thread
+    pub fn start(self: *SnapshotListener) !void {
+        if (self.thread != null) {
+            return error.AlreadyStarted;
+        }
+        self.thread = try std.Thread.spawn(.{}, listenLoop, .{self});
+    }
+
+    /// Join the snapshot listener thread (waits for completion)
+    pub fn join(self: *SnapshotListener) void {
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+    }
+
+    /// Deinit - cleanup resources (call after join)
+    pub fn deinit(self: *SnapshotListener) void {
+        // No resources to clean up currently
+        _ = self;
+    }
+
+    /// Background listening loop (internal)
+    fn listenLoop(self: *SnapshotListener) !void {
+        try listenForSnapshotRequests(
+            self.allocator,
+            self.pg_config,
+            self.publisher,
+            self.should_stop,
+            self.monitored_tables,
+        );
+    }
+};
+
+/// Publish snapshot error to NATS for consumer feedback
+fn publishSnapshotError(
+    allocator: std.mem.Allocator,
+    publisher: *nats_publisher.Publisher,
+    table_name: []const u8,
+    error_type: []const u8,
+    available_tables: []const []const u8,
+) !void {
+    // Build error subject: init.error.{table}
+    const subject = try std.fmt.allocPrint(allocator, "init.error.{s}", .{table_name});
+    defer allocator.free(subject);
+
+    // Build error payload with MessagePack
+    var buffer: [4096]u8 = undefined;
+    const compat = msgpack.compat;
+    var write_buffer = compat.fixedBufferStream(&buffer);
+    var read_buffer = compat.fixedBufferStream(&buffer);
+
+    const BufferType = compat.BufferStream;
+    var packer = msgpack.Pack(
+        *BufferType,
+        *BufferType,
+        BufferType.WriteError,
+        BufferType.ReadError,
+        BufferType.write,
+        BufferType.read,
+    ).init(&write_buffer, &read_buffer);
+
+    // Create map payload
+    var map = msgpack.Payload.mapPayload(allocator);
+    defer map.free(allocator);
+
+    try map.mapPut("error", try msgpack.Payload.strToPayload(error_type, allocator));
+    try map.mapPut("table", try msgpack.Payload.strToPayload(table_name, allocator));
+
+    // Create array for available_tables
+    var tables_array = try msgpack.Payload.arrPayload(available_tables.len, allocator);
+    for (available_tables, 0..) |table, i| {
+        tables_array.arr[i] = try msgpack.Payload.strToPayload(table, allocator);
+    }
+    try map.mapPut("available_tables", tables_array);
+
+    // Encode
+    try packer.write(map);
+
+    // Get encoded bytes
+    const payload = write_buffer.getWritten();
+
+    // Publish error message
+    try publisher.publish(subject, payload, null);
+
+    log.info("📤 Published snapshot error for table '{s}' to {s}", .{ table_name, subject });
+}
 
 /// NATS message callback for snapshot requests
 fn onSnapshotRequest(
@@ -51,6 +168,26 @@ fn onSnapshotRequest(
     };
 
     log.info("📩 Snapshot request via NATS: table='{s}'", .{table_name});
+
+    // Validate table is in monitored tables list
+    const is_monitored = publication_mod.isTableMonitored(table_name, ctx.monitored_tables);
+
+    if (!is_monitored) {
+        log.warn("⚠️ Snapshot requested for non-monitored table '{s}' (not in publication)", .{table_name});
+
+        // Publish error to NATS so consumer gets feedback
+        publishSnapshotError(
+            ctx.allocator,
+            ctx.publisher,
+            table_name,
+            "table_not_in_publication",
+            ctx.monitored_tables,
+        ) catch |err| {
+            log.err("Failed to publish snapshot error: {}", .{err});
+        };
+
+        return;
+    }
 
     // Get request metadata from message payload (MessagePack: requested_by, etc.)
     const data_ptr = c.natsMsg_GetData(msg);
@@ -98,6 +235,7 @@ pub fn listenForSnapshotRequests(
     pg_config: *const pg_conn.PgConf,
     publisher: *nats_publisher.Publisher,
     should_stop: *std.atomic.Value(bool),
+    monitored_tables: []const []const u8,
 ) !void {
     log.info("🔔 Starting NATS snapshot listener thread", .{});
 
@@ -106,6 +244,7 @@ pub fn listenForSnapshotRequests(
         .allocator = allocator,
         .pg_config = pg_config,
         .publisher = publisher,
+        .monitored_tables = monitored_tables,
     };
 
     // Subscribe to snapshot.request.> (wildcard for all tables)

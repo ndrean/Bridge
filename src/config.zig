@@ -7,14 +7,9 @@ const std = @import("std");
 
 /// PostgreSQL connection and replication configuration
 pub const Postgres = struct {
-    /// Default replication slot name
     pub const default_slot_name = "cdc_slot";
-
-    /// Default publication name
     pub const default_publication_name = "cdc_pub";
-
-    /// Connection timeout in milliseconds
-    pub const connection_timeout_ms = 5000;
+    pub const connection_timeout_ms = 5000; // milliseconds
 
     /// Replication connection receive timeout (milliseconds)
     /// Set to 0 for blocking mode
@@ -30,7 +25,6 @@ pub const Postgres = struct {
 
 /// NATS JetStream configuration
 pub const Nats = struct {
-    /// Default NATS server URL
     pub const default_port = 4222;
     pub const default_url = "nats://127.0.0.1:4222";
 
@@ -38,8 +32,8 @@ pub const Nats = struct {
     pub const max_reconnect_attempts = -1;
 
     /// Wait time between reconnection attempts (milliseconds)
-    /// 1s is aggressive but appropriate for CDC (minimize replication lag)
-    pub const reconnect_wait_ms = 1000;
+    pub const reconnect_wait_ms = 1000; // 1s
+    pub const storage_type = .file;
 
     /// Async publish flush timeout (milliseconds)
     /// Must be >= reconnect_wait_ms * max attempts
@@ -54,7 +48,7 @@ pub const Nats = struct {
     pub const stream_init = "INIT";
 
     /// Default streams to verify on startup
-    pub const default_streams = &[_][]const u8{stream_cdc};
+    pub const default_streams = &[_][]const u8{ stream_cdc, stream_init };
 
     /// Subject prefixes
     pub const subject_cdc_prefix = "cdc";
@@ -103,12 +97,12 @@ pub const Batch = struct {
 
     /// Size of the ring buffer (must be power of 2)
     /// Sized for NATS/PostgreSQL reconnection resilience:
-    /// - 32768 slots = ~546ms buffer at 60K events/s
+    /// - 65536 slots = ~1092ms buffer at 60K events/s
     /// - Absorbs jitter and provides meaningful buffer during reconnection
-    /// - NATS reconnect_wait_ms = 1000ms → queue covers 54% of retry interval
+    /// - NATS reconnect_wait_ms = 1000ms → covers retry interval
     /// - PostgreSQL reconnect_delay = 5000ms
     /// - Memory cost: ~2MB (negligible for production resilience)
-    pub const ring_buffer_size = 32768;
+    pub const ring_buffer_size = 65536;
     pub const max_payload_bytes = 256 * 1024; // 256KB
 };
 

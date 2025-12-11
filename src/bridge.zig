@@ -15,6 +15,8 @@ const wal_monitor = @import("wal_monitor.zig");
 const pg_conn = @import("pg_conn.zig");
 const args = @import("args.zig");
 const schema_publisher = @import("schema_publisher.zig");
+const schema_cache_mod = @import("schema_cache.zig");
+const publication_mod = @import("publication.zig");
 const snapshot_listener = @import("snapshot_listener.zig");
 
 pub const log = std.log.scoped(.bridge);
@@ -22,28 +24,12 @@ pub const log = std.log.scoped(.bridge);
 // Global flag for graceful shutdown (shared with HTTP server)
 var should_stop = std.atomic.Value(bool).init(false);
 
-/// Initialize and verify all required NATS JetStream streams exist
-/// Streams should be created by infrastructure (nats-init), this function only verifies they exist
-fn initStreams(
-    publisher: *nats_publisher.Publisher,
-    allocator: std.mem.Allocator,
-    stream_names: []const []const u8,
-) !void {
-    log.info("Verifying {d} NATS JetStream stream(s)...", .{stream_names.len});
-
-    for (stream_names) |stream_name| {
-        try nats_publisher.ensureStream(publisher.js.?, allocator, stream_name);
-        log.info("  ✅ Stream '{s}' verified", .{stream_name});
-    }
-}
-
 /// Helper to process and publish a CDC event (INSERT/UPDATE/DELETE)
 fn processCdcEvent(
     main_allocator: std.mem.Allocator,
     rel: pgoutput.RelationMessage,
     tuple_data: pgoutput.TupleData,
     operation: []const u8,
-    subject_prefix: []const u8,
     wal_end: u64,
     batch_pub: *async_batch_publisher.AsyncBatchPublisher,
     metrics: *metrics_mod.Metrics,
@@ -106,7 +92,7 @@ fn processCdcEvent(
     const subject = try std.fmt.bufPrintZ(
         &subject_buf,
         "{s}.{s}.{s}",
-        .{ subject_prefix, rel.name, operation_lower },
+        .{ Config.Nats.subject_cdc_prefix, rel.name, operation_lower },
     );
 
     // Generate message ID from WAL LSN for idempotent delivery
@@ -155,34 +141,12 @@ pub fn main() !void {
     };
 
     const parsed_args = try args.Args.parseArgs(allocator);
-    defer {
-        for (parsed_args.tables) |table| {
-            allocator.free(table);
-        }
-        allocator.free(parsed_args.tables);
-        for (parsed_args.streams) |stream| {
-            allocator.free(stream);
-        }
-        allocator.free(parsed_args.streams);
-    }
 
     log.info("▶️ Starting CDC Bridge with parameters:\n", .{});
     log.info("Publication name: \x1b[1m {s} \x1b[0m", .{parsed_args.publication_name});
     log.info("Slot name: \x1b[1m {s} \x1b[0m", .{parsed_args.slot_name});
-
-    const parsed_streams = try std.mem.join(allocator, ", ", parsed_args.streams);
-    defer allocator.free(parsed_streams);
-    log.info("Streams: \x1b[1m {s} \x1b[0m", .{parsed_streams});
-
     log.info("HTTP port: \x1b[1m {d} \x1b[0m", .{parsed_args.http_port});
-
-    if (parsed_args.tables.len == 0) {
-        log.info("Tables: \x1b[1m ALL\x1b[0m", .{});
-    } else {
-        const parsed_tables = try std.mem.join(allocator, ", ", parsed_args.tables);
-        defer allocator.free(parsed_tables);
-        log.info("Tables: \x1b[1m {s} \x1b[0m", .{parsed_tables});
-    }
+    log.info("Streams: \x1b[1m CDC, INIT \x1b[0m (hardcoded)", .{});
 
     // Register signal handlers for graceful shutdown
     const empty_mask = std.mem.zeroes(posix.sigset_t);
@@ -206,21 +170,13 @@ pub fn main() !void {
         &metrics,
         null,
     );
-    const http_thread = try std.Thread.spawn(
-        .{},
-        http_server.Server.run,
-        .{&http_srv},
-    );
-    defer http_thread.join();
+    try http_srv.start();
+    defer http_srv.join();
+    defer http_srv.deinit();
 
     // PostgreSQL connection configuration
     var pg_config = try pg_conn.PgConf.init_from_env(allocator);
     defer pg_config.deinit(allocator);
-
-    const replication = replication_setup.ReplicationSetup{
-        .allocator = allocator,
-        .pg_config = pg_config,
-    };
 
     // Create null-terminated versions for C APIs (kept alive for entire program)
     const slot_name_z = try allocator.dupeZ(u8, parsed_args.slot_name);
@@ -228,13 +184,15 @@ pub fn main() !void {
     const pub_name_z = try allocator.dupeZ(u8, parsed_args.publication_name);
     defer allocator.free(pub_name_z);
 
-    log.info("Starting PostgreSQL replication_slot and publication...", .{});
-    try replication.createSlot(slot_name_z);
-    replication.checkPublication(pub_name_z) catch |err| {
-        log.err("🔴 Failed to verify publication: {}", .{err});
-        return;
-    };
-    // , parsed_args.tables);
+    // Initialize replication: create slot + verify publication
+    log.info("Initializing PostgreSQL replication...", .{});
+    var replication_ctx = try replication_setup.init(
+        allocator,
+        &pg_config,
+        slot_name_z,
+        pub_name_z,
+    );
+    defer replication_ctx.deinit();
 
     // 2. Start WAL lag monitor in background thread
     const wal_monitor_config = wal_monitor.WalConfig{
@@ -242,77 +200,61 @@ pub fn main() !void {
         .slot_name = parsed_args.slot_name,
         .check_interval_seconds = 30,
     };
-    const monitor_thread = try std.Thread.spawn(
-        .{},
-        wal_monitor.monitorWALlag,
-        .{ &metrics, wal_monitor_config, &should_stop, allocator },
+    var wal_mon = wal_monitor.WalMonitor.init(
+        allocator,
+        &metrics,
+        wal_monitor_config,
+        &should_stop,
     );
-    defer monitor_thread.join();
+    try wal_mon.start();
+    defer wal_mon.join();
+    defer wal_mon.deinit();
 
     // 3. Connect to NATS JetStream (needed by snapshot listener)
     log.debug("Connecting to NATS JetStream...", .{});
-    var publisher = try nats_publisher.Publisher.init(allocator, .{
-        .url = Config.Nats.default_url,
-    });
+    var publisher = try nats_publisher.Publisher.init(
+        allocator,
+        .{
+            .url = Config.Nats.default_url,
+        },
+    );
     defer publisher.deinit();
 
     // Set metrics pointer for NATS reconnection tracking
     publisher.metrics = &metrics;
 
+    // Connect and verify required streams
     try publisher.connect();
 
-    // Verify all required streams exist (created by infrastructure)
-    try initStreams(&publisher, allocator, parsed_args.streams);
-
     // Initialize schema cache for tracking relation_id changes
-    var schema_cache = schema_publisher.SchemaCache.init(allocator);
+    var schema_cache = schema_cache_mod.SchemaCache.init(allocator);
     defer schema_cache.deinit();
     log.debug("Schema cache initialized\n", .{});
 
-    // Publish initial schemas to INIT stream
-    try schema_publisher.publishInitialSchemas(allocator, &pg_config, &publisher);
+    // Publish initial schemas to INIT stream (only for monitored tables)
+    // Store monitored tables for validation (used by schema changes and snapshot requests)
+    const monitored_tables = replication_ctx.tables;
+
+    try schema_publisher.publishInitialSchemas(
+        allocator,
+        &pg_config,
+        &publisher,
+        monitored_tables,
+    );
 
     // 4. Start snapshot listener in background thread
     log.info("Starting snapshot listener thread...", .{});
-    const snapshot_thread = try std.Thread.spawn(
-        .{},
-        snapshot_listener.listenForSnapshotRequests,
-        .{ allocator, &pg_config, &publisher, &should_stop },
+    var snap_listener = snapshot_listener.SnapshotListener.init(
+        allocator,
+        &pg_config,
+        &publisher,
+        &should_stop,
+        monitored_tables,
     );
-    defer snapshot_thread.join();
+    try snap_listener.start();
+    defer snap_listener.join();
+    defer snap_listener.deinit();
     log.info("✅ Snapshot listener thread started\n", .{});
-
-    // Find CDC stream for subject pattern generation
-    // CDC events are published to subjects like "cdc.table.operation"
-    const cdc_stream_name = blk: {
-        for (parsed_args.streams) |stream_name| {
-            if (std.mem.eql(u8, stream_name, "CDC")) {
-                break :blk stream_name;
-            }
-        }
-        // If CDC stream not found in list, use first stream or fail
-        if (parsed_args.streams.len > 0) {
-            log.warn("CDC stream not found in stream list, using first stream: {s}", .{parsed_args.streams[0]});
-            break :blk parsed_args.streams[0];
-        }
-        return error.NoCDCStreamConfigured;
-    };
-
-    // Generate subject pattern from CDC stream name for publishing
-    // Convert stream name to lowercase and use as subject prefix
-    // Example: CDC -> "cdc.>" subjects
-    var subject_buf: [Config.Buffers.subject_buffer_size]u8 = undefined;
-    const subject_str = try std.fmt.bufPrint(&subject_buf, "{s}.>", .{cdc_stream_name});
-
-    // Convert to lowercase for subject pattern
-    var lower_subject_buf: [Config.Buffers.subject_buffer_size]u8 = undefined;
-    const lower_subject = blk: {
-        if (subject_str.len > lower_subject_buf.len) return error.SubjectTooLong;
-        for (subject_str, 0..) |c, i| {
-            lower_subject_buf[i] = std.ascii.toLower(c);
-        }
-        break :blk lower_subject_buf[0..subject_str.len];
-    };
 
     // Make publisher available to HTTP server for stream management
     http_srv.nats_publisher = &publisher;
@@ -323,17 +265,25 @@ pub fn main() !void {
         .max_wait_ms = Config.Batch.max_age_ms,
         .max_payload_bytes = Config.Batch.max_payload_bytes,
     };
-    var batch_pub = try async_batch_publisher.AsyncBatchPublisher.init(allocator, &publisher, batch_config);
-    defer batch_pub.deinit();
+    var batch_pub = try async_batch_publisher.AsyncBatchPublisher.init(
+        allocator,
+        &publisher,
+        batch_config,
+    );
     // Start flush thread after batch_pub is at its final memory location
     try batch_pub.start();
+    defer batch_pub.join();
+    defer batch_pub.deinit();
     log.info("✅ Async batch publishing enabled (max {d} events or {d}ms or {d}KB)\n", .{ batch_config.max_events, batch_config.max_wait_ms, batch_config.max_payload_bytes / 1024 });
 
-    // Get current LSN to skip historical data
+    // Get current LSN to start straming from this point
     log.info("Getting current LSN position...", .{});
-    const current_lsn = try wal_monitor.getCurrentLSN(allocator, &pg_config);
+    const current_lsn = try wal_monitor.getCurrentLSN(
+        allocator,
+        &pg_config,
+    );
     defer allocator.free(current_lsn);
-    log.info("▶️ Current LSN: {s}\n", .{current_lsn});
+    log.debug("▶️ Current LSN: {s}\n", .{current_lsn});
 
     // Connect to replication stream starting from current LSN
     log.info("Connecting to WAL replication stream...", .{});
@@ -355,17 +305,8 @@ pub fn main() !void {
     metrics.setConnected(true);
 
     // 5. Stream CDC events to NATS
-    // This bridge waits for PostgreSQL events generated by the producer
-    log.info("ℹ️ Subject pattern: \x1b[1m {s} \x1b[0m", .{lower_subject});
-
-    // Compute subject prefix (without the wildcard suffix)
-    // Example: "cdc_bridge.>" -> "cdc_bridge"
-    const subject_prefix = blk: {
-        if (std.mem.endsWith(u8, lower_subject, ".>")) {
-            break :blk lower_subject[0 .. lower_subject.len - 2];
-        }
-        break :blk lower_subject;
-    };
+    // CDC events are published to subjects like "cdc.table.operation"
+    log.info("ℹ️ Subject pattern: \x1b[1m {s} \x1b[0m", .{Config.Nats.cdc_subject_wildcard});
 
     // <--- Metrics setup
     var msg_count: u32 = 0;
@@ -454,11 +395,16 @@ pub fn main() !void {
                                 const cloned_rel_ptr = try rel.clone(allocator);
                                 defer allocator.destroy(cloned_rel_ptr);
 
-                                // Check if schema changed and publish to SCHEMA stream if needed
+                                // Check if schema changed for a monitored table
                                 const schema_changed = try schema_cache.hasChanged(rel.name, rel.relation_id);
-                                if (schema_changed) {
-                                    log.info("🔔 Schema change detected for table '{s}' (relation_id={d})", .{ rel.name, rel.relation_id });
+                                const is_monitored = publication_mod.isTableMonitored(rel.name, monitored_tables);
+                                const schema_changed_in_tables = schema_changed and is_monitored;
+
+                                if (schema_changed_in_tables) {
+                                    log.info("🔔 Schema change detected for monitored table '{s}' (relation_id={d})", .{ rel.name, rel.relation_id });
                                     try schema_publisher.publishSchema(&publisher, &rel, allocator);
+                                } else if (schema_changed and !is_monitored) {
+                                    log.debug("Schema change detected for non-monitored table '{s}' (skipped)", .{rel.name});
                                 }
 
                                 // If relation already exists, free the old one first
@@ -479,7 +425,6 @@ pub fn main() !void {
                                         rel,
                                         ins.tuple_data,
                                         "INSERT",
-                                        subject_prefix,
                                         wal_msg.wal_end,
                                         &batch_pub,
                                         &metrics,
@@ -494,7 +439,6 @@ pub fn main() !void {
                                         rel,
                                         upd.new_tuple,
                                         "UPDATE",
-                                        subject_prefix,
                                         wal_msg.wal_end,
                                         &batch_pub,
                                         &metrics,
@@ -509,7 +453,6 @@ pub fn main() !void {
                                         rel,
                                         del.old_tuple,
                                         "DELETE",
-                                        subject_prefix,
                                         wal_msg.wal_end,
                                         &batch_pub,
                                         &metrics,

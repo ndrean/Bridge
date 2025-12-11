@@ -18,6 +18,74 @@ pub const WalConfig = struct {
     check_interval_seconds: u32 = Conf.WalMonitor.default_check_interval_seconds, // 30s
 };
 
+/// WAL monitor with thread management
+pub const WalMonitor = struct {
+    metrics: *metrics_mod.Metrics,
+    config: WalConfig,
+    should_stop: *std.atomic.Value(bool),
+    allocator: std.mem.Allocator,
+    thread: ?std.Thread = null,
+
+    /// Initialize WAL monitor (does not start the thread)
+    pub fn init(
+        allocator: std.mem.Allocator,
+        metrics: *metrics_mod.Metrics,
+        config: WalConfig,
+        should_stop: *std.atomic.Value(bool),
+    ) WalMonitor {
+        return .{
+            .metrics = metrics,
+            .config = config,
+            .should_stop = should_stop,
+            .allocator = allocator,
+            .thread = null,
+        };
+    }
+
+    /// Start the WAL monitoring thread
+    pub fn start(self: *WalMonitor) !void {
+        if (self.thread != null) {
+            return error.AlreadyStarted;
+        }
+        self.thread = try std.Thread.spawn(.{}, monitorLoop, .{self});
+    }
+
+    /// Join the WAL monitoring thread (waits for completion)
+    pub fn join(self: *WalMonitor) void {
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+    }
+
+    /// Deinit - cleanup resources (call after join)
+    pub fn deinit(self: *WalMonitor) void {
+        // No resources to clean up currently
+        _ = self;
+    }
+
+    /// Background monitoring loop (internal)
+    fn monitorLoop(self: *WalMonitor) !void {
+        log.info("ℹ️ WAL lag monitor started (checking every {d}s)\n", .{self.config.check_interval_seconds});
+
+        while (!self.should_stop.load(.seq_cst)) {
+            // Check WAL lag
+            checkWalLag(self.metrics, self.config, self.allocator) catch |err| {
+                log.warn("⚠️ Failed to check WAL lag: {}", .{err});
+            };
+
+            // Sleep for check interval
+            var remaining_seconds = self.config.check_interval_seconds;
+            while (remaining_seconds > 0 and !self.should_stop.load(.seq_cst)) {
+                std.Thread.sleep(1 * std.time.ns_per_s);
+                remaining_seconds -= 1;
+            }
+        }
+
+        log.info("🥁 WAL lag monitor stopped\n", .{});
+    }
+};
+
 /// Get current WAL LSN position
 ///
 /// Caller is responsible for freeing the returned LSN string
@@ -62,32 +130,6 @@ pub fn getCurrentLSN(allocator: std.mem.Allocator, pg_conf: *const pg_conn.PgCon
     // potential error if lsn_cstr is null, but PQgetvalue should not return null if there is at least one tuple, the check above
     const lsn = std.mem.span(lsn_cstr);
     return try allocator.dupe(u8, lsn);
-}
-
-/// Background thread that periodically checks WAL lag
-pub fn monitorWALlag(
-    metrics: *metrics_mod.Metrics,
-    config: WalConfig,
-    should_stop: *std.atomic.Value(bool),
-    allocator: std.mem.Allocator,
-) !void {
-    log.info("ℹ️ WAL lag monitor started (checking every {d}s)\n", .{config.check_interval_seconds});
-
-    while (!should_stop.load(.seq_cst)) {
-        // Check WAL lag
-        checkWalLag(metrics, config, allocator) catch |err| {
-            log.warn("⚠️ Failed to check WAL lag: {}", .{err});
-        };
-
-        // Sleep for check interval
-        var remaining_seconds = config.check_interval_seconds;
-        while (remaining_seconds > 0 and !should_stop.load(.seq_cst)) {
-            std.Thread.sleep(1 * std.time.ns_per_s);
-            remaining_seconds -= 1;
-        }
-    }
-
-    log.info("🥁 WAL lag monitor stopped\n", .{});
 }
 
 fn checkWalLag(

@@ -56,15 +56,20 @@ pub const AsyncBatchPublisher = struct {
         self.flush_thread = try std.Thread.spawn(.{}, flushLoop, .{self});
     }
 
-    pub fn deinit(self: *AsyncBatchPublisher) void {
+    /// Join the flush thread (waits for completion)
+    pub fn join(self: *AsyncBatchPublisher) void {
         // Signal flush thread to stop
         self.should_stop.store(true, .seq_cst);
 
         // Wait for flush thread to finish
         if (self.flush_thread) |thread| {
             thread.join();
+            self.flush_thread = null;
         }
+    }
 
+    /// Deinit - cleanup resources (call after join)
+    pub fn deinit(self: *AsyncBatchPublisher) void {
         // Clean up any remaining events in the queue
         while (self.event_queue.pop()) |event| {
             var mut_event = event;

@@ -25,3 +25,4 @@ scripts/
 *.tar.gz
 .dockerignore
 .env.example
+*.yml

@@ -1,4 +1,12 @@
-//! Replication setup tasks, including creating/dropping replication slots and publications,
+//! Replication setup and initialization
+//!
+//! This module handles PostgreSQL replication setup:
+//! - Creating replication slots
+//! - Verifying publications exist
+//! - Extracting monitored table lists
+//!
+//! Use `init()` to perform one-time setup and get the list of monitored tables.
+
 const std = @import("std");
 const c = @cImport({
     @cInclude("libpq-fe.h");
@@ -6,6 +14,39 @@ const c = @cImport({
 const pg_conn = @import("pg_conn.zig");
 
 pub const log = std.log.scoped(.replication_setup);
+
+/// Replication context - holds the list of monitored tables from the publication
+///
+/// This is the simplified result of replication setup initialization.
+/// Use `init()` to create and `deinit()` to clean up.
+pub const ReplicationContext = struct {
+    tables: [][]const u8, // Owned strings in "schema.table" format
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *ReplicationContext) void {
+        for (self.tables) |table| {
+            self.allocator.free(table);
+        }
+        self.allocator.free(self.tables);
+    }
+};
+
+/// Publication information returned by checkPublication (internal)
+const PublicationInfo = struct {
+    pubname: []const u8,
+    puballtables: bool,
+    tables: [][]const u8, // Owned strings: schema.table format
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *PublicationInfo) void {
+        for (self.tables) |table| {
+            self.allocator.free(table);
+        }
+        self.allocator.free(self.tables);
+        self.allocator.free(self.pubname);
+    }
+};
+
 /// Struct to handle replication setup tasks and includes get current WAL LSN.
 ///
 /// Includes creating|droping replication slots and publications.
@@ -85,30 +126,46 @@ pub const ReplicationSetup = struct {
         log.info("✅ Replication slot '{s}' created", .{slot_name});
     }
 
-    /// Check that a publication exists (production: admin pre-creates it)
+    /// Check that a publication exists and return its table list
     ///
     /// In production, the database administrator should pre-create the publication
-    /// using SUPERUSER privileges. This function only verifies it exists.
+    /// using SUPERUSER privileges. This function verifies it exists and queries
+    /// which tables it contains.
     ///
     /// The bridge user only needs REPLICATION privilege to use an existing publication.
     ///
     /// Production deployment:
     ///   CREATE PUBLICATION cdc_pub FOR ALL TABLES;
+    ///   -- or --
+    ///   CREATE PUBLICATION cdc_pub FOR TABLE users, orders;
     ///
     /// Privilege requirements:
-    /// - To VERIFY: Requires ability to query pg_publication
+    /// - To VERIFY: Requires ability to query pg_publication and pg_publication_tables
     /// - To USE: Requires REPLICATION privilege
+    ///
+    /// Returns: PublicationInfo with table list (caller must call .deinit())
     pub fn checkPublication(
         self: *const ReplicationSetup,
         pub_name: []const u8,
-    ) !void {
+    ) !PublicationInfo {
         const conn = try self.connect();
         defer c.PQfinish(conn);
 
-        // Check if publication exists
+        // Query publication and its tables
         const check_query = try std.fmt.allocPrintSentinel(
             self.allocator,
-            "SELECT pubname FROM pg_publication WHERE pubname = '{s}'",
+            \\SELECT
+            \\  p.pubname,
+            \\  p.puballtables::text,
+            \\  COALESCE(
+            \\    string_agg(pt.schemaname || '.' || pt.tablename, ','),
+            \\    ''
+            \\  ) as tables
+            \\FROM pg_publication p
+            \\LEFT JOIN pg_publication_tables pt ON pt.pubname = p.pubname
+            \\WHERE p.pubname = '{s}'
+            \\GROUP BY p.pubname, p.puballtables
+        ,
             .{pub_name},
             0,
         );
@@ -117,85 +174,61 @@ pub const ReplicationSetup = struct {
         const check_result = try runQuery(conn, check_query);
         defer c.PQclear(check_result);
 
-        const exists = c.PQntuples(check_result) > 0;
-
-        if (exists) {
-            log.info("✅  Publication '{s}' verified (pre-created by admin)", .{pub_name});
-            return;
+        const row_count = c.PQntuples(check_result);
+        if (row_count == 0) {
+            // Publication doesn't exist - admin must create it
+            log.err("🔴 Publication '{s}' not found", .{pub_name});
+            log.err("   → Ask your database administrator to run:", .{});
+            log.err("      CREATE PUBLICATION {s} FOR ALL TABLES;", .{pub_name});
+            return error.PublicationNotFound;
         }
 
-        // Publication doesn't exist - admin must create it
-        log.err("🔴 Publication '{s}' not found", .{pub_name});
-        log.err("   → Ask your database administrator to run:", .{});
-        log.err("      CREATE PUBLICATION {s} FOR ALL TABLES;", .{pub_name});
-        return error.PublicationNotFound;
+        // Parse result
+        const pubname_cstr = c.PQgetvalue(check_result, 0, 0);
+        const puballtables_cstr = c.PQgetvalue(check_result, 0, 1);
+        const tables_cstr = c.PQgetvalue(check_result, 0, 2);
 
-        // Try to create publication with FOR ALL TABLES
-        // This requires SUPERUSER privilege
-        // const create_query = try std.fmt.allocPrintSentinel(
-        //     self.allocator,
-        //     "CREATE PUBLICATION {s} FOR ALL TABLES",
-        //     .{pub_name},
-        //     0,
-        // );
-        // defer self.allocator.free(create_query);
+        const pubname = try self.allocator.dupe(u8, std.mem.span(pubname_cstr));
+        const puballtables = std.mem.eql(u8, std.mem.span(puballtables_cstr), "t");
 
-        // const create_result = runQuery(conn, create_query) catch |err| {
-        //     // Creation failed - check if publication now exists (race condition)
-        //     const recheck_result = runQuery(conn, check_query) catch {
-        //         log.err("🔴 Failed to create publication '{s}' and cannot verify existence", .{pub_name});
-        //         log.err("   → Ensure an admin has created the publication or grant SUPERUSER privilege", .{});
-        //         return err;
-        //     };
-        //     defer c.PQclear(recheck_result);
+        // Parse comma-separated table list
+        var table_list = std.ArrayList([]const u8){};
+        errdefer {
+            for (table_list.items) |table| {
+                self.allocator.free(table);
+            }
+            table_list.deinit(self.allocator);
+        }
 
-        //     if (c.PQntuples(recheck_result) > 0) {
-        //         log.info("✅ Publication '{s}' exists (created externally)", .{pub_name});
-        //         return;
-        //     }
+        const tables_str = std.mem.span(tables_cstr);
+        if (tables_str.len > 0) {
+            var iter = std.mem.splitScalar(u8, tables_str, ',');
+            while (iter.next()) |table| {
+                const trimmed = std.mem.trim(u8, table, &std.ascii.whitespace);
+                if (trimmed.len > 0) {
+                    const owned = try self.allocator.dupe(u8, trimmed);
+                    try table_list.append(self.allocator, owned);
+                }
+            }
+        }
 
-        //     log.err("🔴 Failed to create publication '{s}'", .{pub_name});
-        //     log.err("   → Ask your database administrator to run:", .{});
-        //     log.err("      CREATE PUBLICATION {s} FOR ALL TABLES;", .{pub_name});
-        //     log.err("   → Or grant SUPERUSER privilege to the bridge user (not recommended for production)", .{});
-        //     return err;
-        // };
-        // defer c.PQclear(create_result);
+        const tables = try table_list.toOwnedSlice(self.allocator);
 
-        // if (tables.len > 0) {
-        //     const table_list = try std.mem.join(self.allocator, ", ", tables);
-        //     defer self.allocator.free(table_list);
-        //     log.info("✅ Publication '{s}' created for ALL TABLES (monitoring: {s})", .{ pub_name, table_list });
-        // } else {
-        //     log.info("✅ Publication '{s}' created for ALL TABLES", .{pub_name});
-        // }
+        // Log success
+        if (puballtables) {
+            log.info("✅  Publication '{s}' verified (FOR ALL TABLES, {d} tables detected)", .{ pub_name, tables.len });
+        } else if (tables.len > 0) {
+            log.info("✅  Publication '{s}' verified ({d} tables: {s})", .{ pub_name, tables.len, tables_str });
+        } else {
+            log.warn("⚠️  Publication '{s}' exists but has no tables", .{pub_name});
+        }
 
-        // OPTION: Table-specific publications (PRESERVED BUT COMMENTED OUT)
-        // Uncomment this block if you need table-specific publications instead of FOR ALL TABLES
-        // WARNING: Requires ownership of each table listed
-        //
-        // const create_query = if (tables.len == 0)
-        //     try std.fmt.allocPrintSentinel(
-        //         self.allocator,
-        //         "CREATE PUBLICATION {s} FOR ALL TABLES",
-        //         .{pub_name},
-        //         0,
-        //     )
-        // else blk: {
-        //     // Join tables with ", "
-        //     const table_list = try std.mem.join(self.allocator, ", ", tables);
-        //     defer self.allocator.free(table_list);
-        //
-        //     const query = try std.fmt.allocPrint(
-        //         self.allocator,
-        //         "CREATE PUBLICATION {s} FOR TABLE {s}",
-        //         .{ pub_name, table_list },
-        //     );
-        //     defer self.allocator.free(query);
-        //
-        //     break :blk try self.allocator.dupeZ(u8, query);
-        // };
-        // defer self.allocator.free(create_query);
+        return PublicationInfo{
+            .pubname = pubname,
+            .puballtables = puballtables,
+            .tables = tables,
+            .allocator = self.allocator,
+        };
     }
 
     /// Drop a replication slot
@@ -217,27 +250,6 @@ pub const ReplicationSetup = struct {
         defer c.PQclear(result);
 
         log.info("✓ Replication slot '{s}' dropped", .{slot_name});
-    }
-
-    /// Drop a publication
-    pub fn dropPublication(self: *const ReplicationSetup, pub_name: []const u8) !void {
-        log.info("Dropping publication '{s}'...", .{pub_name});
-
-        const query = try std.fmt.allocPrintSentinel(
-            self.allocator,
-            "DROP PUBLICATION IF EXISTS {s}",
-            .{pub_name},
-            0,
-        );
-        defer self.allocator.free(query);
-
-        const conn = try self.connect();
-        defer c.PQfinish(conn);
-
-        const result = try runQuery(conn, query);
-        defer c.PQclear(result);
-
-        log.info("✓ Publication '{s}' dropped", .{pub_name});
     }
 
     fn runQuery(conn: *c.PGconn, query: []const u8) !*c.PGresult {
@@ -284,3 +296,49 @@ pub const ReplicationSetup = struct {
         return conn;
     }
 };
+
+/// Initialize replication setup - one-time setup function
+///
+/// This function combines slot creation and publication verification into a single call.
+/// It creates the replication slot (if needed) and verifies the publication exists,
+/// returning only the list of monitored tables.
+///
+/// Args:
+///   allocator: Memory allocator
+///   pg_config: PostgreSQL connection configuration
+///   slot_name: Replication slot name (null-terminated)
+///   publication_name: Publication name (null-terminated)
+///
+/// Returns:
+///   ReplicationContext with monitored tables list
+///   Caller must call .deinit() to free resources
+pub fn init(
+    allocator: std.mem.Allocator,
+    pg_config: *const pg_conn.PgConf,
+    slot_name: [:0]const u8,
+    publication_name: [:0]const u8,
+) !ReplicationContext {
+    const setup = ReplicationSetup{
+        .allocator = allocator,
+        .pg_config = pg_config.*,
+    };
+
+    // Create replication slot (if it doesn't exist)
+    log.info("Setting up replication slot '{s}'...", .{slot_name});
+    try setup.createSlot(slot_name);
+
+    // Verify publication and get table list
+    log.info("Checking publication '{s}'...", .{publication_name});
+    var pub_info = try setup.checkPublication(publication_name);
+    defer pub_info.deinit();
+
+    // Transfer ownership of tables to ReplicationContext
+    // We take the tables slice and let pub_info.deinit() handle the rest
+    const tables = pub_info.tables;
+    pub_info.tables = &[_][]const u8{}; // Empty slice so deinit() doesn't free tables
+
+    return ReplicationContext{
+        .tables = tables,
+        .allocator = allocator,
+    };
+}

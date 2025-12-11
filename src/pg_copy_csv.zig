@@ -1,7 +1,5 @@
 //! PostgreSQL COPY CSV format parser
 //!
-//! Much simpler than binary format - just CSV parsing with PostgreSQL-specific escaping
-//!
 //! Format: COPY (...) TO STDOUT WITH (FORMAT csv, HEADER true)
 //! - First line: column names (comma-separated)
 //! - Following lines: data rows (comma-separated, quoted if needed)
@@ -38,7 +36,7 @@ pub const CopyCsvParser = struct {
         self.buffer.deinit(self.allocator);
     }
 
-    /// Execute COPY command and read all data
+    /// Execute PG_OPY command and read all data and parse header
     pub fn executeCopy(self: *CopyCsvParser, query: [:0]const u8) !void {
         // Execute COPY command
         const result = c.PQexec(self.conn, query.ptr);
@@ -79,6 +77,10 @@ pub const CopyCsvParser = struct {
     }
 
     /// Parse CSV header line
+    ///
+    /// Sets self.header to array of column names
+    ///
+    /// Caller owns the memory for column names
     fn parseHeader(self: *CopyCsvParser) !void {
         const data = self.buffer.items;
 

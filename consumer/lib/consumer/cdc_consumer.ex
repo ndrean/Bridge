@@ -29,12 +29,13 @@ defmodule Consumer.Cdc do
   end
 
   @impl true
-  def handle_message(message, state) do
-    # dbg(message.topic)
+  def handle_message(%{topic: topic, body: body} = _message, state) do
+    op = String.split(topic, ".") |> List.last()
+    dbg(op)
 
     try do
       # Decode MessagePack payload
-      decoded = Msgpax.unpack!(message.body)
+      decoded = Msgpax.unpack!(body)
 
       cond do
         is_list(decoded) ->
@@ -52,7 +53,7 @@ defmodule Consumer.Cdc do
           data_str = if decoded["data"], do: " data=#{inspect(decoded["data"])}", else: ""
 
           Logger.info(
-            "[CDC Consumer] #{message.topic}: table=#{decoded["table"]}, operation=#{decoded["operation"]}#{data_str}"
+            "[CDC Consumer] #{topic}: table=#{decoded["table"]}, operation=#{decoded["operation"]}#{data_str}"
           )
       end
 

@@ -8,16 +8,16 @@ A lightweight (15MB), opinionated bridge for streaming PostgreSQL changes to NAT
 
 ```mermaid
 flowchart LR
-    PG[PostgreSQL<br/>Logical Replication] --> Bridge[Bridge Server<br/>5 threads]
+    PG[Postgres<br/>Log. Repl.] --> Bridge[Bridge Server<br/>5 threads]
     Bridge --> NATS[NATS JetStream]
 
     subgraph NATS
-        CDC[CDC Stream<br/>cdc.table.operation]
-        INIT[INIT Stream<br/>init.snap.*, init.meta.*]
-        KV[KV Store: schemas<br/>key=table_name]
+        CDC[CDC Stream<br>cdc.table.op]
+        INIT[INIT Stream<br>init.snap.*, <br>init.meta.*]
+        KV[KV Store: <br>schemas<br>key=table]
     end
 
-    NATS --> Consumer[Consumer<br/>Local SQLite/PGLite]
+    NATS --> Consumer[Consumer<br>Local <br>SQLite/PGLite]
 ```
 
 ## Table of Contents
@@ -39,6 +39,14 @@ flowchart LR
 
 ## Overview
 
+We use NATS JetStream to solve the problem of distributing PostgreSQL's logical replication as both solve the hard problems: ordering, durability, idempotency.
+
+The bridge just connects them correctly.
+
+This bridge is an **experiment in minimalism**: can PostgreSQL CDC be done with 16MB and 7MB RAM while preserving correctness?
+
+The design makes deliberate trade-offs for simplicity and efficiency.
+
 ### What It Does
 
 **Two-phase data flow:**
@@ -53,8 +61,8 @@ flowchart LR
 - MessagePack encoding for efficiency
 - At-least-once delivery with idempotent message IDs
 - Graceful shutdown with LSN acknowledgment
-- 15MB Docker image, 10MB RAM usage
-- ~60K events/s throughput (single-threaded)
+- 16MB Docker image, 5MB RAM usage
+- ~+60K events/s throughput (single-threaded)
 
 ### Use Case
 
@@ -65,8 +73,6 @@ flowchart LR
 ---
 
 ## Design Philosophy
-
-This bridge is an **experiment in minimalism**: can PostgreSQL CDC be done with 16MB and 5MB RAM while preserving correctness? The design makes deliberate trade-offs for simplicity and efficiency.
 
 ### 1. Opinionated Encoding: MessagePack
 
@@ -86,13 +92,14 @@ This bridge is an **experiment in minimalism**: can PostgreSQL CDC be done with 
 - Simpler LSN acknowledgment logic
 - Scale horizontally (multiple bridges) instead of vertically
 
-**To scale throughput:**
-```bash
-# Bridge 1: 60K events/s
-./bridge --slot slot_1 --table users --port 9090
+**To scale throughput:**: the PostgreSQL admin creates the publication and scope (_pub_name_ for which tables).
 
-# Bridge 2: Another 60K events/s
-./bridge --slot slot_2 --table orders --port 9091
+```bash
+# Bridge 1: 60K events/s for table "users" with publication "my_pub_1"
+./bridge --slot slot_1 --pub my_pub_1 --port 9090
+
+# Bridge 2: Another 60K events/s for table "orders" with publication "my_pub_2"
+./bridge --slot slot_2 --pub my_pub_2 --port 9091
 ```
 
 **Trade-off:** Multiple processes vs single multi-threaded process. This approach prioritizes operational simplicity.
@@ -105,7 +112,7 @@ The system has **two separate acknowledgment flows** that work independently:
 
 **The bridge's challenge:** When can we safely tell PostgreSQL to prune WAL?
 
-```
+```txt
 PostgreSQL WAL → Bridge → NATS JetStream
               ↑            ↓
               └─── ACK after JetStream confirms
@@ -127,11 +134,13 @@ PostgreSQL WAL → Bridge → NATS JetStream
 **Backpressure:**
 - NATS slow/full → Bridge can't get JetStream ACK → Bridge stops ACK'ing PostgreSQL → WAL accumulates
 
-#### ACK Flow 2: JetStream Pruning (Consumer ↔ NATS)
+#### ACK Flow 2: JetStream Pruning (NATS ↔ Consumer)
+
+This flow happens outside of the scope of hte bridge server.
 
 **The consumer's challenge:** When can JetStream prune delivered messages?
 
-```
+```txt
 NATS JetStream → Consumer
        ↑              ↓
        └──── Consumer ACKs (or NAKs)
@@ -198,17 +207,6 @@ This architecture keeps PostgreSQL WAL lean while allowing consumers to replay/l
 - Consumer controls timing (e.g., off-peak hours)
 - Non-blocking (bridge continues CDC while snapshotting)
 
-### Design Principles Summary
-
-| Principle               | Manifestation                       | Benefit                           |
-| ----------------------- | ----------------------------------- | --------------------------------- |
-| **Simple > Clever**     | Single-threaded, horizontal scaling | Easy to debug, no race conditions |
-| **Explicit > Implicit** | Consumer requests snapshots         | Predictable behavior              |
-| **Correctness > Speed** | ACK only after JetStream confirms   | Zero data loss                    |
-| **Small > Big**         | 15MB image, vendored dependencies   | Minimal operational overhead      |
-
-**The bet:** PostgreSQL's logical replication + NATS JetStream already solve the hard problems (ordering, durability, idempotency). The bridge just connects them correctly.
-
 ---
 
 ## Prerequisites
@@ -220,7 +218,8 @@ This architecture keeps PostgreSQL WAL lean while allowing consumers to replay/l
 #### 1. Enable Logical Replication
 
 Add to `postgresql.conf` or Docker command:
-```
+
+```sh
 wal_level = logical
 max_replication_slots = 10
 max_wal_senders = 10
@@ -236,6 +235,7 @@ CREATE PUBLICATION cdc_pub FOR ALL TABLES;
 ```
 
 To filter specific tables:
+
 ```sql
 CREATE PUBLICATION cdc_pub FOR TABLE users, orders;
 ```
@@ -271,6 +271,7 @@ nats-server -js -m 8222
 ```
 
 Or via Docker:
+
 ```bash
 docker run -p 4222:4222 -p 8222:8222 nats:latest -js -m 8222
 ```
@@ -308,7 +309,8 @@ nats kv add schemas --history=10 --replicas=1
 #### 4. Optional: Configure Authentication
 
 Example `nats-server.conf`:
-```hocon
+
+```yml
 port: 4222
 
 jetstream {
@@ -340,7 +342,7 @@ See `docker-compose.yml` for a complete Docker setup with PostgreSQL + NATS.
 
 ### Bootstrap Flow (First-Time Setup)
 
-```
+```txt
 1. Consumer starts
 2. Fetches schemas from NATS KV store
    GET kv://schemas/{table_name} → MessagePack schema
@@ -357,6 +359,8 @@ See `docker-compose.yml` for a complete Docker setup with PostgreSQL + NATS.
 
 ### Implementation Example (Elixir)
 
+The native concurrency of the BEAM and Elixir makes it a natural candidate to consume "consistant" data.
+
 **1. Fetch Schemas**
 
 ```elixir
@@ -365,7 +369,6 @@ def fetch_schema(table_name) do
     schema_data when is_binary(schema_data) ->
       {:ok, schema} = Msgpax.unpack(schema_data)
       # schema = %{"table" => "users", "columns" => [...]}
-      {:ok, schema}
     _ ->
       {:error, :not_found}
   end
@@ -384,6 +387,7 @@ def request_snapshot(table_name) do
     # Request snapshot
     :ok = Gnat.pub(:gnat, "snapshot.request.#{table_name}", "")
     Logger.info("Requested snapshot for #{table_name}")
+    :ok
   end
 end
 ```
@@ -391,7 +395,7 @@ end
 **3. Subscribe to INIT Stream**
 
 ```elixir
-# Create durable consumer
+# Create durable consumer === persistent
 consumer_config = %Gnat.Jetstream.API.Consumer{
   durable_name: "my_init_consumer",
   stream_name: "INIT",
@@ -446,11 +450,12 @@ See `consumer/lib/consumer/` for a complete Elixir example.
 
 ## Running the Bridge
 
+> [!NOTE] We hardcoded the stream names "CDC" and "INIT".
+
 ### Basic Usage
 
 ```bash
-./bridge --stream CDC,INIT \
-         --slot cdc_slot \
+./bridge --slot cdc_slot \
          --publication cdc_pub \
          --port 9090
 ```
@@ -458,8 +463,7 @@ See `consumer/lib/consumer/` for a complete Elixir example.
 ### Filter Specific Tables
 
 ```bash
-./bridge --stream CDC,INIT \
-         --slot cdc_slot \
+./bridge --slot cdc_slot \
          --publication cdc_pub \
          --table users,orders \
          --port 9090
@@ -488,7 +492,6 @@ export BRIDGE_PORT=9090
 
 ```
 Options:
-  --stream <NAMES>       Comma-separated stream names (default: CDC,INIT)
   --slot <NAME>          Replication slot name (default: cdc_slot)
   --publication <NAME>   Publication name (default: cdc_pub)
   --table <NAMES>        Comma-separated table filter (default: all tables)
@@ -901,7 +904,7 @@ curl -X POST "http://localhost:9090/streams/delete?stream=TEST"
 **Producer-Consumer pattern:**
 - **Producer**: Main thread (reading WAL)
 - **Consumer**: Batch publisher thread
-- **Queue**: Lock-free ring buffer (32768 slots, 2^15)
+- **Queue**: Lock-free ring buffer (65536 slots, 2^16)
 
 **Why lock-free?**
 - Zero contention (single producer, single consumer)

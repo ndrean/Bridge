@@ -16,7 +16,7 @@ pub const log = std.log.scoped(.nats_pub);
 pub const PublisherConfig = struct {
     url: [:0]const u8 = Conf.Nats.default_url,
     max_reconnect_attempts: i32 = Conf.Nats.max_reconnect_attempts, // -1 = infinite
-    reconnect_wait_ms: i64 = Conf.Nats.reconnect_wait_ms, // 2 seconds between attempts
+    reconnect_wait_ms: i64 = Conf.Nats.reconnect_wait_ms, // 1s between attempts
 };
 
 /// JetStream Stream Configuration
@@ -27,7 +27,7 @@ pub const StreamConfig = struct {
     max_msgs: i64 = Conf.Nats.stream_max_msgs,
     max_bytes: i64 = Conf.Nats.stream_max_bytes,
     max_age_ns: i64 = Conf.Nats.stream_max_age_ns,
-    storage: StorageType = .file, // persisted on file system
+    storage: StorageType = Conf.Nats.storage_type, // persisted on file system
     replicas: i32 = 1,
 
     pub const RetentionPolicy = enum {
@@ -129,7 +129,10 @@ pub const Publisher = struct {
     is_connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     metrics: ?*Metrics = null, // Optional metrics tracking
 
-    pub fn init(allocator: std.mem.Allocator, config: PublisherConfig) !Publisher {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        config: PublisherConfig,
+    ) !Publisher {
         const nats_uri = std.process.getEnvVarOwned(allocator, "NATS_HOST") catch |err| blk: {
             log.info("NATS_HOST Env Var not set ({t}), using default 127.0.0.1", .{err});
             break :blk try allocator.dupe(u8, "127.0.0.1");
@@ -310,6 +313,14 @@ pub const Publisher = struct {
         }
 
         log.info("✅ JetStream context acquired", .{});
+
+        // Verify required streams exist
+        const required_streams = Conf.Nats.default_streams;
+        log.info("Verifying {d} NATS JetStream stream(s)...", .{required_streams.len});
+        for (required_streams) |stream_name| {
+            try ensureStream(self.js.?, self.allocator, stream_name);
+            log.info("  ✅ Stream '{s}' verified", .{stream_name});
+        }
     }
 
     pub fn deinit(self: *Publisher) void {
@@ -580,4 +591,26 @@ pub fn ensureStream(js: *c.jsCtx, allocator: std.mem.Allocator, stream_name: []c
     );
 
     return error.StreamNotFound;
+}
+
+/// Check multiple JetStream streams exist
+///
+/// Verifies that all required streams are created and accessible.
+/// Streams should be created by infrastructure (nats-init), this function only verifies they exist.
+///
+/// Args:
+///   publisher: NATS publisher instance with active JetStream context
+///   allocator: Memory allocator
+///   stream_names: Slice of stream names to verify
+pub fn checkStreams(
+    publisher: *Publisher,
+    allocator: std.mem.Allocator,
+    stream_names: []const []const u8,
+) !void {
+    log.info("Verifying {d} NATS JetStream stream(s)...", .{stream_names.len});
+
+    for (stream_names) |stream_name| {
+        try ensureStream(publisher.js.?, allocator, stream_name);
+        log.info("  ✅ Stream '{s}' verified", .{stream_name});
+    }
 }
