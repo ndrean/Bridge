@@ -3,10 +3,49 @@ const nats_publisher = @import("nats_publisher.zig");
 const msgpack = @import("msgpack");
 const pgoutput = @import("pgoutput.zig");
 const Config = @import("config.zig");
+const encoder_mod = @import("encoder.zig");
 
 pub const log = std.log.scoped(.batch_publisher);
 
-/// Convert std.json.Value to msgpack.Payload recursively
+/// Convert pgoutput.Column value to encoder.Value
+fn columnValueToEncoderValue(
+    encoder: *encoder_mod.Encoder,
+    column_value: pgoutput.DecodedValue,
+) !encoder_mod.Value {
+    return switch (column_value) {
+        .int32 => |v| encoder.createInt(@intCast(v)),
+        .int64 => |v| encoder.createInt(v),
+        .float64 => |v| encoder.createFloat(v),
+        .boolean => |v| encoder.createBool(v),
+        .text, .bytea, .array, .numeric => |v| try encoder.createString(v),
+        .jsonb => |v| blk: {
+            // For JSONB columns in MessagePack mode, parse and convert to native types
+            // For JSON mode, just treat as a string (simpler and avoids ownership issues)
+            break :blk switch (encoder.format) {
+                .msgpack => blk2: {
+                    // Parse JSON and convert to MessagePack native types
+                    const parsed = std.json.parseFromSlice(
+                        std.json.Value,
+                        encoder.allocator,
+                        v,
+                        .{},
+                    ) catch {
+                        // If parsing fails, fall back to string
+                        break :blk2 try encoder.createString(v);
+                    };
+                    defer parsed.deinit();
+
+                    const mp = try jsonValueToMsgpack(parsed.value, encoder.allocator);
+                    break :blk2 encoder_mod.Value{ .msgpack = mp };
+                },
+                .json => try encoder.createString(v), // Keep JSONB as JSON string
+            };
+        },
+        .null => encoder.createNull(),
+    };
+}
+
+/// Convert std.json.Value to msgpack.Payload recursively (for JSONB columns in MessagePack mode)
 fn jsonValueToMsgpack(value: std.json.Value, allocator: std.mem.Allocator) !msgpack.Payload {
     return switch (value) {
         .null => msgpack.Payload{ .nil = {} },
@@ -95,6 +134,7 @@ pub const BatchPublisher = struct {
     allocator: std.mem.Allocator,
     publisher: *nats_publisher.Publisher,
     config: BatchConfig,
+    format: encoder_mod.Format,
 
     // Batch state
     events: std.ArrayList(CDCEvent),
@@ -106,11 +146,13 @@ pub const BatchPublisher = struct {
         allocator: std.mem.Allocator,
         publisher: *nats_publisher.Publisher,
         config: BatchConfig,
+        format: encoder_mod.Format,
     ) BatchPublisher {
         return .{
             .allocator = allocator,
             .publisher = publisher,
             .config = config,
+            .format = format,
             .events = std.ArrayList(CDCEvent){},
             .current_payload_size = 0,
             .last_flush_time = std.time.milliTimestamp(),
@@ -214,99 +256,34 @@ pub const BatchPublisher = struct {
         if (event_count == 1) {
             const event = self.events.items[0];
 
-            // Use ArrayList for dynamic buffer (no fixed size limit)
-            var buffer: std.ArrayList(u8) = .empty;
-            defer buffer.deinit(self.allocator);
+            // Use unified encoder
+            var encoder = encoder_mod.Encoder.init(self.allocator, self.format);
+            defer encoder.deinit();
 
-            // Create a stream wrapper for ArrayList
-            const ArrayListStream = struct {
-                list: *std.ArrayList(u8),
-                allocator: std.mem.Allocator,
-                pos: usize = 0,
+            var event_map = encoder.createMap();
+            defer event_map.free(self.allocator);
 
-                const Stream = @This();
-                pub const WriteError = std.mem.Allocator.Error;
-                pub const ReadError = error{EndOfStream};
-
-                pub fn write(stream: *Stream, bytes: []const u8) WriteError!usize {
-                    try stream.list.appendSlice(stream.allocator, bytes);
-                    return bytes.len;
-                }
-
-                pub fn read(stream: *Stream, dest: []u8) ReadError!usize {
-                    const available = stream.list.items.len - stream.pos;
-                    if (available == 0) return 0;
-                    const to_read = @min(dest.len, available);
-                    @memcpy(dest[0..to_read], stream.list.items[stream.pos..][0..to_read]);
-                    stream.pos += to_read;
-                    return to_read;
-                }
-            };
-
-            var write_stream = ArrayListStream{ .list = &buffer, .allocator = self.allocator };
-            var read_stream = ArrayListStream{ .list = &buffer, .allocator = self.allocator };
-
-            var packer = msgpack.Pack(
-                *ArrayListStream,
-                *ArrayListStream,
-                ArrayListStream.WriteError,
-                ArrayListStream.ReadError,
-                ArrayListStream.write,
-                ArrayListStream.read,
-            ).init(
-                &write_stream,
-                &read_stream,
-            );
-
-            var event_map = msgpack.Payload.mapPayload(self.allocator);
-            errdefer event_map.free(self.allocator);
-
-            try event_map.mapPut("subject", try msgpack.Payload.strToPayload(event.subject, self.allocator));
-            try event_map.mapPut("table", try msgpack.Payload.strToPayload(event.table, self.allocator));
-            try event_map.mapPut("operation", try msgpack.Payload.strToPayload(event.operation, self.allocator));
-            try event_map.mapPut("msg_id", try msgpack.Payload.strToPayload(event.msg_id, self.allocator));
-            try event_map.mapPut("relation_id", msgpack.Payload{ .int = @intCast(event.relation_id) });
+            try event_map.put("subject", try encoder.createString(event.subject));
+            try event_map.put("table", try encoder.createString(event.table));
+            try event_map.put("operation", try encoder.createString(event.operation));
+            try event_map.put("msg_id", try encoder.createString(event.msg_id));
+            try event_map.put("relation_id", encoder.createInt(@intCast(event.relation_id)));
 
             // Add column data if present
             if (event.data) |columns| {
                 log.debug("Single event has {d} columns", .{columns.items.len});
-                var data_payload = msgpack.Payload.mapPayload(self.allocator);
-                // Don't defer - needs to stay alive until packer.write() completes
+                var data_map = encoder.createMap();
 
                 for (columns.items) |column| {
-                    const value_payload = switch (column.value) {
-                        .int32 => |v| msgpack.Payload{ .int = @intCast(v) },
-                        .int64 => |v| msgpack.Payload{ .int = v },
-                        .float64 => |v| msgpack.Payload{ .float = v },
-                        .boolean => |v| msgpack.Payload{ .bool = v },
-                        .text, .bytea, .array, .numeric => |v| try msgpack.Payload.strToPayload(v, self.allocator),
-                        .jsonb => |v| blk: {
-                            // Parse JSON and convert to MessagePack native types
-                            const parsed = std.json.parseFromSlice(
-                                std.json.Value,
-                                self.allocator,
-                                v,
-                                .{},
-                            ) catch {
-                                // If parsing fails, fall back to string
-                                break :blk try msgpack.Payload.strToPayload(v, self.allocator);
-                            };
-                            defer parsed.deinit();
-
-                            // Convert JSON Value to MessagePack Payload
-                            break :blk try jsonValueToMsgpack(parsed.value, self.allocator);
-                        },
-                        .null => msgpack.Payload{ .nil = {} },
-                    };
-
-                    try data_payload.mapPut(column.name, value_payload);
+                    const value_enc = try columnValueToEncoderValue(&encoder, column.value);
+                    try data_map.put(column.name, value_enc);
                 }
 
-                try event_map.mapPut("data", data_payload);
+                try event_map.put("data", data_map);
             }
 
-            try packer.write(event_map);
-            const encoded = buffer.items;
+            const encoded = try encoder.encode(event_map);
+            defer self.allocator.free(encoded);
 
             try self.publisher.publish(event.subject, encoded, event.msg_id);
 
@@ -314,93 +291,46 @@ pub const BatchPublisher = struct {
             try self.publisher.flushAsync();
 
             log.debug("Published single event: {s}", .{event.subject});
-
-            // Free payload structures after encoding is complete
-            event_map.free(self.allocator);
         } else {
-            // Use arena allocator for MessagePack encoding to reduce allocations
-            // This reduces ~300 allocations per batch to just 1
-            var arena = std.heap.ArenaAllocator.init(self.allocator);
-            defer arena.deinit();
-            const encoding_allocator = arena.allocator();
+            // Use unified encoder for batch publishing
+            var encoder = encoder_mod.Encoder.init(self.allocator, self.format);
+            defer encoder.deinit();
 
-            // Publish as a batch using MessagePack array
-            var buffer: [131072]u8 = undefined; // 128KB buffer
-            const compat = msgpack.compat;
-            var write_buffer = compat.fixedBufferStream(&buffer);
-            var read_buffer = compat.fixedBufferStream(&buffer);
+            // Create array of events
+            var batch_array = try encoder.createArray(event_count);
+            defer batch_array.free(self.allocator);
 
-            const BufferType = compat.BufferStream;
-            var packer = msgpack.Pack(
-                *BufferType,
-                *BufferType,
-                BufferType.WriteError,
-                BufferType.ReadError,
-                BufferType.write,
-                BufferType.read,
-            ).init(&write_buffer, &read_buffer);
-
-            // Create array payload
-            var batch_array = try msgpack.Payload.arrPayload(event_count, encoding_allocator);
-            // No defer needed - arena.deinit() handles it
+            const encode_start = std.time.milliTimestamp();
 
             for (self.events.items, 0..) |event, i| {
                 // Each event is a map with subject, table, operation, msg_id, and data
-                var event_map = msgpack.Payload.mapPayload(encoding_allocator);
+                var event_map = encoder.createMap();
 
-                try event_map.mapPut("subject", try msgpack.Payload.strToPayload(event.subject, encoding_allocator));
-                try event_map.mapPut("table", try msgpack.Payload.strToPayload(event.table, encoding_allocator));
-                try event_map.mapPut("operation", try msgpack.Payload.strToPayload(event.operation, encoding_allocator));
-                try event_map.mapPut("msg_id", try msgpack.Payload.strToPayload(event.msg_id, encoding_allocator));
-                try event_map.mapPut("relation_id", msgpack.Payload{ .int = @intCast(event.relation_id) });
+                try event_map.put("subject", try encoder.createString(event.subject));
+                try event_map.put("table", try encoder.createString(event.table));
+                try event_map.put("operation", try encoder.createString(event.operation));
+                try event_map.put("msg_id", try encoder.createString(event.msg_id));
+                try event_map.put("relation_id", encoder.createInt(@intCast(event.relation_id)));
 
                 // Add column data if present
                 if (event.data) |columns| {
-                    var data_payload = msgpack.Payload.mapPayload(encoding_allocator);
+                    var data_map = encoder.createMap();
 
                     for (columns.items) |column| {
-                        const value_payload = switch (column.value) {
-                            .int32 => |v| msgpack.Payload{ .int = @intCast(v) },
-                            .int64 => |v| msgpack.Payload{ .int = v },
-                            .float64 => |v| msgpack.Payload{ .float = v },
-                            .boolean => |v| msgpack.Payload{ .bool = v },
-                            .text, .bytea, .array, .numeric => |v| try msgpack.Payload.strToPayload(v, encoding_allocator),
-                            .jsonb => |v| blk: {
-                                // Parse JSON and convert to MessagePack native types
-                                const parsed = std.json.parseFromSlice(
-                                    std.json.Value,
-                                    encoding_allocator,
-                                    v,
-                                    .{},
-                                ) catch {
-                                    // If parsing fails, fall back to string
-                                    break :blk try msgpack.Payload.strToPayload(v, encoding_allocator);
-                                };
-                                defer parsed.deinit();
-
-                                // Convert JSON Value to MessagePack Payload
-                                break :blk try jsonValueToMsgpack(parsed.value, encoding_allocator);
-                            },
-                            .null => msgpack.Payload{ .nil = {} },
-                        };
-
-                        try data_payload.mapPut(column.name, value_payload);
+                        const value_enc = try columnValueToEncoderValue(&encoder, column.value);
+                        try data_map.put(column.name, value_enc);
                     }
 
-                    try event_map.mapPut("data", data_payload);
+                    try event_map.put("data", data_map);
                 }
 
-                batch_array.arr[i] = event_map;
+                try batch_array.setIndex(i, event_map);
             }
 
-            // Write batch array
-            const encode_start = std.time.milliTimestamp();
-            try packer.write(batch_array);
-            const encode_elapsed = std.time.milliTimestamp() - encode_start;
+            const encoded = try encoder.encode(batch_array);
+            defer self.allocator.free(encoded);
 
-            // Get the encoded bytes
-            const written = write_buffer.pos;
-            const encoded = buffer[0..written];
+            const encode_elapsed = std.time.milliTimestamp() - encode_start;
 
             // Publish the batch with a composite message ID
             const publish_start = std.time.milliTimestamp();

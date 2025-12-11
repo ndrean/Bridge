@@ -2,6 +2,7 @@
 const std = @import("std");
 const pg = @import("config.zig").Postgres;
 const nats = @import("config.zig").Nats;
+const encoder = @import("encoder.zig");
 const log = std.log.scoped(.args);
 
 /// Command-line arguments structure
@@ -9,6 +10,7 @@ pub const Args = struct {
     http_port: u16,
     slot_name: []const u8,
     publication_name: []const u8,
+    encoding_format: encoder.Format,
 
     /// Parse command-line arguments
     pub fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -18,32 +20,9 @@ pub const Args = struct {
         var http_port: u16 = 6543; // default
         var slot_name: []const u8 = pg.default_slot_name; // default
         var publication_name: []const u8 = pg.default_publication_name; // default
+        var encoding_format: encoder.Format = .msgpack; // default
 
         while (args.next()) |arg| {
-            // if (std.mem.eql(u8, arg, "--stream")) {
-            //     if (args.next()) |value| {
-            //         // Parse comma-separated stream names
-            //         var stream_list = std.ArrayList([]const u8){};
-            //         defer stream_list.deinit(allocator);
-
-            //         var iter = std.mem.splitScalar(u8, value, ',');
-            //         while (iter.next()) |stream_name| {
-            //             const trimmed = std.mem.trim(
-            //                 u8,
-            //                 stream_name,
-            //                 &std.ascii.whitespace,
-            //             );
-
-            //             if (trimmed.len > 0) {
-            //                 // Heap-allocate the string to ensure it outlives parseArgs()
-            //                 const owned = try allocator.dupe(u8, trimmed);
-            //                 try stream_list.append(allocator, owned);
-            //             }
-            //         }
-
-            //         streams = try stream_list.toOwnedSlice(allocator);
-            //     }
-            // } else
             if (std.mem.eql(u8, arg, "--port")) {
                 if (args.next()) |value| {
                     http_port = std.fmt.parseInt(u16, value, 10) catch {
@@ -55,46 +34,20 @@ pub const Args = struct {
                 if (args.next()) |value| {
                     slot_name = value;
                 }
-            } else if (std.mem.eql(u8, arg, "--publication")) {
+            } else if (std.mem.eql(u8, arg, "--pub")) {
                 if (args.next()) |value| {
                     publication_name = value;
                 }
+            } else if (std.mem.eql(u8, arg, "--json")) {
+                encoding_format = .json;
             }
-            // else if (std.mem.eql(u8, arg, "--table")) {
-            //     if (args.next()) |value| {
-            //         // Check if "all" (case-insensitive)
-            //         if (std.ascii.eqlIgnoreCase(value, "all")) {
-            //             tables = &.{}; // Empty = all tables
-            //         } else {
-            //             // Parse comma-separated table names
-            //             var table_list = std.ArrayList([]const u8){};
-            //             defer table_list.deinit(allocator);
-
-            //             var iter = std.mem.splitScalar(u8, value, ',');
-            //             while (iter.next()) |table_name| {
-            //                 const trimmed = std.mem.trim(
-            //                     u8,
-            //                     table_name,
-            //                     &std.ascii.whitespace,
-            //                 );
-
-            //                 if (trimmed.len > 0) {
-            //                     // Heap-allocate the string to ensure it outlives parseArgs()
-            //                     const owned = try allocator.dupe(u8, trimmed);
-            //                     try table_list.append(allocator, owned);
-            //                 }
-            //             }
-
-            //             tables = try table_list.toOwnedSlice(allocator);
-            //         }
-            // }
-            // }
         }
 
         return Args{
             .http_port = http_port,
             .slot_name = slot_name,
             .publication_name = publication_name,
+            .encoding_format = encoding_format,
         };
     }
 };

@@ -55,14 +55,17 @@ The design makes deliberate trade-offs for simplicity and efficiency.
 2. **Real-time CDC** (CDC stream): Consumer receives INSERT/UPDATE/DELETE events as they happen
 
 **Key features:**
+
 - Streams PostgreSQL changes using logical replication (pgoutput format)
 - Publishes schemas to NATS KV store on startup
 - Generates table snapshots on-demand (10K row chunks)
-- MessagePack encoding for efficiency
+- Triggers message to NATS on schema change
+- MessagePack encoding by default for efficiency (JSON available with `--json`)
 - At-least-once delivery with idempotent message IDs
 - Graceful shutdown with LSN acknowledgment
-- 16MB Docker image, 5MB RAM usage
+- 16MB Docker image, 7MB RAM usage
 - ~+60K events/s throughput (single-threaded)
+- telemetry via HTTP `/metrics` (Prometheus format) and Logs structured metrics to stdout (Grafana Loki)
 
 ### Use Case
 
@@ -74,14 +77,14 @@ The design makes deliberate trade-offs for simplicity and efficiency.
 
 ## Design Philosophy
 
-### 1. Opinionated Encoding: MessagePack
+### 1. Encoding
 
-**Current default: MessagePack**
+**Default: MessagePack**
 - Compact (~30% smaller than JSON)
 - Type-safe (preserves int/float/binary distinctions)
 - Fast encoding/decoding
 
-**Future option:** `--format json` flag for browser compatibility (NATS supports WebSocket connections)
+**Alternative: JSON**: use flag `--json` for browser compatibility (NATS supports WebSocket connections) but slightly larger payload size and slower encoding/decoding.
 
 ### 2. Single-Threaded per Bridge
 
@@ -104,13 +107,7 @@ The design makes deliberate trade-offs for simplicity and efficiency.
 
 **Trade-off:** Multiple processes vs single multi-threaded process. This approach prioritizes operational simplicity.
 
-### 3. Two Independent ACK Flows
-
-The system has **two separate acknowledgment flows** that work independently:
-
-#### ACK Flow 1: WAL Preservation (Bridge ↔ PostgreSQL)
-
-**The bridge's challenge:** When can we safely tell PostgreSQL to prune WAL?
+### 3. Bridge ACK Flow
 
 ```txt
 PostgreSQL WAL → Bridge → NATS JetStream
@@ -118,27 +115,18 @@ PostgreSQL WAL → Bridge → NATS JetStream
               └─── ACK after JetStream confirms
 ```
 
-**How it works:**
-
 1. Bridge receives WAL event from PostgreSQL
 2. Bridge publishes to NATS JetStream (async)
 3. **JetStream confirms** message is durably persisted (file storage)
 4. Bridge ACKs that LSN to PostgreSQL
 5. PostgreSQL can safely prune WAL up to that LSN
 
-**Why this matters:**
-- Bridge only ACKs after NATS has the data (no data loss)
-- PostgreSQL can reclaim disk space safely
-- If bridge crashes, PostgreSQL retains unpublished WAL
+Bridge only ACKs after NATS has the data (no data loss). Then PostgreSQL can reclaim disk space safely.
+If bridge crashes, PostgreSQL retains unpublished WAL
 
-**Backpressure:**
-- NATS slow/full → Bridge can't get JetStream ACK → Bridge stops ACK'ing PostgreSQL → WAL accumulates
+**Backpressure:**: NATS slow/full → Bridge can't get JetStream ACK → Bridge stops ACK'ing PostgreSQL → WAL accumulates
 
-#### ACK Flow 2: JetStream Pruning (NATS ↔ Consumer)
-
-This flow happens outside of the scope of hte bridge server.
-
-**The consumer's challenge:** When can JetStream prune delivered messages?
+The NATS ACK flow remains "standard" outside of the bridge scope:
 
 ```txt
 NATS JetStream → Consumer
@@ -146,39 +134,16 @@ NATS JetStream → Consumer
        └──── Consumer ACKs (or NAKs)
 ```
 
-**How it works:**
-
 1. Consumer pulls messages from JetStream
 2. Consumer processes message
 3. Consumer ACKs to JetStream (or NAKs on error)
 4. JetStream tracks consumer position (durable consumer)
 5. JetStream can prune messages acknowledged by all consumers
 
-**Why this matters:**
-- Consumer controls replay (NAK → redeliver)
-- Durable consumer name survives restarts
-- Multiple consumers can track independent positions
+The Consumer controls replay (NAK → redeliver). Durable consumer name survives restarts. Multiple consumers can track independent positions
 
-**Backpressure:**
-- Consumer slow → JetStream buffers → Consumer catches up at own pace
-- JetStream retention policies prevent unbounded growth
-
-#### Why Two Flows Are Better Than One
-
-**Bridge doesn't wait for consumers:**
-- Bridge ACKs to PostgreSQL as soon as NATS has the data
-- Consumer speed doesn't affect PostgreSQL WAL growth
-- NATS JetStream handles the buffering/delivery problem
-
-**Separation of concerns:**
-
-| Component          | Responsibility                      | ACK Target                         |
-| ------------------ | ----------------------------------- | ---------------------------------- |
-| **Bridge**         | Get data from PG into NATS reliably | PostgreSQL (LSN)                   |
-| **NATS JetStream** | Deliver to consumers durably        | N/A (handles both flows)           |
-| **Consumer**       | Process data and track progress     | NATS JetStream (consumer position) |
-
-This architecture keeps PostgreSQL WAL lean while allowing consumers to replay/lag independently.
+**Backpressure:**: Consumer slow → JetStream buffers → Consumer catches up at own pace. JetStream retention policies prevent unbounded growth
+.
 
 ### 4. Two-Stream Architecture
 
@@ -187,14 +152,11 @@ This architecture keeps PostgreSQL WAL lean while allowing consumers to replay/l
 | **CDC**  | Real-time changes   | Short (1 min) | Continuous subscription |
 | **INIT** | Bootstrap snapshots | Long (7 days) | One-time replay         |
 
-**Why separate?**
-- Different retention policies
-- Consumer requests snapshots on-demand (not auto-pushed)
-- Clear operational semantics
+Both streams have different retention policies.
+Consumer requests snapshots on-demand (not auto-pushed)
 
 ### 5. On-Demand Snapshots
 
-**Flow:**
 1. Bridge starts → publishes schemas to KV store immediately
 2. Consumer fetches schemas when ready
 3. Consumer publishes: `snapshot.request.{table}`
@@ -202,18 +164,13 @@ This architecture keeps PostgreSQL WAL lean while allowing consumers to replay/l
 5. Consumer reconstructs table from INIT stream
 6. Consumer subscribes to CDC stream for updates
 
-**Why on-demand?**
-- No unnecessary work (only snapshot tables consumers need)
-- Consumer controls timing (e.g., off-peak hours)
-- Non-blocking (bridge continues CDC while snapshotting)
+No unnecessary work (only snapshot tables consumers need). Consumer controls timing (e.g., off-peak hours) Non-blocking (bridge continues CDC while snapshotting)
 
 ---
 
 ## Prerequisites
 
-### PostgreSQL Setup (Admin/DBA Task)
-
-**Requires superuser privileges** (e.g., `postgres` user). The bridge uses a restricted `bridge_reader` user for security.
+### PostgreSQL Setup (by admin/DBA Task eg `postgres` user)
 
 #### 1. Enable Logical Replication
 
@@ -229,18 +186,22 @@ wal_sender_timeout = 300s  # 5 minutes
 
 #### 2. Create Publication
 
-```sql
--- Run as superuser
-CREATE PUBLICATION cdc_pub FOR ALL TABLES;
-```
-
-To filter specific tables:
+On specific tables:
 
 ```sql
 CREATE PUBLICATION cdc_pub FOR TABLE users, orders;
 ```
 
+Or for all tables:
+
+```sql
+-- Run as superuser
+CREATE PUBLICATION cdc_pub FOR ALL TABLES;
+```
+
 #### 3. Create Bridge User
+
+> [!NOTE] The bridge uses a restricted `bridge_reader` user for security. It should be restricted to SELECT on given tables + REPLICATION (least privilege).
 
 ```sql
 -- Run as superuser
@@ -254,19 +215,17 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT SELECT ON TABLES TO bridge_reader;
 ```
 
-**Why two users?**
-- **Superuser** (`postgres`): Creates publications (security-sensitive)
-- **Bridge user** (`bridge_reader`): Restricted to SELECT + REPLICATION (least privilege)
-
 See `init.sh` for a complete setup script.
 
 ---
 
 ### NATS JetStream Setup (Admin Task)
 
+The NATS admin must enable JetStream, create two streams 'CDC' and 'INIT' and a KV store 'schemas'.
+
 #### 1. Enable JetStream
 
-```bash
+```sh
 nats-server -js -m 8222
 ```
 
@@ -278,7 +237,7 @@ docker run -p 4222:4222 -p 8222:8222 nats:latest -js -m 8222
 
 #### 2. Create Streams
 
-```bash
+```sh
 # CDC stream: Short retention for real-time events
 nats stream add CDC \
   --subjects='cdc.>' \
@@ -302,11 +261,11 @@ nats stream add INIT \
 
 #### 3. Create KV Bucket for Schemas
 
-```bash
+```sh
 nats kv add schemas --history=10 --replicas=1
 ```
 
-#### 4. Optional: Configure Authentication
+#### 4. Configure Authentication
 
 Example `nats-server.conf`:
 
@@ -452,21 +411,40 @@ See `consumer/lib/consumer/` for a complete Elixir example.
 
 > [!NOTE] We hardcoded the stream names "CDC" and "INIT".
 
-### Basic Usage
+The user of the bridge defines a `REPLICATION_SLOT` with the flag `--slot my_slot`. The bridge will create it.
 
-```bash
-./bridge --slot cdc_slot \
-         --publication cdc_pub \
-         --port 9090
+### Command-Line Options
+
+```txt
+  --slot <NAME>     Mandatory: Replication slot name (default: cdc_slot)
+  --pub <NAME>      Mandatory: use the Postgres `PUBLICATION`
+  --port <PORT>     HTTP telemetry port (default: 9090)
+  --json            Encoder option: defaults to `MessagePack`
+  --help, -h        Show this help message
 ```
 
-### Filter Specific Tables
+### Usage
 
-```bash
-./bridge --slot cdc_slot \
-         --publication cdc_pub \
-         --table users,orders \
-         --port 9090
+The PG admin has created the "bridge-user" and use the env vars `POSTGRES_BRIDGE_USER` with `POSTGRES_BRIDGE_PASSWORD`
+
+The PG admin has create a PUBLICATION say 'my_pub' for given tables, say 'users', 'orders'.
+
+The NATS admin has created two streams 'CDC' and 'INIT', created a KV store 'schemas' and defined credentials for a "nats-user" with the env vars `NATS_BRIDGE_USER` with `NATS_BRIDGE_PASSWORD`. 
+
+```sh
+PG_HOST=postgres-server \
+PG_DB=my-db \
+PG_PORT=5432 \
+POSTGRES_BRIDGE_USER=pg-user_a \
+POSTGRES_BRIDGE_PASSWORD=pg-secret \
+NATS_BRIDGE_USER=nats-user_a \
+NATS_BRIDGE_PASSWORD=nats-secret \
+NATS_HOST=nats-server \
+./bridge --slot my_slot --pub my_pub
+
+# if the user wants another PORT and receives JSON:
+
+./bridge --slot my_slot --pub my_pub --port 9009 --json
 ```
 
 ### Environment Variables
@@ -488,17 +466,6 @@ export NATS_BRIDGE_PASSWORD=bridge_password
 export BRIDGE_PORT=9090
 ```
 
-### Command-Line Options
-
-```
-Options:
-  --slot <NAME>          Replication slot name (default: cdc_slot)
-  --publication <NAME>   Publication name (default: cdc_pub)
-  --table <NAMES>        Comma-separated table filter (default: all tables)
-  --port <PORT>          HTTP telemetry port (default: 9090)
-  --help, -h             Show this help message
-```
-
 ### Docker Compose
 
 ```bash
@@ -510,23 +477,25 @@ See `docker-compose.prod.yml` for the complete setup.
 
 ### Horizontal Scaling
 
-Run multiple bridge instances with different replication slots:
+Run multiple bridge instances with different replication slots: you can go from 60K events/s to 120K events/s with two independant bridge server connected to the Postgres database and the NATS server.
 
 ```bash
-# Terminal 1: Users table (60K events/s)
-./bridge --stream CDC,INIT --slot slot_1 --table users --port 9090
+# Terminal 1: 'pub_1' created for 'Users' table 
+./bridge ---slot slot_1 --pub pub_1 --port 9090
 
-# Terminal 2: Orders table (60K events/s)
-./bridge --stream CDC,INIT --slot slot_2 --table orders --port 9091
-
-# Total: 120K events/s, independent failure domains
+# Terminal 2: 'pub_2' created for 'Orders' table
+./bridge --slot slot_2  --pub pub_2 --port 9091
 ```
 
 ---
 
 ## Message Formats
 
-> **Note**: Actual payloads use MessagePack binary encoding. JSON examples below show the logical structure for illustration.
+Payloads use `MessagePack` binary encoding by default.
+
+JSON can be enabled with the flag `--json`.
+
+The examples below show the logical structure for illustration.
 
 ### Schema (KV Store: `schemas.{table}`)
 
@@ -802,19 +771,9 @@ Shutdown sequence:
 ### 6. Stream Management Endpoints
 
 **Get stream info:**
+
 ```bash
 curl "http://localhost:9090/streams/info?stream=CDC" | jq
-```
-
-**Purge stream messages:**
-```bash
-curl -X POST "http://localhost:9090/streams/purge?stream=TEST"
-```
-
-**Create/delete streams:**
-```bash
-curl -X POST "http://localhost:9090/streams/create?stream=TEST&subjects=test.>"
-curl -X POST "http://localhost:9090/streams/delete?stream=TEST"
 ```
 
 ---
@@ -918,7 +877,7 @@ curl -X POST "http://localhost:9090/streams/delete?stream=TEST"
 
 **How it handles NATS outages:**
 
-```
+```txt
 NATS goes down at T=0
 ├─ Main thread continues reading WAL → pushes to queue
 ├─ Flush thread can't publish → queue fills up
@@ -934,26 +893,13 @@ NATS reconnects at T=1000ms+ (reconnect_wait, queue covers 54% of retry)
 
 **Backpressure cascade:**
 
-```
+```txt
 NATS outage → Queue fills → Main thread slows → PostgreSQL WAL accumulates
                                                          ↓
                                            (up to max_slot_wal_keep_size=10GB)
 ```
 
-**Queue size trade-offs:**
-
-| Queue Size          | Buffer Duration<br/>(at 60K events/s) | Memory Impact | Pros                    | Cons                              |
-| ------------------- | ------------------------------------- | ------------- | ----------------------- | --------------------------------- |
-| 4096                | ~68ms                                 | ~256KB        | Minimal memory          | Too small for reconnections       |
-| 16384               | ~273ms                                | ~1MB          | Good balance            | Marginal for multi-second outages |
-| **32768** (current) | **~546ms**                            | **~2MB**      | **Covers most outages** | **None (negligible cost)**        |
-
-**Why 32768 is the sweet spot:**
-- **NATS reconnection**: 1s between attempts, 546ms covers 54% of retry interval
-- **PostgreSQL reconnection**: 5s delay, queue absorbs burst during reconnection
-- **Production-grade**: 546ms buffer handles real-world jitter and blips
-- **Cost**: 2MB RAM (12MB total) = negligible for the resilience gain
-- **Graceful degradation**: Queue full → controlled WAL accumulation (not instant flood)
+The internal SPSC Queue size is 65536 items or 4MB which buffers at 60K events/s during 1s.
 
 **Graceful degradation:**
 - Queue absorbs microsecond-scale jitter
@@ -963,7 +909,7 @@ NATS outage → Queue fills → Main thread slows → PostgreSQL WAL accumulates
 
 ### Data Flow
 
-```
+```txt
 PostgreSQL WAL
     ↓
 Main Thread (parse pgoutput)
@@ -1093,6 +1039,7 @@ If you're betting on mission-critical CDC, use Debezium. If you're exploring NAT
 ```
 
 This compiles:
+
 - `nats.c` → `libs/nats-install/`
 - `libpq` → `libs/libpq-install/`
 
@@ -1151,7 +1098,7 @@ All configuration constants are centralized in `src/config.zig`.
 - Critical threshold: `1GB`
 
 **Buffer sizes:**
-- SPSC queue: `32768` slots (2^15, ~546ms buffer at 60K events/s)
+- SPSC queue: `65536` slots (2^16, ~1092ms buffer at 60K events/s)
 - Subject buffer: `128` bytes
 - Message ID buffer: `128` bytes
 
@@ -1214,7 +1161,9 @@ See `src/config.zig` for all tunables.
 
 **Terminal 1 - Start the bridge:**
 ```bash
-./zig-out/bin/bridge --stream CDC,INIT
+docker compose -f docker-compose.prod.yml up postgres nats-init nats-conf-gen nats-server
+
+./zig-out/bin/bridge --slot my_slot --pub cdc_slot
 ```
 
 **Terminal 2 - Generate CDC events:**
@@ -1262,17 +1211,14 @@ docker exec -it postgres psql -U postgres -c "
 
 ## Roadmap
 
-**Planned enhancements:**
-- [ ] `--format json` flag for browser-friendly encoding
-- [ ] Schema change notifications (publish to NATS on relation_id change)
-- [ ] Compression options (`--compress gzip|lz4|zstd`)
-- [ ] Multiple publication support (`--publication pub1,pub2`)
+**Planned enhancements:**:
+
+- [ ] Compression options (`--compress zstd`)
 - [ ] Metrics export to StatsD/InfluxDB
 
-**Open questions:**
-- Will horizontal scaling prove simpler than multi-threading?
-- Should JSON be the default instead of MessagePack?
-- Can we reach 100K+ events/s per instance with optimizations?
+**Open questions:**:
+
+- Can we reach 100K+ events/s per instance with more CPU or further optimizations?
 
 **Contributions welcome!** This is a learning project as much as a tool. If you find it useful (or find gaps), feedback is valuable.
 

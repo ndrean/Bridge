@@ -28,6 +28,7 @@ pub const Encoder = struct {
     format: Format,
 
     pub fn init(allocator: std.mem.Allocator, format: Format) Encoder {
+        log.info("Format used: {}", .{format});
         return .{
             .allocator = allocator,
             .format = format,
@@ -108,49 +109,25 @@ pub const Encoder = struct {
     }
 
     /// Encode as MessagePack
+    ///
+    /// Caller owns the returned byte slice and must free it.
     fn encodeMsgpack(self: *Encoder, value: Value) ![]const u8 {
         const msgpack_value = switch (value) {
             .msgpack => |mp| mp,
             .json => return error.FormatMismatch,
         };
 
-        // Use ArrayList for dynamic buffer
-        var buffer = std.ArrayList(u8).empty;
-        errdefer buffer.deinit(self.allocator);
+        // Use Writer.Allocating for dynamic buffer
+        var buffer: [8192]u8 = undefined;
+        var out: std.io.Writer.Allocating = .init(self.allocator);
+        var reader = std.io.Reader.fixed(&buffer);
 
-        const ArrayListStream = struct {
-            list: *std.ArrayList(u8),
-            allocator: std.mem.Allocator,
-
-            const WriteError = std.mem.Allocator.Error;
-            const ReadError = error{};
-
-            pub fn write(stream: *@This(), bytes: []const u8) WriteError!usize {
-                try stream.list.appendSlice(stream.allocator, bytes);
-                return bytes.len;
-            }
-
-            pub fn read(stream: *@This(), out: []u8) ReadError!usize {
-                _ = stream;
-                _ = out;
-                return 0;
-            }
-        };
-
-        var write_stream = ArrayListStream{ .list = &buffer, .allocator = self.allocator };
-        var read_stream = ArrayListStream{ .list = &buffer, .allocator = self.allocator };
-
-        var packer = msgpack.Pack(
-            *ArrayListStream,
-            *ArrayListStream,
-            ArrayListStream.WriteError,
-            ArrayListStream.ReadError,
-            ArrayListStream.write,
-            ArrayListStream.read,
-        ).init(&write_stream, &read_stream);
-
+        var packer = msgpack.PackerIO.init(&reader, &out.writer);
         try packer.write(msgpack_value);
-        return try buffer.toOwnedSlice(self.allocator);
+
+        var arr = out.toArrayList();
+        defer arr.deinit(self.allocator);
+        return try arr.toOwnedSlice(self.allocator);
     }
 
     /// Encode as JSON
@@ -160,11 +137,11 @@ pub const Encoder = struct {
             .msgpack => return error.FormatMismatch,
         };
 
-        var buffer = std.ArrayList(u8).init(self.allocator);
-        errdefer buffer.deinit();
-
-        try std.json.stringify(json_value, .{}, buffer.writer());
-        return try buffer.toOwnedSlice();
+        var out: std.io.Writer.Allocating = .init(self.allocator);
+        try std.json.Stringify.value(json_value, .{ .whitespace = .indent_2 }, &out.writer);
+        var arr = out.toArrayList();
+        defer arr.deinit(self.allocator);
+        return try arr.toOwnedSlice(self.allocator);
     }
 };
 
@@ -216,7 +193,9 @@ pub const Value = union(Format) {
                     .msgpack => return error.FormatMismatch,
                 };
 
-                js.array.items[index] = val_js;
+                // For JSON arrays, we need to append items in order
+                // Use appendAssumeCapacity since we already reserved capacity
+                js.array.appendAssumeCapacity(val_js);
             },
         }
     }
@@ -225,14 +204,240 @@ pub const Value = union(Format) {
     pub fn free(self: *Value, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .msgpack => |*mp| mp.free(allocator),
-            .json => |*js| {
-                switch (js.*) {
-                    .object => |*obj| obj.deinit(),
-                    .array => |*arr| arr.deinit(),
-                    .string => |s| allocator.free(s),
-                    else => {},
+            .json => |*js| jsonFree(js, allocator),
+        }
+    }
+
+    /// Recursively free a JSON value and all nested values
+    fn jsonFree(js: *std.json.Value, allocator: std.mem.Allocator) void {
+        switch (js.*) {
+            .object => |*obj| {
+                // Recursively free all nested values in the object
+                var it = obj.iterator();
+                while (it.next()) |entry| {
+                    jsonFree(entry.value_ptr, allocator);
                 }
+                obj.deinit();
             },
+            .array => |*arr| {
+                // Recursively free all elements
+                for (arr.items) |*item| {
+                    jsonFree(item, allocator);
+                }
+                arr.deinit();
+            },
+            .string => |s| allocator.free(s),
+            else => {},
         }
     }
 };
+
+// Tests
+test "encoder: create and encode simple msgpack map" {
+    const allocator = std.testing.allocator;
+
+    var encoder = Encoder.init(allocator, .msgpack);
+    defer encoder.deinit();
+
+    var map = encoder.createMap();
+    defer map.free(allocator);
+
+    try map.put("name", try encoder.createString("Alice"));
+    try map.put("age", encoder.createInt(30));
+    try map.put("active", encoder.createBool(true));
+
+    const encoded = try encoder.encode(map);
+    defer allocator.free(encoded);
+
+    try std.testing.expect(encoded.len > 0);
+}
+
+test "encoder: create and encode simple json map" {
+    const allocator = std.testing.allocator;
+
+    var encoder = Encoder.init(allocator, .json);
+    defer encoder.deinit();
+
+    var map = encoder.createMap();
+    defer map.free(allocator);
+
+    try map.put("name", try encoder.createString("Alice"));
+    try map.put("age", encoder.createInt(30));
+    try map.put("active", encoder.createBool(true));
+
+    const encoded = try encoder.encode(map);
+    defer allocator.free(encoded);
+
+    try std.testing.expect(encoded.len > 0);
+    // JSON should contain the keys
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "Alice") != null);
+}
+
+test "encoder: create and encode array msgpack" {
+    const allocator = std.testing.allocator;
+
+    var encoder = Encoder.init(allocator, .msgpack);
+    defer encoder.deinit();
+
+    var array = try encoder.createArray(3);
+    defer array.free(allocator);
+
+    try array.setIndex(0, try encoder.createString("one"));
+    try array.setIndex(1, try encoder.createString("two"));
+    try array.setIndex(2, try encoder.createString("three"));
+
+    const encoded = try encoder.encode(array);
+    defer allocator.free(encoded);
+
+    try std.testing.expect(encoded.len > 0);
+}
+
+test "encoder: create and encode array json" {
+    const allocator = std.testing.allocator;
+
+    var encoder = Encoder.init(allocator, .json);
+    defer encoder.deinit();
+
+    var array = try encoder.createArray(3);
+    defer array.free(allocator);
+
+    try array.setIndex(0, try encoder.createString("one"));
+    try array.setIndex(1, try encoder.createString("two"));
+    try array.setIndex(2, try encoder.createString("three"));
+
+    const encoded = try encoder.encode(array);
+    defer allocator.free(encoded);
+
+    try std.testing.expect(encoded.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "two") != null);
+}
+
+test "encoder: nested structures msgpack" {
+    const allocator = std.testing.allocator;
+
+    var encoder = Encoder.init(allocator, .msgpack);
+    defer encoder.deinit();
+
+    var map = encoder.createMap();
+    defer map.free(allocator);
+
+    try map.put("name", try encoder.createString("Bob"));
+
+    var nested = encoder.createMap();
+    try nested.put("city", try encoder.createString("NYC"));
+    try nested.put("zip", encoder.createInt(10001));
+    try map.put("address", nested);
+
+    const encoded = try encoder.encode(map);
+    defer allocator.free(encoded);
+
+    try std.testing.expect(encoded.len > 0);
+}
+
+test "encoder: nested structures json" {
+    const allocator = std.testing.allocator;
+
+    var encoder = Encoder.init(allocator, .json);
+    defer encoder.deinit();
+
+    var map = encoder.createMap();
+    defer map.free(allocator);
+
+    try map.put("name", try encoder.createString("Bob"));
+
+    var nested = encoder.createMap();
+    try nested.put("city", try encoder.createString("NYC"));
+    try nested.put("zip", encoder.createInt(10001));
+    try map.put("address", nested);
+
+    const encoded = try encoder.encode(map);
+    defer allocator.free(encoded);
+
+    try std.testing.expect(encoded.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "Bob") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "NYC") != null);
+}
+
+test "encoder: all value types msgpack" {
+    const allocator = std.testing.allocator;
+
+    var encoder = Encoder.init(allocator, .msgpack);
+    defer encoder.deinit();
+
+    var map = encoder.createMap();
+    defer map.free(allocator);
+
+    try map.put("string", try encoder.createString("test"));
+    try map.put("int", encoder.createInt(42));
+    try map.put("float", encoder.createFloat(3.14));
+    try map.put("bool_true", encoder.createBool(true));
+    try map.put("bool_false", encoder.createBool(false));
+    try map.put("null", encoder.createNull());
+
+    const encoded = try encoder.encode(map);
+    defer allocator.free(encoded);
+
+    try std.testing.expect(encoded.len > 0);
+}
+
+test "encoder: all value types json" {
+    const allocator = std.testing.allocator;
+
+    var encoder = Encoder.init(allocator, .json);
+    defer encoder.deinit();
+
+    var map = encoder.createMap();
+    defer map.free(allocator);
+
+    try map.put("string", try encoder.createString("test"));
+    try map.put("int", encoder.createInt(42));
+    try map.put("float", encoder.createFloat(3.14));
+    try map.put("bool_true", encoder.createBool(true));
+    try map.put("bool_false", encoder.createBool(false));
+    try map.put("null", encoder.createNull());
+
+    const encoded = try encoder.encode(map);
+    defer allocator.free(encoded);
+
+    try std.testing.expect(encoded.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "null") != null);
+}
+
+test "encoder: format selection from runtime value" {
+    const allocator = std.testing.allocator;
+
+    // Simulate CLI flag parsing: default is msgpack
+    const default_format: Format = .msgpack;
+    var encoder1 = Encoder.init(allocator, default_format);
+    defer encoder1.deinit();
+
+    var map1 = encoder1.createMap();
+    defer map1.free(allocator);
+    try map1.put("test", try encoder1.createString("msgpack"));
+    const encoded1 = try encoder1.encode(map1);
+    defer allocator.free(encoded1);
+
+    // MessagePack is binary, should NOT contain readable "test" in the encoded output
+    // (it will have the key, but in binary format)
+    try std.testing.expect(encoded1.len > 0);
+
+    // Simulate CLI flag parsing: --json flag
+    const json_format: Format = .json;
+    var encoder2 = Encoder.init(allocator, json_format);
+    defer encoder2.deinit();
+
+    var map2 = encoder2.createMap();
+    defer map2.free(allocator);
+    try map2.put("test", try encoder2.createString("json"));
+    const encoded2 = try encoder2.encode(map2);
+    defer allocator.free(encoded2);
+
+    // JSON is text, should contain readable "test" and "json"
+    try std.testing.expect(std.mem.indexOf(u8, encoded2, "test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded2, "json") != null);
+}

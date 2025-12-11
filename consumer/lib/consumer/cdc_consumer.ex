@@ -30,8 +30,7 @@ defmodule Consumer.Cdc do
 
   @impl true
   def handle_message(%{topic: topic, body: body} = _message, state) do
-    op = String.split(topic, ".") |> List.last()
-    dbg(op)
+    # dbg(decoded = Jason.decode!(body))
 
     try do
       # Decode MessagePack payload

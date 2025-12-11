@@ -39,10 +39,12 @@ const ColumnInfo = struct {
 ///   publisher: NATS publisher instance
 ///   relation: Relation message from pgoutput (contains column info)
 ///   allocator: Memory allocator
+///   format: Encoding format (.msgpack or .json)
 pub fn publishSchema(
     publisher: *nats_publisher.Publisher,
     relation: *const pgoutput.RelationMessage,
     allocator: std.mem.Allocator,
+    format: encoder_mod.Format,
 ) !void {
     const schema_version = std.time.timestamp();
 
@@ -61,8 +63,8 @@ pub fn publishSchema(
     defer allocator.free(subject);
     const subject_z: [:0]const u8 = subject[0 .. subject.len - 1 :0];
 
-    // Build payload with unified encoder (TODO: make format configurable via CLI flag)
-    var encoder = encoder_mod.Encoder.init(allocator, .msgpack);
+    // Build payload with unified encoder
+    var encoder = encoder_mod.Encoder.init(allocator, format);
     defer encoder.deinit();
 
     var schema_map = encoder.createMap();
@@ -111,11 +113,13 @@ pub fn publishSchema(
 ///   pg_config: PostgreSQL connection configuration
 ///   publisher: NATS publisher instance
 ///   monitored_tables: List of tables from the publication to publish schemas for
+///   format: Encoding format (.msgpack or .json)
 pub fn publishInitialSchemas(
     allocator: std.mem.Allocator,
     pg_config: *const pg_conn.PgConf,
     publisher: *nats_publisher.Publisher,
     monitored_tables: []const []const u8,
+    format: encoder_mod.Format,
 ) !void {
     log.info("📋 Querying and publishing initial schemas to NATS KV...", .{});
 
@@ -192,7 +196,7 @@ pub fn publishInitialSchemas(
         return error.QueryFailed;
     }
 
-    const num_rows = c.PQntuples(result);
+    const num_rows: usize = @intCast(c.PQntuples(result));
     if (num_rows == 0) {
         log.warn("No tables found in public schema", .{});
         return;
@@ -210,18 +214,19 @@ pub fn publishInitialSchemas(
     }
 
     // Parse rows and group by table
-    for (0..@intCast(num_rows)) |i| {
-        const table_schema = std.mem.span(c.PQgetvalue(result, @intCast(i), 0));
-        const table_name = std.mem.span(c.PQgetvalue(result, @intCast(i), 1));
-        const column_name = std.mem.span(c.PQgetvalue(result, @intCast(i), 2));
-        const position_str = std.mem.span(c.PQgetvalue(result, @intCast(i), 3));
-        const data_type = std.mem.span(c.PQgetvalue(result, @intCast(i), 4));
-        const is_nullable_str = std.mem.span(c.PQgetvalue(result, @intCast(i), 5));
-        const column_default_ptr = c.PQgetvalue(result, @intCast(i), 6);
+    for (0..num_rows) |ui| {
+        const i: c_int = @intCast(ui);
+        const table_schema = std.mem.span(c.PQgetvalue(result, i, 0));
+        const table_name = std.mem.span(c.PQgetvalue(result, i, 1));
+        const column_name = std.mem.span(c.PQgetvalue(result, i, 2));
+        const position_str = std.mem.span(c.PQgetvalue(result, i, 3));
+        const data_type = std.mem.span(c.PQgetvalue(result, i, 4));
+        const is_nullable_str = std.mem.span(c.PQgetvalue(result, i, 5));
+        const column_default_ptr = c.PQgetvalue(result, i, 6);
 
         const position = try std.fmt.parseInt(u32, position_str, 10);
         const is_nullable = std.mem.eql(u8, is_nullable_str, "YES");
-        const column_default = if (c.PQgetisnull(result, @intCast(i), 6) == 1)
+        const column_default = if (c.PQgetisnull(result, i, 6) == 1)
             null
         else
             std.mem.span(column_default_ptr);
@@ -259,7 +264,7 @@ pub fn publishInitialSchemas(
             }
         }
 
-        try publishTableSchema(allocator, publisher, table_name, columns.items);
+        try publishTableSchema(allocator, publisher, table_name, columns.items, format);
     }
 
     log.info("✅ Published initial schemas for {d} tables", .{table_schemas.count()});
@@ -268,12 +273,13 @@ pub fn publishInitialSchemas(
 /// Publish a single table's schema to NATS KV store
 ///
 /// Internal helper function called by publishInitialSchemas.
-/// Encodes column metadata as MessagePack and stores in KV with key: table_name
+/// Encodes column metadata and stores in KV with key: table_name
 fn publishTableSchema(
     allocator: std.mem.Allocator,
     publisher: *nats_publisher.Publisher,
     table_name: []const u8,
     columns: []const ColumnInfo,
+    format: encoder_mod.Format,
 ) !void {
     // Extract just the table name (remove schema prefix if present)
     const table_only = blk: {
@@ -283,70 +289,39 @@ fn publishTableSchema(
         break :blk table_name;
     };
 
-    // Build MessagePack payload with schema info
-    var buffer = std.ArrayList(u8).empty;
-    defer buffer.deinit(allocator);
+    // Build payload with unified encoder
+    var encoder = encoder_mod.Encoder.init(allocator, format);
+    defer encoder.deinit();
 
-    const ArrayListStream = struct {
-        list: *std.ArrayList(u8),
-        allocator: std.mem.Allocator,
-
-        const WriteError = std.mem.Allocator.Error;
-        const ReadError = error{};
-
-        pub fn write(self: *@This(), bytes: []const u8) WriteError!usize {
-            try self.list.appendSlice(self.allocator, bytes);
-            return bytes.len;
-        }
-
-        pub fn read(self: *@This(), out: []u8) ReadError!usize {
-            _ = self;
-            _ = out;
-            return 0;
-        }
-    };
-
-    var write_stream = ArrayListStream{ .list = &buffer, .allocator = allocator };
-    var read_stream = ArrayListStream{ .list = &buffer, .allocator = allocator };
-
-    var packer = msgpack.Pack(
-        *ArrayListStream,
-        *ArrayListStream,
-        ArrayListStream.WriteError,
-        ArrayListStream.ReadError,
-        ArrayListStream.write,
-        ArrayListStream.read,
-    ).init(&write_stream, &read_stream);
-
-    var schema_map = msgpack.Payload.mapPayload(allocator);
+    var schema_map = encoder.createMap();
     defer schema_map.free(allocator);
 
     // Add schema fields
-    try schema_map.mapPut("table", try msgpack.Payload.strToPayload(table_only, allocator));
-    try schema_map.mapPut("schema", try msgpack.Payload.strToPayload(table_name, allocator));
-    try schema_map.mapPut("timestamp", msgpack.Payload{ .int = std.time.timestamp() });
+    try schema_map.put("table", try encoder.createString(table_only));
+    try schema_map.put("schema", try encoder.createString(table_name));
+    try schema_map.put("timestamp", encoder.createInt(std.time.timestamp()));
 
     // Add columns array
-    var columns_array = try msgpack.Payload.arrPayload(columns.len, allocator);
+    var columns_array = try encoder.createArray(columns.len);
     for (columns, 0..) |col, i| {
-        var col_map = msgpack.Payload.mapPayload(allocator);
-        try col_map.mapPut("name", try msgpack.Payload.strToPayload(col.name, allocator));
-        try col_map.mapPut("position", msgpack.Payload{ .int = @intCast(col.position) });
-        try col_map.mapPut("data_type", try msgpack.Payload.strToPayload(col.data_type, allocator));
-        try col_map.mapPut("is_nullable", msgpack.Payload{ .bool = col.is_nullable });
+        var col_map = encoder.createMap();
+        try col_map.put("name", try encoder.createString(col.name));
+        try col_map.put("position", encoder.createInt(@intCast(col.position)));
+        try col_map.put("data_type", try encoder.createString(col.data_type));
+        try col_map.put("is_nullable", encoder.createBool(col.is_nullable));
 
         if (col.column_default) |default_val| {
-            try col_map.mapPut("column_default", try msgpack.Payload.strToPayload(default_val, allocator));
+            try col_map.put("column_default", try encoder.createString(default_val));
         } else {
-            try col_map.mapPut("column_default", msgpack.Payload{ .nil = {} });
+            try col_map.put("column_default", encoder.createNull());
         }
 
-        columns_array.arr[i] = col_map;
+        try columns_array.setIndex(i, col_map);
     }
-    try schema_map.mapPut("columns", columns_array);
+    try schema_map.put("columns", columns_array);
 
-    try packer.write(schema_map);
-    const encoded = buffer.items;
+    const encoded = try encoder.encode(schema_map);
+    defer allocator.free(encoded);
 
     // Open KV store for schemas
     var kv_store = try nats_kv.KVStore.open(publisher.js, config.Nats.schema_kv_bucket, allocator);

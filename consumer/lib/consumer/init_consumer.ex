@@ -85,6 +85,8 @@ defmodule Consumer.Init do
       Enum.reduce(tables, [], fn table_name, acc ->
         case Gnat.Jetstream.API.KV.get_value(:gnat, "schemas", table_name) do
           schema_data when is_binary(schema_data) ->
+            # dbg(Jason.decode!(schema_data))
+
             case Msgpax.unpack(schema_data) do
               {:ok, schema} ->
                 Logger.info(

@@ -4,6 +4,7 @@ const nats_publisher = @import("nats_publisher.zig");
 const pgoutput = @import("pgoutput.zig");
 const SPSCQueue = @import("spsc_queue.zig").SPSCQueue;
 const Config = @import("config.zig");
+const encoder_mod = @import("encoder.zig");
 
 pub const log = std.log.scoped(.async_batch_publisher);
 
@@ -12,6 +13,7 @@ pub const AsyncBatchPublisher = struct {
     allocator: std.mem.Allocator,
     publisher: *nats_publisher.Publisher,
     config: batch_publisher.BatchConfig,
+    format: encoder_mod.Format,
 
     // Lock-free event queue (SPSC: Single Producer Single Consumer)
     // Producer: Main thread adding WAL events
@@ -31,6 +33,7 @@ pub const AsyncBatchPublisher = struct {
         allocator: std.mem.Allocator,
         publisher: *nats_publisher.Publisher,
         config: batch_publisher.BatchConfig,
+        format: encoder_mod.Format,
     ) !AsyncBatchPublisher {
         // Initialize lock-free queue with power-of-2 capacity
         // 4096 events = can buffer ~8 batches worth of events at max_events=500
@@ -40,6 +43,7 @@ pub const AsyncBatchPublisher = struct {
             .allocator = allocator,
             .publisher = publisher,
             .config = config,
+            .format = format,
             .event_queue = event_queue,
             .last_confirmed_lsn = std.atomic.Value(u64).init(0),
             .fatal_error = std.atomic.Value(bool).init(false),
@@ -321,6 +325,7 @@ pub const AsyncBatchPublisher = struct {
             .allocator = self.allocator,
             .publisher = self.publisher,
             .config = self.config,
+            .format = self.format,
             .events = batch.*, // Shallow copy - temp_publisher.events now shares buffer with batch
             .current_payload_size = 0,
             .last_flush_time = 0,

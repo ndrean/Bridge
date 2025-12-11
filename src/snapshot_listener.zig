@@ -16,6 +16,7 @@ const publication_mod = @import("publication.zig");
 const config = @import("config.zig");
 const msgpack = @import("msgpack");
 const pg_copy_csv = @import("pg_copy_csv.zig");
+const encoder_mod = @import("encoder.zig");
 
 pub const log = std.log.scoped(.snapshot_listener);
 
@@ -100,41 +101,25 @@ fn publishSnapshotError(
     const subject = try std.fmt.allocPrint(allocator, "init.error.{s}", .{table_name});
     defer allocator.free(subject);
 
-    // Build error payload with MessagePack
-    var buffer: [4096]u8 = undefined;
-    const compat = msgpack.compat;
-    var write_buffer = compat.fixedBufferStream(&buffer);
-    var read_buffer = compat.fixedBufferStream(&buffer);
+    // Use unified encoder (always MessagePack for snapshots)
+    var encoder = encoder_mod.Encoder.init(allocator, .msgpack);
+    defer encoder.deinit();
 
-    const BufferType = compat.BufferStream;
-    var packer = msgpack.Pack(
-        *BufferType,
-        *BufferType,
-        BufferType.WriteError,
-        BufferType.ReadError,
-        BufferType.write,
-        BufferType.read,
-    ).init(&write_buffer, &read_buffer);
-
-    // Create map payload
-    var map = msgpack.Payload.mapPayload(allocator);
+    var map = encoder.createMap();
     defer map.free(allocator);
 
-    try map.mapPut("error", try msgpack.Payload.strToPayload(error_type, allocator));
-    try map.mapPut("table", try msgpack.Payload.strToPayload(table_name, allocator));
+    try map.put("error", try encoder.createString(error_type));
+    try map.put("table", try encoder.createString(table_name));
 
     // Create array for available_tables
-    var tables_array = try msgpack.Payload.arrPayload(available_tables.len, allocator);
+    var tables_array = try encoder.createArray(available_tables.len);
     for (available_tables, 0..) |table, i| {
-        tables_array.arr[i] = try msgpack.Payload.strToPayload(table, allocator);
+        try tables_array.setIndex(i, try encoder.createString(table));
     }
-    try map.mapPut("available_tables", tables_array);
+    try map.put("available_tables", tables_array);
 
-    // Encode
-    try packer.write(map);
-
-    // Get encoded bytes
-    const payload = write_buffer.getWritten();
+    const payload = try encoder.encode(map);
+    defer allocator.free(payload);
 
     // Publish error message
     try publisher.publish(subject, payload, null);
@@ -505,47 +490,15 @@ fn encodeCsvRowsToMessagePack(
     lsn: []const u8,
     chunk: u32,
 ) ![]const u8 {
-    // Build MessagePack with metadata wrapper
-    var buffer = std.ArrayList(u8).empty;
-    defer buffer.deinit(allocator);
-
-    const ArrayListStream = struct {
-        list: *std.ArrayList(u8),
-        allocator: std.mem.Allocator,
-
-        const WriteError = std.mem.Allocator.Error;
-        const ReadError = error{};
-
-        pub fn write(self: *@This(), bytes: []const u8) WriteError!usize {
-            try self.list.appendSlice(self.allocator, bytes);
-            return bytes.len;
-        }
-
-        pub fn read(self: *@This(), out: []u8) ReadError!usize {
-            _ = self;
-            _ = out;
-            return 0;
-        }
-    };
-
-    var write_stream = ArrayListStream{ .list = &buffer, .allocator = allocator };
-    var read_stream = ArrayListStream{ .list = &buffer, .allocator = allocator };
-
-    var packer = msgpack.Pack(
-        *ArrayListStream,
-        *ArrayListStream,
-        ArrayListStream.WriteError,
-        ArrayListStream.ReadError,
-        ArrayListStream.write,
-        ArrayListStream.read,
-    ).init(&write_stream, &read_stream);
+    // Use unified encoder (always MessagePack for snapshots)
+    var encoder = encoder_mod.Encoder.init(allocator, .msgpack);
+    defer encoder.deinit();
 
     // Build data array (array of row maps)
-    var data_array = try msgpack.Payload.arrPayload(rows.len, allocator);
-    // Don't defer free - wrapper_map will own and free this
+    var data_array = try encoder.createArray(rows.len);
 
     for (rows, 0..) |row, row_idx| {
-        var row_map = msgpack.Payload.mapPayload(allocator);
+        var row_map = encoder.createMap();
 
         for (row.fields, 0..) |csv_field, col_idx| {
             if (col_idx >= col_names.len) continue;
@@ -553,29 +506,28 @@ fn encodeCsvRowsToMessagePack(
             const col_name = col_names[col_idx];
 
             if (csv_field.isNull()) {
-                try row_map.mapPut(col_name, msgpack.Payload{ .nil = {} });
+                try row_map.put(col_name, encoder.createNull());
             } else if (csv_field.value) |text_val| {
                 // CSV values are already text, just encode them
-                try row_map.mapPut(col_name, try msgpack.Payload.strToPayload(text_val, allocator));
+                try row_map.put(col_name, try encoder.createString(text_val));
             }
         }
 
-        data_array.arr[row_idx] = row_map;
+        try data_array.setIndex(row_idx, row_map);
     }
 
-    // Build metadata wrapper map (this will own and free data_array)
-    var wrapper_map = msgpack.Payload.mapPayload(allocator);
+    // Build metadata wrapper map
+    var wrapper_map = encoder.createMap();
     defer wrapper_map.free(allocator);
 
-    try wrapper_map.mapPut("table", try msgpack.Payload.strToPayload(table_name, allocator));
-    try wrapper_map.mapPut("operation", try msgpack.Payload.strToPayload("snapshot", allocator));
-    try wrapper_map.mapPut("snapshot_id", try msgpack.Payload.strToPayload(snapshot_id, allocator));
-    try wrapper_map.mapPut("chunk", msgpack.Payload{ .int = @intCast(chunk) });
-    try wrapper_map.mapPut("lsn", try msgpack.Payload.strToPayload(lsn, allocator));
-    try wrapper_map.mapPut("data", data_array);
+    try wrapper_map.put("table", try encoder.createString(table_name));
+    try wrapper_map.put("operation", try encoder.createString("snapshot"));
+    try wrapper_map.put("snapshot_id", try encoder.createString(snapshot_id));
+    try wrapper_map.put("chunk", encoder.createInt(@intCast(chunk)));
+    try wrapper_map.put("lsn", try encoder.createString(lsn));
+    try wrapper_map.put("data", data_array);
 
-    try packer.write(wrapper_map);
-    return try buffer.toOwnedSlice(allocator);
+    return try encoder.encode(wrapper_map);
 }
 
 /// Publish snapshot metadata to NATS
@@ -588,53 +540,22 @@ fn publishSnapshotMetadata(
     batch_count: u32,
     row_count: u64,
 ) !void {
-    // Build MessagePack metadata
-    var buffer = std.ArrayList(u8).empty;
-    defer buffer.deinit(allocator);
+    // Use unified encoder (always MessagePack for snapshots)
+    var encoder = encoder_mod.Encoder.init(allocator, .msgpack);
+    defer encoder.deinit();
 
-    const ArrayListStream = struct {
-        list: *std.ArrayList(u8),
-        allocator: std.mem.Allocator,
-
-        const WriteError = std.mem.Allocator.Error;
-        const ReadError = error{};
-
-        pub fn write(self: *@This(), bytes: []const u8) WriteError!usize {
-            try self.list.appendSlice(self.allocator, bytes);
-            return bytes.len;
-        }
-
-        pub fn read(self: *@This(), out: []u8) ReadError!usize {
-            _ = self;
-            _ = out;
-            return 0;
-        }
-    };
-
-    var write_stream = ArrayListStream{ .list = &buffer, .allocator = allocator };
-    var read_stream = ArrayListStream{ .list = &buffer, .allocator = allocator };
-
-    var packer = msgpack.Pack(
-        *ArrayListStream,
-        *ArrayListStream,
-        ArrayListStream.WriteError,
-        ArrayListStream.ReadError,
-        ArrayListStream.write,
-        ArrayListStream.read,
-    ).init(&write_stream, &read_stream);
-
-    var meta_map = msgpack.Payload.mapPayload(allocator);
+    var meta_map = encoder.createMap();
     defer meta_map.free(allocator);
 
-    try meta_map.mapPut("snapshot_id", try msgpack.Payload.strToPayload(snapshot_id, allocator));
-    try meta_map.mapPut("lsn", try msgpack.Payload.strToPayload(lsn, allocator));
-    try meta_map.mapPut("timestamp", msgpack.Payload{ .int = std.time.timestamp() });
-    try meta_map.mapPut("batch_count", msgpack.Payload{ .int = @intCast(batch_count) });
-    try meta_map.mapPut("row_count", msgpack.Payload{ .int = @intCast(row_count) });
-    try meta_map.mapPut("table", try msgpack.Payload.strToPayload(table_name, allocator));
+    try meta_map.put("snapshot_id", try encoder.createString(snapshot_id));
+    try meta_map.put("lsn", try encoder.createString(lsn));
+    try meta_map.put("timestamp", encoder.createInt(std.time.timestamp()));
+    try meta_map.put("batch_count", encoder.createInt(@intCast(batch_count)));
+    try meta_map.put("row_count", encoder.createInt(@intCast(row_count)));
+    try meta_map.put("table", try encoder.createString(table_name));
 
-    try packer.write(meta_map);
-    const encoded = buffer.items;
+    const encoded = try encoder.encode(meta_map);
+    defer allocator.free(encoded);
 
     const subject = try std.fmt.allocPrint(
         allocator,

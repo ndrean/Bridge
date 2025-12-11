@@ -146,6 +146,7 @@ pub fn main() !void {
     log.info("Publication name: \x1b[1m {s} \x1b[0m", .{parsed_args.publication_name});
     log.info("Slot name: \x1b[1m {s} \x1b[0m", .{parsed_args.slot_name});
     log.info("HTTP port: \x1b[1m {d} \x1b[0m", .{parsed_args.http_port});
+    log.info("Encoding format: \x1b[1m {s} \x1b[0m", .{@tagName(parsed_args.encoding_format)});
     log.info("Streams: \x1b[1m CDC, INIT \x1b[0m (hardcoded)", .{});
 
     // Register signal handlers for graceful shutdown
@@ -240,6 +241,7 @@ pub fn main() !void {
         &pg_config,
         &publisher,
         monitored_tables,
+        parsed_args.encoding_format,
     );
 
     // 4. Start snapshot listener in background thread
@@ -269,6 +271,7 @@ pub fn main() !void {
         allocator,
         &publisher,
         batch_config,
+        parsed_args.encoding_format,
     );
     // Start flush thread after batch_pub is at its final memory location
     try batch_pub.start();
@@ -342,8 +345,7 @@ pub fn main() !void {
         relation_map.deinit();
     }
 
-    // Create arena allocator once and reuse it for all message parsing
-    // This avoids creating/destroying arena 70k times per second at high throughput
+    // Create arena allocator once
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
@@ -402,7 +404,7 @@ pub fn main() !void {
 
                                 if (schema_changed_in_tables) {
                                     log.info("🔔 Schema change detected for monitored table '{s}' (relation_id={d})", .{ rel.name, rel.relation_id });
-                                    try schema_publisher.publishSchema(&publisher, &rel, allocator);
+                                    try schema_publisher.publishSchema(&publisher, &rel, allocator, parsed_args.encoding_format);
                                 } else if (schema_changed and !is_monitored) {
                                     log.debug("Schema change detected for non-monitored table '{s}' (skipped)", .{rel.name});
                                 }
