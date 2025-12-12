@@ -434,57 +434,81 @@ The user of the bridge defines a `REPLICATION_SLOT` with the flag `--slot my_slo
   --help, -h        Show this help message
 ```
 
-### Usage
+### Local Development (Bridge on Host Machine)
 
-The PG admin has created the "bridge-user" and use the env vars `POSTGRES_BRIDGE_USER` with `POSTGRES_BRIDGE_PASSWORD`
+**Use case**: Development workflow where you run the bridge binary locally and connect to containerized PostgreSQL + NATS.
 
-The PG admin has create a PUBLICATION say 'my_pub' for given tables, say 'users', 'orders'.
+**Prerequisites**:
 
-The NATS admin has created two streams 'CDC' and 'INIT', created a KV store 'schemas' and defined credentials for a "nats-user" with the env vars `NATS_BRIDGE_USER` with `NATS_BRIDGE_PASSWORD`. 
+- PostgreSQL admin has created publication (e.g., `cdc_pub`) and bridge user (`bridge_reader`)
+- NATS admin has created CDC/INIT streams, KV store, and credentials
 
-```sh
-PG_HOST=postgres-server \
-PG_DB=my-db \
-PG_PORT=5432 \
-POSTGRES_BRIDGE_USER=pg-user_a \
-POSTGRES_BRIDGE_PASSWORD=pg-secret \
-NATS_BRIDGE_USER=nats-user_a \
-NATS_BRIDGE_PASSWORD=nats-secret \
-NATS_HOST=nats-server \
-./bridge --slot my_slot --pub my_pub
+**Step 1**: Start infrastructure containers:
 
-# if the user wants another PORT and receives JSON:
-
-./bridge --slot my_slot --pub my_pub --port 9009 --json
+```bash
+docker compose \
+  -f docker-compose.prod.yml \
+  --env-file .env.prod up \
+  postgres nats-server nats-init nats-config-gen -d
 ```
 
-### Environment Variables
+**Step 2**: Build the bridge locally:
+
+```bash
+zig build
+```
+
+**Step 3**: Run the bridge with environment variables:
+
+```bash
+PG_HOST=localhost \
+PG_DB=postgres \
+PG_PORT=5432 \
+POSTGRES_BRIDGE_USER=bridge_reader \
+POSTGRES_BRIDGE_PASSWORD=bridge_password_changeme \
+NATS_BRIDGE_USER=bridge_user \
+NATS_BRIDGE_PASSWORD=bridge_secure_password \
+NATS_HOST=localhost \
+./zig-out/bin/bridge --slot my_slot --pub cdc_pub
+
+# With custom port and JSON encoding:
+./zig-out/bin/bridge --slot my_slot --pub cdc_pub --port 9091 --json
+```
+
+**Environment variables reference**:
 
 ```bash
 # PostgreSQL connection
-export PG_HOST=localhost
-export PG_PORT=5432
-export PG_USER=bridge_reader
-export PG_PASSWORD=secure_password
-export PG_DB=postgres
+PG_HOST=localhost          # PostgreSQL host
+PG_PORT=5432              # PostgreSQL port
+POSTGRES_BRIDGE_USER=bridge_reader
+POSTGRES_BRIDGE_PASSWORD=bridge_password_changeme
+PG_DB=postgres            # Database name
 
 # NATS connection
-export NATS_HOST=localhost
-export NATS_BRIDGE_USER=bridge_user
-export NATS_BRIDGE_PASSWORD=bridge_password
-
-# Bridge configuration
-export BRIDGE_PORT=9090
+NATS_HOST=localhost       # NATS server host
+NATS_BRIDGE_USER=bridge_user
+NATS_BRIDGE_PASSWORD=bridge_secure_password
 ```
 
-### Docker Compose
+### Production Deployment (Full Container Stack)
+
+**Use case**: Running everything in containers for production or production-like environments.
+
+**What runs in containers**:
+
+- PostgreSQL (with logical replication enabled)
+- NATS server (with JetStream)
+- Bridge binary (compiled and containerized)
+
+**Command**:
 
 ```bash
 # Start full stack (PostgreSQL + NATS + Bridge)
-docker compose -f docker-compose.prod.yml up --build
+docker compose -f docker-compose.prod.yml --env-file .env.prod up --build -d
 ```
 
-See `docker-compose.prod.yml` for the complete setup.
+This uses `docker-compose.prod.yml` which includes the bridge container alongside PostgreSQL and NATS. See that file for complete configuration.
 
 ### Horizontal Scaling
 
@@ -587,63 +611,100 @@ Published after all chunks. Tells consumer how many chunks to expect.
 }
 ```
 
-### CDC Event (CDC Stream: `cdc.{table}.{operation}`)
+### CDC Event (CDC Stream: `cdc.{table}.{operation}.{batch}`)
 
 Real-time INSERT/UPDATE/DELETE events.
 
-**Subject pattern:** `cdc.{table}.{operation}`
-- `cdc.users.insert`
-- `cdc.users.update`
-- `cdc.users.delete`
+**Subject pattern:** `cdc.{table}.{operation}` with the test table 'test_types':
+
+- `cdc.test_types.insert`
+- `cdc.test_types.update`
+- `cdc.test_types.delete`
 
 **Message ID (for deduplication):** `{lsn}-{table}-{operation}`
-- Example: `25cb3c8-users-insert`
+
+Example: `"1851208-test_types-insert"`
 
 **INSERT event:**
+
 ```json
 {
-  "table": "users",
-  "operation": "INSERT",
-  "relation_id": 16384,
-  "lsn": "0/25cb3c8",
-  "columns": [
-    {"name": "id", "value": 1},
-    {"name": "name", "value": "Alice"},
-    {"name": "email", "value": "alice@example.com"},
-    {"name": "created_at", "value": "2025-12-10 10:30:00+00"}
-  ]
+  "data" => {
+    "age" => 30,
+    "created_at" => "2025-12-12T12:00:34.338547Z",
+    "id" => 12,
+    "is_true" => true,
+    "matrix" => "{{1,2},{3,4}}",
+    "metadata" => {
+      "key_1" => "value_1",
+      "key_2" => [[1, 2], [3, 4], [5, 6]],
+      "key_3" => {"key_4" => "value_4", "key_5" => "value_5"}
+    },
+    "price" => "123.4500",
+    "some_text" => "Sample text",
+    "tags" => "{\"tag1\",\"tag2\"}",
+    "temperature" => 36.6,
+    "uid" => "f4b0611f-7258-47f8-bceb-0eba9ac5195a"
+  },
+  "msg_id" => "1851208-test_types-insert",
+  "operation" => "INSERT",
+  "relation_id" => 16392,
+  "subject" => "cdc.test_types.insert",
+  "table" => "test_types"
 }
 ```
 
 **UPDATE event:**
+
 ```json
 {
-  "table": "users",
-  "operation": "UPDATE",
-  "relation_id": 16384,
-  "lsn": "0/25cb4d0",
-  "columns": [
-    {"name": "id", "value": 1},
-    {"name": "name", "value": "Alice Smith"},
-    {"name": "email", "value": "alice.smith@example.com"},
-    {"name": "created_at", "value": "2025-12-10 10:30:00+00"}
-  ]
+  "data" => {
+    "age" => 31,
+    "created_at" => "2025-12-12T12:00:34.338547Z",
+    "id" => 12,
+    "is_true" => false,
+    "matrix" => "{{1,2},{3,4}}",
+    "metadata" => {
+      "key_1" => "value_1",
+      "key_2" => [[1, 2], [3, 4], [5, 6]],
+      "key_3" => {"key_4" => "value_4", "key_5" => "value_5"}
+    },
+    "price" => "122.9905",
+    "some_text" => "Sample text",
+    "tags" => "{\"tag1\",\"tag2\"}",
+    "temperature" => 37,
+    "uid" => "f4b0611f-7258-47f8-bceb-0eba9ac5195a"
+  },
+  "msg_id" => "18513a8-test_types-update",
+  "operation" => "UPDATE",
+  "relation_id" => 16392,
+  "subject" => "cdc.test_types.update",
+  "table" => "test_types"
 }
 ```
 
 **DELETE event:**
+
 ```json
 {
-  "table": "users",
-  "operation": "DELETE",
-  "relation_id": 16384,
-  "lsn": "0/25cb5e8",
-  "columns": [
-    {"name": "id", "value": 1},
-    {"name": "name", "value": "Alice Smith"},
-    {"name": "email", "value": "alice.smith@example.com"},
-    {"name": "created_at", "value": "2025-12-10 10:30:00+00"}
-  ]
+  "data" => {
+    "age" => nil,
+    "created_at" => nil,
+    "id" => 12,
+    "is_true" => nil,
+    "matrix" => nil,
+    "metadata" => nil,
+    "price" => nil,
+    "some_text" => nil,
+    "tags" => nil,
+    "temperature" => nil,
+    "uid" => nil
+  },
+  "msg_id" => "1851518-test_types-delete",
+  "operation" => "DELETE",
+  "relation_id" => 16392,
+  "subject" => "cdc.test_types.delete",
+  "table" => "test_types"
 }
 ```
 
@@ -869,17 +930,240 @@ curl "http://localhost:9090/streams/info?stream=CDC" | jq
 4. **HTTP telemetry thread**: Serves `/metrics`, `/health`, `/status`, `/shutdown`
 5. **Snapshot listener thread**: Subscribes to `snapshot.request.>`, generates snapshots on-demand
 
-### Lock-Free Queue (SPSC)
+### Lock-Free Queue (SPSC): A nice Piece of Computer Art
+
+[![SPSC Queue Video](https://img.youtube.com/vi/K3P_Lmq6pw0/0.jpg)](https://www.youtube.com/watch?v=K3P_Lmq6pw0&t=408s)
+
+_Watch: ["1024 Cores" - Zig SHOWTIME talk on lock-free programming](https://www.youtube.com/watch?v=K3P_Lmq6pw0&t=408s)_
+
+_Watch: [SPSC Queue Video](https://www.youtube.com/watch?v=K3P_Lmq6pw0&t=408s)_
+
+We have a shared **ring buffer** between a unique producer/writer thread (main CDC decoder) and a unique consumer/reader thread (batch publisher).
+
+This is the perfect use case for a **wait-free** SPSC (Single Producer Single Consumer) ring buffer.
+
+This is a hot path in the code, so it must be efficient and fast. It uses three tricks: **empty last slot**, **bitmasking**, and **cache alignment** (as explained in the video above).
+
+#### Queue Structure
+
+```zig
+pub fn SPSCQueue(comptime T: type) type {
+    return struct {
+        buffer: []T,              // Ring buffer storage
+        capacity: usize,          // Power of 2 (e.g., 65536)
+        mask: usize,              // capacity - 1, for fast modulo via bitmasking
+
+        // Separate cache lines to avoid false sharing between producer/consumer
+        // On x86-64, cache lines are 64 bytes
+        write_index: std.atomic.Value(usize) align(64),  // Producer's position
+        read_index: std.atomic.Value(usize) align(64),   // Consumer's position
+    };
+}
+```
+
+We specialize it with `T = CDCEvent`, creating a buffer of `CDCEvent[]`.
+
+**Two indices:**
+- `write_index`: Producer's position (next empty slot for writing)
+  - Only modified by producer thread
+  - Read by consumer to know data availability
+- `read_index`: Consumer's position (next item to read)
+  - Only modified by consumer thread
+  - Read by producer to know space availability
+
+#### Why Atomic Operations?
+
+Both threads share the buffer. The producer is the _only_ thread updating `write_index`, and the consumer is the _only_ thread updating `read_index`. So why atomicity?
+
+**Two reasons:**
+
+1. **Prevent compiler/CPU reordering** (the main reason)
+2. **Ensure visibility across CPU cores** (cache coherence)
+
+Without proper ordering, the CPU/compiler might reorder operations like this:
+
+```zig
+// What we write:
+self.buffer[5] = item;           // Step 1: Write data
+self.write_index.store(6, ...);  // Step 2: Publish index
+
+// What CPU might do WITHOUT .release:
+self.write_index.store(6, ...);  // Reordered! Consumer sees index 6...
+self.buffer[5] = item;           // ...but data isn't written yet! 🔥
+```
+
+**Memory ordering semantics:**
+
+- `.monotonic`: Prevents compiler optimization across reads/writes (like `volatile` in C)
+- `.acquire`/`.release`: Solve cross-thread ordering and create "happens-before" relationships
+
+#### Trick #1: Empty Last Slot
+
+Consider: `read_index == write_index` means _empty_.
+
+**Problem**: If we fill all slots, the queue appears empty!
+
+7 slots filled out of 8: write_index=7, read_index=0
+
+| A   | B   | C   | D   | E   | F   | G   |     |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+
+Fill the 8th slot: write_index=0 (wraps), read_index=0 ❌
+| A   | B   | C   | D   | E   | F   | G   | H   |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+
+Now `read_index == write_index` but the queue is FULL, not empty!
+
+**Solution**: Keep the last slot empty
+
+```zig
+// Check if queue is full (in push)
+const next_write = (current_write + 1) % capacity;
+if (next_write == current_read) {
+    return error.QueueFull;
+}
+```
+
+We trade 1 slot for a simple, fast full/empty check. No separate counter or atomic flags needed!
+
+#### Trick #2: Bitmasking for Fast Modulo
+
+Since capacity is a power of 2 (e.g., 65536 = 2^16), we can use bitmasking instead of division:
+
+```zig
+// Slow (20-30 CPU cycles):
+index = (index + 1) % capacity;
+
+// Fast (1 CPU cycle):
+index = (index + 1) & mask;  // where mask = capacity - 1
+```
+
+Examples:
+
+```zig
+7 % 8 == 7  and  7 & 7 == 7
+8 % 8 == 0  and  8 & 7 == 0
+9 % 8 == 1  and  9 & 7 == 1
+```
+
+#### Trick #3: Cache Alignment
+
+CPU caches work in cache lines (64 bytes on x86-64). **Without alignment**, both indices share a cache line:
+
+```txt
+Cache Line 0: [write_index][read_index][other data...] ❌ 
+```
+
+Problem: Producer updates `write_index` → invalidates consumer's cache → ping-pong between CPU cores!
+
+**With alignment**, each index owns its cache line:
+
+```txt
+Cache Line 0: [write_index][padding...............]  ← Producer owns
+Cache Line 1: [read_index][padding................]  ← Consumer owns
+✅ 
+```
+
+This is achieved with:
+
+```zig
+write_index: std.atomic.Value(usize) align(64),
+read_index: std.atomic.Value(usize) align(64),
+```
+
+#### The Push Operation (Producer Only)
+
+```zig
+pub fn push(self: *Self, item: T) error{QueueFull}!void {
+    // 1. Load our own index (no sync needed - we're the only writer)
+    const current_write = self.write_index.load(.monotonic);
+
+    // 2. Load consumer's index (need to see their progress)
+    const current_read = self.read_index.load(.acquire);
+    //    ↑ .acquire: See all consumer's writes before they updated read_index
+
+    // 3. Check if full (using the empty-slot trick)
+    const next_write = (current_write + 1) & self.mask;
+    if (next_write == current_read) {
+        return error.QueueFull;
+    }
+
+    // 4. Write data to buffer (regular write, not atomic)
+    self.buffer[current_write] = item;
+
+    // 5. Publish availability with release
+    self.write_index.store(next_write, .release);
+    //    ↑ .release: Ensure data write (step 4) happens before this
+    //    Consumer will see data when they load write_index with .acquire
+}
+```
+
+#### The Pop Operation (Consumer Only)
+
+```zig
+pub fn pop(self: *Self) ?T {
+    // 1. Load our own index (no sync needed - we're the only reader)
+    const current_read = self.read_index.load(.monotonic);
+
+    // 2. Load producer's index (need to see their data)
+    const current_write = self.write_index.load(.acquire);
+    //    ↑ .acquire: See producer's data write before they updated write_index
+
+    // 3. Check if empty
+    if (current_read == current_write) {
+        return null;
+    }
+
+    // 4. Read data from buffer (regular read, not atomic)
+    const item = self.buffer[current_read];
+
+    // 5. Publish free space with release
+    const next_read = (current_read + 1) & self.mask;
+    self.read_index.store(next_read, .release);
+    //    ↑ .release: Ensure data read (step 4) happens before this
+    //    Producer will see space when they load read_index with .acquire
+
+    return item;
+}
+```
+
+#### Synchronization Pattern
+
+The `.release → .acquire` pairs create "happens-before" relationships:
+
+```txt
+Thread 1 (Producer)              Thread 2 (Consumer)
+─────────────────────            ─────────────────────
+buffer[5] = item
+write_index.store(6, .release) ─→ write_index.load(.acquire)
+                                   ↓ sees buffer[5] write
+                                   data = buffer[5]
+                                   read_index.store(6, .release) ─→ read_index.load(.acquire)
+                                                                     ↓ sees space freed
+```
+
+**Memory ordering summary:**
+
+- `.monotonic` on same-thread loads: No cross-thread ordering, just atomicity
+- `.acquire` when reading other thread's index: See all writes before that index update
+- `.release` when updating your own index: All previous writes visible before publishing
+
+#### Why This Is Wait-Free
+
+This queue is **wait-free** because:
+
+- No mutex locks (`mutex.lock()`)
+- No CAS (Compare-And-Swap) retry loops
+- Single writer per index means no contention
+
+If we had multiple writers, we'd need CAS loops with retries (see the video for details).
+
+#### Practical Performance
 
 **Producer-Consumer pattern:**
 - **Producer**: Main thread (reading WAL)
 - **Consumer**: Batch publisher thread
-- **Queue**: Lock-free ring buffer (65536 slots, 2^16)
-
-**Why lock-free?**
-- Zero contention (single producer, single consumer)
-- Cache-friendly (separate cache lines for indices)
-- Wait-free operations (no blocking)
+- **Queue**: 65536 slots (2^16), ~4MB memory
 
 **Dual purpose:**
 
@@ -892,13 +1176,13 @@ curl "http://localhost:9090/streams/info?stream=CDC" | jq
 NATS goes down at T=0
 ├─ Main thread continues reading WAL → pushes to queue
 ├─ Flush thread can't publish → queue fills up
-├─ Queue fills (32768 slots) → ~546ms buffer at 60K events/s
+├─ Queue fills (65536 slots) → ~1s buffer at 60K events/s
 ├─ Queue full → Main thread backs off (sleeps 1ms per attempt)
 ├─ PostgreSQL WAL starts accumulating (controlled)
 │
-NATS reconnects at T=1000ms+ (reconnect_wait, queue covers 54% of retry)
+NATS reconnects at T=1000ms+ (reconnect_wait covered by queue buffer)
 ├─ Flush thread resumes publishing
-├─ Queue drains rapidly (~546ms of buffered events)
+├─ Queue drains rapidly (~1s of buffered events)
 └─ Bridge catches up, resumes ACK'ing PostgreSQL
 ```
 
@@ -910,11 +1194,10 @@ NATS outage → Queue fills → Main thread slows → PostgreSQL WAL accumulates
                                            (up to max_slot_wal_keep_size=10GB)
 ```
 
-The internal SPSC Queue size is 65536 items or 4MB which buffers at 60K events/s during 1s.
-
 **Graceful degradation:**
-- Queue absorbs microsecond-scale jitter
-- PostgreSQL WAL absorbs second-scale outages
+
+- Queue absorbs microsecond-scale jitter (lock-free, wait-free)
+- PostgreSQL WAL absorbs second-scale outages (up to 1s queue buffer)
 - `max_slot_wal_keep_size=10GB` absorbs minute-scale outages
 - Beyond that → alerts fire (intentional)
 
@@ -1023,9 +1306,7 @@ PostgreSQL LSN ACK
 - Built-in bootstrapping (not manual)
 - Zig-native (compiled, minimal overhead)
 
-### The Honest Take
-
-This bridge might carve out a niche for NATS-first teams who want turnkey CDC without heavy infrastructure. Or it might not—time will tell. 🤷
+### Honest Take
 
 If you're betting on mission-critical CDC, use Debezium. If you're exploring NATS and want a lightweight CDC solution, this is worth trying.
 
@@ -1158,9 +1439,11 @@ See `src/config.zig` for all tunables.
 ## Dependencies
 
 **Managed via `build.zig.zon`:**
+
 - [zig-msgpack](https://github.com/zigcc/zig-msgpack) - MessagePack encoding
 
 **Vendored:**
+
 - [nats.c](https://github.com/nats-io/nats.c) v3.12.0 - NATS client (C library)
 - [libpq](https://www.postgresql.org/docs/current/libpq.html) PostgreSQL 18.1
 
@@ -1171,26 +1454,30 @@ See `src/config.zig` for all tunables.
 ### End-to-End CDC Pipeline Test
 
 **Terminal 1 - Start the bridge:**
-```bash
+
+```sh
 docker compose -f docker-compose.prod.yml up postgres nats-init nats-conf-gen nats-server
+
+source .env.local
 
 ./zig-out/bin/bridge --slot my_slot --pub cdc_slot
 ```
 
 **Terminal 2 - Generate CDC events:**
-```bash
+
+```sh
 cd consumer && iex -S mix
 
 # Generate 100 INSERT events
-iex> Producer.run_test(100)
+iex> PgProducer.bulk(10)
 
-# Parallel load test: 100 batches of 10 events each
-iex> Stream.interval(500) |> Stream.take(100) |> Task.async_stream(fn _ -> Producer.run_test(10) end) |> Enum.to_list()
+# Parallel load test: 100 batches of 10 events each every 1ms
+iex> PgProducer.stream(100, 10, 1)
 ```
 
 ### HTTP Endpoint Tests
 
-```bash
+```sh
 # Health check
 curl http://localhost:9090/health
 
@@ -1201,7 +1488,7 @@ curl http://localhost:9090/status | jq
 curl http://localhost:9090/metrics
 
 # Stream management
-curl "http://localhost:9090/streams/info?stream=CDC" | jq
+curl http://localhost:9090/streams/info?stream=CDC | jq
 
 # Graceful shutdown
 curl -X POST http://localhost:9090/shutdown

@@ -30,31 +30,52 @@ defmodule Consumer.Cdc do
 
   @impl true
   def handle_message(%{topic: topic, body: body} = _message, state) do
-    # dbg(decoded = Jason.decode!(body))
+    dbg(topic)
+    dbg(Jason.decode!(body))
+    decoded = Jason.decode!(body)
+
+    if !is_list(decoded) do
+      data_str = if decoded["data"], do: Jason.decode!(decoded["data"]["metadata"]), else: ""
+
+      dbg(Jason.decode!(data_str))
+
+      Logger.info(
+        "[CDC Consumer] #{topic}: table=#{decoded["table"]}, operation=#{decoded["operation"]}#{data_str}"
+      )
+    else
+      Enum.each(decoded, fn event ->
+        data_str = if event["data"], do: " data=#{inspect(event["data"])}", else: ""
+
+        Logger.info(
+          "[CDC Consumer] Batch event - table: #{event["table"]}, operation: #{event["operation"]}, msg_id: #{event["msg_id"]}#{data_str}"
+        )
+      end)
+    end
 
     try do
       # Decode MessagePack payload
-      decoded = Msgpax.unpack!(body)
+      # decoded = Msgpax.unpack!(body)
+      _decoded = Jason.decode!(Jason.encode!(body))
 
-      cond do
-        is_list(decoded) ->
-          # Batch of events - each event has table, operation, subject, msg_id, and data
-          Enum.each(decoded, fn event ->
-            data_str = if event["data"], do: " data=#{inspect(event["data"])}", else: ""
+      # cond do
+      #   is_list(decoded) ->
+      #     # Batch of events - each event has table, operation, subject, msg_id, and data
+      #     Enum.each(decoded, fn event ->
+      #       data_str = if event["data"], do: " data=#{inspect(event["data"])}", else: ""
 
-            Logger.info(
-              "[CDC Consumer] Batch event - table: #{event["table"]}, operation: #{event["operation"]}, msg_id: #{event["msg_id"]}#{data_str}"
-            )
-          end)
+      #       Logger.info(
+      #         "[CDC Consumer] Batch event - table: #{event["table"]}, operation: #{event["operation"]}, msg_id: #{event["msg_id"]}#{data_str}"
+      #       )
+      #     end)
 
-        true ->
-          # Single event with table, operation, and data fields
-          data_str = if decoded["data"], do: " data=#{inspect(decoded["data"])}", else: ""
+      #   true ->
+      #     # Single event with table, operation, and data fields
+      #     data_str = if decoded["data"], do: " data=#{inspect(decoded["data"])}", else: ""
 
-          Logger.info(
-            "[CDC Consumer] #{topic}: table=#{decoded["table"]}, operation=#{decoded["operation"]}#{data_str}"
-          )
-      end
+      #     Logger.info(
+      #       "[CDC Consumer] #{topic}: table=#{decoded["table"]}, operation=#{decoded["operation"]}#{data_str}"
+      #     )
+      # end
 
       # Acknowledge successful processing
       {:ack, state}

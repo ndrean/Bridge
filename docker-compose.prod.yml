@@ -61,7 +61,7 @@ services:
       - "${BRIDGE_CDC_PUBLICATION}"
       - "--port"
       - "${BRIDGE_PORT}"
-      # - "--json"
+      - "--json"
     networks:
       - cdc-bridge
     restart: unless-stopped
