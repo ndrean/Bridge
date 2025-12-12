@@ -2,7 +2,7 @@ const std = @import("std");
 
 /// Lock-free Single Producer Single Consumer (SPSC) ring queue
 ///
-/// It works exactly one producer thread and one consumer thread.
+/// It works with exactly one producer thread and one consumer thread.
 ///
 /// - Producer: Main thread adding WAL events to batch
 /// - Consumer: Flush thread publishing batches to NATS
@@ -13,10 +13,11 @@ const std = @import("std");
 /// - Consumer uses .release on read_index so producer sees space is available
 ///
 /// Properties:
-/// - Wait-free for both producer and consumer
+/// - Single Producer, Single Consumer with fixed capacity a power of 2
+/// - uses a ring buffer and computes indices via bitmasking
+/// - leaves one slot empty to distinguish full vs empty
 /// - No locks, no syscalls, just atomic operations
-/// - Cache-friendly sequential access pattern
-/// - Fixed capacity (must be power of 2 for fast modulo via bitmasking)
+/// - Cache alignment to avoid false sharing
 pub fn SPSCQueue(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -63,11 +64,11 @@ pub fn SPSCQueue(comptime T: type) type {
         /// - release on write_index: Ensure data is visible before index update
         pub fn push(self: *Self, item: T) error{QueueFull}!void {
             const current_write = self.write_index.load(.monotonic);
-            const current_read = self.read_index.load(.acquire);
 
-            // Check if queue is full
             // We leave one slot empty to distinguish full from empty
             const next_write = (current_write + 1) & self.mask;
+            const current_read = self.read_index.load(.acquire);
+            // Check if queue is full
             if (next_write == current_read) {
                 return error.QueueFull;
             }
@@ -75,8 +76,7 @@ pub fn SPSCQueue(comptime T: type) type {
             // Write data to buffer
             self.buffer[current_write] = item;
 
-            // Publish the write with release semantics
-            // This ensures the data write is visible before the index update
+            // with `.release`, all ops are completed before this store
             self.write_index.store(next_write, .release);
         }
 
@@ -98,9 +98,8 @@ pub fn SPSCQueue(comptime T: type) type {
             // Read data from buffer
             const item = self.buffer[current_read];
 
-            // Update read index with release semantics
-            // This makes the freed slot visible to the producer
             const next_read = (current_read + 1) & self.mask;
+            // with `.release`, all ops are completed before this store
             self.read_index.store(next_read, .release);
 
             return item;

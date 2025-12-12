@@ -55,13 +55,13 @@ pub fn publishSchema(
     });
 
     // Build subject: schema.{table_name}
-    const subject = try std.fmt.allocPrint(
+    const subject = try std.fmt.allocPrintSentinel(
         allocator,
-        "schema.{s}\x00",
+        "schema.{s}",
         .{relation.name},
+        0,
     );
     defer allocator.free(subject);
-    const subject_z: [:0]const u8 = subject[0 .. subject.len - 1 :0];
 
     // Build payload with unified encoder
     var encoder = encoder_mod.Encoder.init(allocator, format);
@@ -96,7 +96,7 @@ pub fn publishSchema(
     var msg_id_buf: [64]u8 = undefined;
     const msg_id = try std.fmt.bufPrint(&msg_id_buf, "schema-{s}-{d}", .{ relation.name, relation.relation_id });
 
-    try publisher.publish(subject_z, encoded, msg_id);
+    try publisher.publish(subject, encoded, msg_id);
     try publisher.flushAsync();
 
     log.info("✅ Schema published: {s} ({d} columns)", .{ relation.name, relation.columns.len });
@@ -192,13 +192,16 @@ pub fn publishInitialSchemas(
 
     if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
         const err_msg = c.PQerrorMessage(conn);
-        log.err("Schema query failed: {s}", .{err_msg});
+        log.err(
+            "⚠️ Schema query failed: {s}",
+            .{err_msg},
+        );
         return error.QueryFailed;
     }
 
     const num_rows: usize = @intCast(c.PQntuples(result));
     if (num_rows == 0) {
-        log.warn("No tables found in public schema", .{});
+        log.warn("⚠️No tables found in public schema", .{});
         return;
     }
 

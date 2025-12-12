@@ -357,14 +357,13 @@ fn generateIncrementalSnapshot(
         defer allocator.free(encoded);
 
         // Publish chunk to NATS: init.snap.users.snap-1733507200.0
-        const subject = try std.fmt.allocPrint(
+        const subject = try std.fmt.allocPrintSentinel(
             allocator,
-            config.Snapshot.data_subject_pattern ++ "\x00",
+            config.Snapshot.data_subject_pattern,
             .{ table_name, snapshot_id, batch },
+            0,
         );
         defer allocator.free(subject);
-
-        const subject_z: [:0]const u8 = subject[0 .. subject.len - 1 :0];
 
         // Message ID for deduplication
         const msg_id_buf = try std.fmt.allocPrint(
@@ -374,14 +373,14 @@ fn generateIncrementalSnapshot(
         );
         defer allocator.free(msg_id_buf);
 
-        try publisher.publish(subject_z, encoded, msg_id_buf);
+        try publisher.publish(subject, encoded, msg_id_buf);
         try publisher.flushAsync();
 
         log.info("📦 Published snapshot chunk {d} ({d} rows, {d} bytes CSV) → {s}", .{
             batch,
             num_rows,
             encoded.len,
-            subject_z,
+            subject,
         });
 
         batch += 1;
@@ -557,19 +556,18 @@ fn publishSnapshotMetadata(
     const encoded = try encoder.encode(meta_map);
     defer allocator.free(encoded);
 
-    const subject = try std.fmt.allocPrint(
+    const subject = try std.fmt.allocPrintSentinel(
         allocator,
-        config.Snapshot.meta_subject_pattern ++ "\x00",
+        config.Snapshot.meta_subject_pattern,
         .{table_name},
+        0,
     );
     defer allocator.free(subject);
 
-    const subject_z: [:0]const u8 = subject[0 .. subject.len - 1 :0];
-
-    try publisher.publish(subject_z, encoded, null);
+    try publisher.publish(subject, encoded, null);
     try publisher.flushAsync();
 
-    log.info("📋 Published snapshot metadata → {s}", .{subject_z});
+    log.info("📋 Published snapshot metadata → {s}", .{subject});
 }
 
 /// Generate snapshot ID based on current timestamp

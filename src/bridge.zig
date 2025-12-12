@@ -399,18 +399,18 @@ pub fn main() !void {
 
                                 // Check if schema changed for a monitored table
                                 const schema_changed = try schema_cache.hasChanged(rel.name, rel.relation_id);
-                                const is_monitored = publication_mod.isTableMonitored(rel.name, monitored_tables);
-                                const schema_changed_in_tables = schema_changed and is_monitored;
 
-                                if (schema_changed_in_tables) {
-                                    log.info("🔔 Schema change detected for monitored table '{s}' (relation_id={d})", .{ rel.name, rel.relation_id });
+                                if (schema_changed) {
+                                    log.info("🔔 Schema change detected for table '{s}' (relation_id={d})", .{ rel.name, rel.relation_id });
                                     try schema_publisher.publishSchema(&publisher, &rel, allocator, parsed_args.encoding_format);
-                                } else if (schema_changed and !is_monitored) {
-                                    log.debug("Schema change detected for non-monitored table '{s}' (skipped)", .{rel.name});
                                 }
 
-                                // If relation already exists, free the old one first
-                                const result = try relation_map.fetchPut(cloned_rel_ptr.relation_id, cloned_rel_ptr.*);
+                                // Update the current relation map HashMap
+                                const result = try relation_map.fetchPut(
+                                    cloned_rel_ptr.relation_id,
+                                    cloned_rel_ptr.*,
+                                );
+                                // If relation already exists, free the returned old one
                                 if (result) |old_entry| {
                                     var old_rel = old_entry.value;
                                     old_rel.deinit(allocator);
