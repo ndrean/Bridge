@@ -1406,32 +1406,55 @@ See `src/config.zig` for all tunables.
 
 ## Project Structure
 
-```
+```txt
 ├── src/
+│   # Core
 │   ├── bridge.zig              # Main application entry point
 │   ├── config.zig              # Centralized configuration
-│   ├── wal_stream.zig          # PostgreSQL replication stream
-│   ├── pgoutput.zig            # pgoutput format parser
+│   ├── args.zig                # Command-line argument parsing
+│
+│   # PostgreSQL Connection & Replication
+│   ├── pg_conn.zig             # PostgreSQL connection helpers
+│   ├── pg_constants.zig        # PostgreSQL protocol constants
+│   ├── replication_setup.zig   # Replication slot and publication setup
+│   ├── publication.zig         # Publication metadata and table validation
+│   ├── wal_stream.zig          # PostgreSQL logical replication stream
+│   ├── wal_monitor.zig         # WAL lag monitoring
+│
+│   # PostgreSQL Data Parsers
+│   ├── pgoutput.zig            # pgoutput format decoder
+│   ├── pg_copy_csv.zig         # PostgreSQL COPY CSV parser (for snapshots)
+│   ├── array.zig               # PostgreSQL array type handling
+│   ├── numeric.zig             # PostgreSQL numeric type handling
+│
+│   # Schema Management
+│   ├── schema_cache.zig        # Schema change detection cache
+│   ├── schema_publisher.zig    # Schema publishing to NATS KV store
+│
+│   # NATS Publishers
 │   ├── nats_publisher.zig      # NATS JetStream publisher
 │   ├── nats_kv.zig             # NATS KV store wrapper
 │   ├── batch_publisher.zig     # Synchronous batch publisher
 │   ├── async_batch_publisher.zig # Async batch publisher with SPSC queue
 │   ├── spsc_queue.zig          # Lock-free single-producer single-consumer queue
-│   ├── schema_publisher.zig    # Schema publishing to KV store
-│   ├── snapshot_listener.zig   # Snapshot request listener
-│   ├── wal_monitor.zig         # WAL lag monitoring
+│
+│   # Snapshot Management
+│   ├── snapshot_listener.zig   # Snapshot request listener (NATS consumer)
+│
+│   # Encoding
+│   ├── encoder.zig             # Unified MessagePack/JSON encoder
+│
+│   # Observability
 │   ├── http_server.zig         # HTTP telemetry server
 │   ├── metrics.zig             # Metrics tracking
-│   └── pg_conn.zig             # PostgreSQL connection helpers
+│
+│   # Utilities
+│   └── utils.zig               # Utility functions
+
 ├── libs/
 │   ├── nats.c/                 # Vendored nats.c v3.12.0 source
 │   ├── nats-install/           # Built nats.c library
 │   └── libpq-install/          # Built libpq library
-├── consumer/                   # Elixir consumer example
-│   └── lib/consumer/
-│       ├── application.ex      # Consumer app setup
-│       ├── cdc_consumer.ex     # CDC stream consumer
-│       └── init_consumer.ex    # INIT stream consumer (bootstrap)
 ├── build.zig                   # Zig build configuration
 ├── build.zig.zon               # Package dependencies
 ├── docker-compose.yml          # Base infrastructure setup
