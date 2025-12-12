@@ -1,6 +1,6 @@
-//! WAL monitoring functionality.
+//! WAL monitoring background thread functionality.
 //!
-//! Includes getting current WAL LSN and monitoring WAL lag in a background thread.
+//! It monitoring WAL lag using `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`and includes getting current WAL LSN
 const std = @import("std");
 const c = @cImport({
     @cInclude("libpq-fe.h");
@@ -42,7 +42,7 @@ pub const WalMonitor = struct {
         };
     }
 
-    /// Start the WAL monitoring thread
+    /// Start the WAL monitoring loop thread that queries WAL lag periodically.
     pub fn start(self: *WalMonitor) !void {
         if (self.thread != null) {
             return error.AlreadyStarted;
@@ -64,14 +64,24 @@ pub const WalMonitor = struct {
         _ = self;
     }
 
-    /// Background monitoring loop (internal)
+    /// checkWALLag monitoring loop (internal)
     fn monitorLoop(self: *WalMonitor) !void {
-        log.info("ℹ️ WAL lag monitor started (checking every {d}s)\n", .{self.config.check_interval_seconds});
+        log.info(
+            "ℹ️ WAL lag monitor started (checking every {d}s)\n",
+            .{self.config.check_interval_seconds},
+        );
 
         while (!self.should_stop.load(.seq_cst)) {
             // Check WAL lag
-            checkWalLag(self.metrics, self.config, self.allocator) catch |err| {
-                log.warn("⚠️ Failed to check WAL lag: {}", .{err});
+            checkWalLag(
+                self.metrics,
+                self.config,
+                self.allocator,
+            ) catch |err| {
+                log.warn(
+                    "⚠️ Failed to check WAL lag: {}",
+                    .{err},
+                );
             };
 
             // Sleep for check interval
@@ -86,7 +96,7 @@ pub const WalMonitor = struct {
     }
 };
 
-/// Get current WAL LSN position
+/// Get current WAL LSN position with the query `SELECT pg_current_wal_lsn()::text`
 ///
 /// Caller is responsible for freeing the returned LSN string
 pub fn getCurrentLSN(allocator: std.mem.Allocator, pg_conf: *const pg_conn.PgConf) ![]const u8 {
@@ -132,6 +142,7 @@ pub fn getCurrentLSN(allocator: std.mem.Allocator, pg_conf: *const pg_conn.PgCon
     return try allocator.dupe(u8, lsn);
 }
 
+/// Check WAL lag for the given replication slot and update metrics. Runs the query `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`.
 fn checkWalLag(
     metrics: *metrics_mod.Metrics,
     config: WalConfig,
@@ -175,8 +186,14 @@ fn checkWalLag(
 
     const nrows = c.PQntuples(result);
     if (nrows == 0) {
-        log.warn("🔴 Replication slot '{s}' not found", .{config.slot_name});
-        metrics.updateWalLag(false, 0);
+        log.warn(
+            "🔴 Replication slot '{s}' not found",
+            .{config.slot_name},
+        );
+        metrics.updateWalLag(
+            false,
+            0,
+        );
         return;
     }
 
@@ -184,11 +201,22 @@ fn checkWalLag(
     const active_str = c.PQgetvalue(result, 0, 0);
     const lag_bytes_str = c.PQgetvalue(result, 0, 1);
 
-    const slot_active = std.mem.eql(u8, std.mem.span(active_str), "t");
-    const lag_bytes = try std.fmt.parseInt(u64, std.mem.span(lag_bytes_str), 10);
+    const slot_active = std.mem.eql(
+        u8,
+        std.mem.span(active_str),
+        "t",
+    );
+    const lag_bytes = try std.fmt.parseInt(
+        u64,
+        std.mem.span(lag_bytes_str),
+        10,
+    );
 
     // Update metrics
-    metrics.updateWalLag(slot_active, lag_bytes);
+    metrics.updateWalLag(
+        slot_active,
+        lag_bytes,
+    );
 
     // Log warnings for concerning states
     const one_gb: u64 = 1024 * 1024 * 1024;

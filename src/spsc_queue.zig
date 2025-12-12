@@ -1,9 +1,9 @@
 const std = @import("std");
 
-/// Lock-free Single Producer Single Consumer (SPSC) bounded queue
+/// Lock-free Single Producer Single Consumer (SPSC) ring queue
 ///
-/// This is a high-performance, wait-free queue for scenarios with exactly one
-/// producer thread and one consumer thread. Perfect for the CDC bridge where:
+/// It works exactly one producer thread and one consumer thread.
+///
 /// - Producer: Main thread adding WAL events to batch
 /// - Consumer: Flush thread publishing batches to NATS
 ///
@@ -130,7 +130,7 @@ pub fn SPSCQueue(comptime T: type) type {
 }
 
 // Tests
-test "SPSC queue basic operations" {
+test "SPSC queue basic" {
     const testing = std.testing;
     var queue = try SPSCQueue(u32).init(testing.allocator, 8);
     defer queue.deinit();
@@ -154,7 +154,7 @@ test "SPSC queue basic operations" {
     try testing.expectEqual(@as(?u32, null), queue.pop());
 }
 
-test "SPSC queue full condition" {
+test "SPSC queue full" {
     const testing = std.testing;
     var queue = try SPSCQueue(u32).init(testing.allocator, 4);
     defer queue.deinit();
@@ -174,7 +174,7 @@ test "SPSC queue full condition" {
     try queue.push(4);
 }
 
-test "SPSC queue wrap-around" {
+test "SPSC queue push-pop" {
     const testing = std.testing;
     var queue = try SPSCQueue(u32).init(testing.allocator, 4);
     defer queue.deinit();
