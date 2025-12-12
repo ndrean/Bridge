@@ -49,6 +49,9 @@ The design makes deliberate trade-offs for simplicity and efficiency.
 
 ### What It Does
 
+We have a _pull_ model subscribing to the WAL.
+We use the plugin `pgoutput` to receive formatted data from Postgres.
+
 **Uses Protocol v1**:
 
 The plugin `pgoutput` will send data after the transaction is commited.
@@ -66,7 +69,7 @@ Version 3 introduced row filtering (eg only replicate rows where user_id > 1000)
 
 - Streams PostgreSQL changes using logical replication (pgoutput format)
 - Publishes schemas to NATS KV store on startup
-- Generates table snapshots on-demand (10K row chunks)
+- Generates table snapshots on-demand (10K row chunks) via NATS requests.
 - Triggers message to NATS on schema change
 - MessagePack encoding by default for efficiency (JSON available with `--json`)
 - At-least-once delivery with idempotent message IDs
@@ -77,7 +80,7 @@ Version 3 introduced row filtering (eg only replicate rows where user_id > 1000)
 
 ### Use Case
 
-**Perfect for:** Consumers wanting to mirror PostgreSQL tables locally (SQLite, PGLite, etc.) and stay synchronized with real-time changes.
+Consumers wanting to mirror PostgreSQL tables locally (SQLite, PGLite, etc.) and stay synchronized with real-time changes.
 
 **Example:** Edge applications, mobile apps, or analytics workers that need a local replica of specific tables without querying the main database.
 
