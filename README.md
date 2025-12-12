@@ -932,13 +932,15 @@ curl "http://localhost:9090/streams/info?stream=CDC" | jq
 
 ### Lock-Free Queue (SPSC): A nice Piece of Computer Art
 
-[![SPSC Queue Video](https://img.youtube.com/vi/K3P_Lmq6pw0/0.jpg)](https://www.youtube.com/watch?v=K3P_Lmq6pw0&t=408s)
+All the code below is taken from these two videos:
 
-_Watch: ["1024 Cores" - Zig SHOWTIME talk on lock-free programming](https://www.youtube.com/watch?v=K3P_Lmq6pw0&t=408s)_
+_Watch: [Zig SHOWTIME talk on lock-free programming](https://www.youtube.com/watch?v=K3P_Lmq6pw0&t=408s)_
 
 _Watch: [SPSC Queue Video](https://www.youtube.com/watch?v=K3P_Lmq6pw0&t=408s)_
 
 We have a shared **ring buffer** between a unique producer/writer thread (main CDC decoder) and a unique consumer/reader thread (batch publisher).
+
+[![SPSC Queue Video](https://img.youtube.com/vi/K3P_Lmq6pw0/0.jpg)](https://www.youtube.com/watch?v=K3P_Lmq6pw0&t=408s)
 
 This is the perfect use case for a **wait-free** SPSC (Single Producer Single Consumer) ring buffer.
 
@@ -989,7 +991,7 @@ self.write_index.store(6, ...);  // Step 2: Publish index
 
 // What CPU might do WITHOUT .release:
 self.write_index.store(6, ...);  // Reordered! Consumer sees index 6...
-self.buffer[5] = item;           // ...but data isn't written yet! 🔥
+self.buffer[5] = item;           // ...but data isn't written yet!
 ```
 
 **Memory ordering semantics:**
@@ -1014,7 +1016,11 @@ Fill the 8th slot: write_index=0 (wraps), read_index=0 ❌
 
 Now `read_index == write_index` but the queue is FULL, not empty!
 
-**Solution**: Keep the last slot empty
+**Solution**: Keep the last slot empty by excluding it with the computation `(current_write + 1) % capacity`.
+
+> Indeed, when current_write is 7 and capacity is 8, then next_write becomes 0
+
+This now gives us a way to distinguish between full and empty:
 
 ```zig
 // Check if queue is full (in push)
