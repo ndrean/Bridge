@@ -1,4 +1,6 @@
 const std = @import("std");
+const c_imports = @import("c_imports.zig");
+const c = c_imports.c;
 const batch_publisher = @import("batch_publisher.zig");
 const nats_publisher = @import("nats_publisher.zig");
 const pgoutput = @import("pgoutput.zig");
@@ -304,6 +306,10 @@ pub const AsyncBatchPublisher = struct {
         // Signal that flush thread has completed all work
         self.flush_complete.store(true, .seq_cst);
         log.info("✅ Flush thread completed - all events published", .{});
+
+        // Release NATS thread-local storage
+        // This is required when user-created threads call NATS C library APIs
+        c.nats_ReleaseThreadMemory();
     }
 
     /// Flush a batch to NATS (runs in flush thread)

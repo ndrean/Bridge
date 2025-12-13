@@ -14,9 +14,8 @@ const nats_kv = @import("nats_kv.zig");
 const pgoutput = @import("pgoutput.zig");
 const msgpack = @import("msgpack");
 const encoder_mod = @import("encoder.zig");
-const c = @cImport({
-    @cInclude("libpq-fe.h");
-});
+const c_imports = @import("c_imports.zig");
+const c = c_imports.c;
 const pg_conn = @import("pg_conn.zig");
 
 pub const log = std.log.scoped(.schema_publisher);
@@ -141,7 +140,7 @@ pub fn publishInitialSchemas(
     }
 
     // Build IN clause for monitored tables: ('table1', 'table2', ...)
-    var in_clause = std.ArrayList(u8){};
+    var in_clause: std.ArrayList(u8) = .empty;
     defer in_clause.deinit(allocator);
 
     try in_clause.appendSlice(allocator, "(");

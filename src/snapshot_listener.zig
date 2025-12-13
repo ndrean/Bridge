@@ -6,10 +6,8 @@
 //! 3. Publish snapshot chunks to NATS INIT stream
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("libpq-fe.h");
-    @cInclude("nats.h");
-});
+const c_imports = @import("c_imports.zig");
+const c = c_imports.c;
 const pg_conn = @import("pg_conn.zig");
 const nats_publisher = @import("nats_publisher.zig");
 const publication_mod = @import("publication.zig");
@@ -236,7 +234,7 @@ pub fn listenForSnapshotRequests(
     var sub: ?*c.natsSubscription = null;
     const status = c.natsConnection_Subscribe(
         &sub,
-        @ptrCast(publisher.nc),
+        publisher.nc,
         config.Snapshot.request_subject_wildcard,
         onSnapshotRequest,
         &ctx,
@@ -251,6 +249,25 @@ pub fn listenForSnapshotRequests(
     }
     defer c.natsSubscription_Destroy(sub);
 
+    // Flush to ensure server processed the subscription
+    // This sends PING and waits for PONG to verify subscription was registered
+    const flush_status = c.natsConnection_Flush(publisher.nc);
+    if (flush_status != c.NATS_OK) {
+        log.err("⚠️ Failed to flush after subscription: {s}", .{
+            std.mem.span(c.natsStatus_GetText(flush_status)),
+        });
+        return error.FlushFailed;
+    }
+
+    // Check if server had any errors processing the subscription
+    var last_err_text: [*c]const u8 = null;
+    const last_err = c.natsConnection_GetLastError(publisher.nc, &last_err_text);
+    if (last_err != c.NATS_OK) {
+        const err_msg = if (last_err_text != null) std.mem.span(last_err_text) else "unknown";
+        log.err("Server error after subscription: {s}", .{err_msg});
+        return error.SubscriptionError;
+    }
+
     log.info("🔔 Subscribed to NATS subject 'snapshot.request.>' for snapshot requests", .{});
 
     // Keep thread alive until stop signal
@@ -259,6 +276,10 @@ pub fn listenForSnapshotRequests(
     }
 
     log.info("🥁 Snapshot listener thread stopped", .{});
+
+    // Release NATS thread-local storage
+    // This is required when user-created threads call NATS C library APIs
+    c.nats_ReleaseThreadMemory();
 }
 
 /// Generate incremental snapshot in chunks and publish to NATS

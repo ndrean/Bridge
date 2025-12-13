@@ -8,9 +8,8 @@
 //! Use `init()` to perform one-time setup and get the list of monitored tables.
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("libpq-fe.h");
-});
+const c_imports = @import("c_imports.zig");
+const c = c_imports.c;
 const pg_conn = @import("pg_conn.zig");
 
 pub const log = std.log.scoped(.replication_setup);
@@ -20,8 +19,8 @@ pub const log = std.log.scoped(.replication_setup);
 /// This is the simplified result of replication setup initialization.
 /// Use `init()` to create and `deinit()` to clean up.
 pub const ReplicationContext = struct {
-    tables: [][]const u8, // Owned strings in "schema.table" format
     allocator: std.mem.Allocator,
+    tables: [][]const u8, // Owned strings in "schema.table" format
 
     pub fn deinit(self: *ReplicationContext) void {
         for (self.tables) |table| {
@@ -33,10 +32,10 @@ pub const ReplicationContext = struct {
 
 /// Publication information returned by checkPublication (internal)
 const PublicationInfo = struct {
+    allocator: std.mem.Allocator,
     pubname: []const u8,
     puballtables: bool,
     tables: [][]const u8, // Owned strings: schema.table format
-    allocator: std.mem.Allocator,
 
     pub fn deinit(self: *PublicationInfo) void {
         for (self.tables) |table| {
@@ -338,7 +337,7 @@ pub fn init(
     pub_info.tables = &[_][]const u8{}; // Empty slice so deinit() doesn't free tables
 
     return ReplicationContext{
-        .tables = tables,
         .allocator = allocator,
+        .tables = tables,
     };
 }

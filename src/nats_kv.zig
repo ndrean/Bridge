@@ -5,9 +5,8 @@
 //! It is used for storing schema definitions.
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("nats.h");
-});
+const c_imports = @import("c_imports.zig");
+const c = c_imports.c;
 
 pub const log = std.log.scoped(.nats_kv);
 

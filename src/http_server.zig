@@ -1,4 +1,6 @@
 const std = @import("std");
+const c_imports = @import("c_imports.zig");
+const c = c_imports.c;
 const metrics_mod = @import("metrics.zig");
 const nats_publisher = @import("nats_publisher.zig");
 
@@ -101,6 +103,10 @@ pub const Server = struct {
         }
 
         log.info("👋 HTTP server stopped", .{});
+
+        // Release NATS thread-local storage
+        // This is required when user-created threads call NATS C library APIs
+        c.nats_ReleaseThreadMemory();
     }
 
     fn handleRequest(self: *Server, stream: std.net.Stream) !void {

@@ -4,9 +4,8 @@
 //!
 //! This is crucial to ensure that the Schema and Snapshot messages are reliably delivered to NATS JetStream.
 const std = @import("std");
-const c = @cImport({
-    @cInclude("nats.h");
-});
+const c_imports = @import("c_imports.zig");
+const c = c_imports.c;
 const Conf = @import("config.zig");
 const Metrics = @import("metrics.zig").Metrics;
 

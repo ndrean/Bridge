@@ -2,9 +2,8 @@
 //!
 //! It monitoring WAL lag using `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`and includes getting current WAL LSN
 const std = @import("std");
-const c = @cImport({
-    @cInclude("libpq-fe.h");
-});
+const c_imports = @import("c_imports.zig");
+const c = c_imports.c;
 const pg_conn = @import("pg_conn.zig");
 const metrics_mod = @import("metrics.zig");
 const Conf = @import("config.zig");

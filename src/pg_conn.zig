@@ -2,10 +2,8 @@
 //!
 //! Methods for PG init configuration and connection_string, and connection management.
 const std = @import("std");
-
-const c = @cImport({
-    @cInclude("libpq-fe.h");
-});
+const c_imports = @import("c_imports.zig");
+const c = c_imports.c;
 
 pub const log = std.log.scoped(.pg_conn);
 

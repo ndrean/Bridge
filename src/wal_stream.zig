@@ -3,9 +3,8 @@
 //! Handles connecting to PostgreSQL in replication mode, starting replication from a slot,
 //! receiving WAL messages ('k' and ''), and sending status updates.
 const std = @import("std");
-const c = @cImport({
-    @cInclude("libpq-fe.h");
-});
+const c_imports = @import("c_imports.zig");
+const c = c_imports.c;
 const pg_conn = @import("pg_conn.zig");
 const Conf = @import("config.zig");
 

@@ -7,9 +7,8 @@
 //! - Escaping: double quotes for quotes, standard CSV rules
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("libpq-fe.h");
-});
+const c_imports = @import("c_imports.zig");
+const c = c_imports.c;
 
 pub const log = std.log.scoped(.pg_copy_csv);
 
@@ -24,7 +23,7 @@ pub const CopyCsvParser = struct {
         return .{
             .allocator = allocator,
             .conn = conn,
-            .buffer = std.ArrayList(u8){},
+            .buffer = .empty,
         };
     }
 
@@ -187,7 +186,7 @@ pub const CopyCsvParser = struct {
 
     /// Unescape CSV quoted value (replace "" with ")
     fn unescapeCsv(self: *CopyCsvParser, input: []const u8) ![]const u8 {
-        var result = std.ArrayList(u8){};
+        var result: std.ArrayList(u8) = .empty;
         defer result.deinit(self.allocator);
 
         var i: usize = 0;

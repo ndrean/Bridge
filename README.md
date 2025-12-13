@@ -1003,9 +1003,11 @@ self.buffer[5] = item;           // ...but data isn't written yet!
 
 Consider: `read_index == write_index` means _empty_.
 
+=> we use this to control if we can `pop()` at `read_index` from the buffer.
+
 **Problem**: If we fill all slots, the queue appears empty!
 
-7 slots filled out of 8: write_index=7, read_index=0
+Consider 7 slots filled out of 8: write_index=7, read_index=0
 
 | A   | B   | C   | D   | E   | F   | G   |     |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -1015,13 +1017,9 @@ Fill the 8th slot: write_index=0 (wraps), read_index=0
 | A   | B   | C   | D   | E   | F   | G   | H   |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 
-Now `read_index == write_index` but the queue is FULL, not empty!
+Now `write_index` becomes 0, so `read_index == write_index` but the queue is FULL, not empty!
 
-**Solution**: Keep the last slot empty by excluding it with the computation `(current_write + 1) % capacity`.
-
-> Indeed, when current_write is 7 and capacity is 8, then next_write becomes 0
-
-This now gives us a way to distinguish between full and empty:
+**Solution**: `push()` only if `next_write_index != read_index`. In pratice, the last slot ill alsways be empty by excluding it with the test:
 
 ```zig
 // Check if queue is full (in push)
@@ -1031,9 +1029,11 @@ if (next_write == current_read) {
 }
 ```
 
-We trade 1 slot for a simple, fast full/empty check. No separate counter or atomic flags needed!
+> Indeed, when current_write is 7 and capacity is 8, then next_write becomes 0, and the test returns `error.QueueFull`.
 
-#### Trick #2: Bitmasking for Fast Modulo
+This now gives us a way to distinguish between _full_ and _empty_ beucase when both indexes are 0, the test above does not return the error, whilst it does when full except the last slot.
+
+#### Trick #2: Replcae `modulo` with Bitmasking for Fast Modulo
 
 Since capacity is a power of 2 (e.g., 65536 = 2^16), we can use bitmasking instead of division:
 
@@ -1116,7 +1116,7 @@ pub fn pop(self: *Self) ?T {
     const current_write = self.write_index.load(.acquire);
     //    ↑ .acquire: See producer's data write before they updated write_index
 
-    // 3. Check if empty
+    // 3. Check if empty (both indices are equal)
     if (current_read == current_write) {
         return null;
     }
