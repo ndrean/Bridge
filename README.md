@@ -975,9 +975,11 @@ We specialize it with `T = CDCEvent`, creating a buffer of `CDCEvent[]`.
 
 #### Why Atomic Operations?
 
-Both threads share the buffer. The producer is the _only_ thread updating `write_index`, and the consumer is the _only_ thread updating `read_index`. So why atomicity?
+Both threads share the buffer. The producer is the _only_ thread updating `write_index`, and the consumer is the _only_ thread updating `read_index`. 
 
-**Two reasons:**
+So why do we still need atomics if each index has a single writer?
+
+Not primarily for atomicity (no two threads write the same variable), but for two reasons:
 
 1. **Prevent compiler/CPU reordering** (the main reason)
 2. **Ensure visibility across CPU cores** (cache coherence)
@@ -996,7 +998,7 @@ self.buffer[5] = item;           // ...but data isn't written yet!
 
 **Memory ordering semantics:**
 
-- `.monotonic`: Prevents compiler optimization across reads/writes (like `volatile` in C)
+- `.monotonic`: Guarantees atomicity and a single total order per variable, but does not establish ordering with other memory accesses
 - `.acquire`/`.release`: Solve cross-thread ordering and create "happens-before" relationships
 
 #### Trick #1: Empty Last Slot
@@ -1007,19 +1009,19 @@ Consider: `read_index == write_index` means _empty_.
 
 **Problem**: If we fill all slots, the queue appears empty!
 
-Consider 7 slots filled out of 8: write_index=7, read_index=0
+Consider 7 slots filled out of 8; we have `write_index=7, read_index=0`
 
 | A   | B   | C   | D   | E   | F   | G   |     |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 
-Fill the 8th slot: write_index=0 (wraps), read_index=0
+Fill the 8th slot:
 
 | A   | B   | C   | D   | E   | F   | G   | H   |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 
-Now `write_index` becomes 0, so `read_index == write_index` but the queue is FULL, not empty!
+Now `write_index=0` (wraps), so `read_index == write_index` but the queue is FULL, not empty!
 
-**Solution**: `push()` only if `next_write_index != read_index`. In pratice, the last slot ill alsways be empty by excluding it with the test:
+**Solution**: `push()` only if `next_write_index != read_index`. In pratice, the last slot will always be empty by excluding it with the test:
 
 ```zig
 // Check if queue is full (in push)
@@ -1029,11 +1031,9 @@ if (next_write == current_read) {
 }
 ```
 
-> Indeed, when current_write is 7 and capacity is 8, then next_write becomes 0, and the test returns `error.QueueFull`.
+This now gives us a way to distinguish between _full_ and _empty_.
 
-This now gives us a way to distinguish between _full_ and _empty_ beucase when both indexes are 0, the test above does not return the error, whilst it does when full except the last slot.
-
-#### Trick #2: Replcae `modulo` with Bitmasking for Fast Modulo
+#### Trick #2: Replacae `modulo` with Bitmasking for Fast Modulo
 
 Since capacity is a power of 2 (e.g., 65536 = 2^16), we can use bitmasking instead of division:
 
@@ -1139,29 +1139,51 @@ pub fn pop(self: *Self) ?T {
 The `.release → .acquire` pairs create "happens-before" relationships:
 
 ```txt
-Thread 1 (Producer)              Thread 2 (Consumer)
-─────────────────────            ─────────────────────
+Time →
+────────────────────────────────────────────────────────────────────
+
+Producer thread (CPU Core A)          Consumer thread (CPU Core B)
+────────────────────────────          ──────────────────────────────
+
 buffer[5] = item
-write_index.store(6, .release) ─→ write_index.load(.acquire)
-                                   ↓ sees buffer[5] write
-                                   data = buffer[5]
-                                   read_index.store(6, .release) ─→ read_index.load(.acquire)
-                                                                     ↓ sees space freed
+    │
+    │   (regular write)
+    │
+write_index.store(6, .release)
+    │
+    │   ───────────── happens-before ─────────────▶
+    │
+                                     write_index.load(.acquire)
+                                         │
+                                         │  sees write_index == 6
+                                         │  AND sees buffer[5] = item
+                                         │
+                                     item = buffer[5]
+                                         │
+                                     read_index.store(6, .release)
+                                         │
+             ◀──────────── happens-before ─────────────
+                                         │
+read_index.load(.acquire)
+    │
+    │  sees freed space safely
 ```
 
 **Memory ordering summary:**
 
 - `.monotonic` on same-thread loads: No cross-thread ordering, just atomicity
-- `.acquire` when reading other thread's index: See all writes before that index update
+- `.acquire` ensures that if we observe the updated index, we also observe all
+memory operations that happened-before the corresponding .release.
 - `.release` when updating your own index: All previous writes visible before publishing
 
 #### Why This Is Wait-Free
 
-This queue is **wait-free** because:
+This queue is **wait-free**, not just lock-free because:
 
 - No mutex locks (`mutex.lock()`)
 - No CAS (Compare-And-Swap) retry loops
 - Single writer per index means no contention
+- each operation completes in a bounded number of steps, regardless of the other thread’s behavior.
 
 If we had multiple writers, we'd need CAS loops with retries (see the video for details).
 
