@@ -119,8 +119,8 @@ pub const Encoder = struct {
 
         // Use Writer.Allocating for dynamic buffer
         var buffer: [8192]u8 = undefined;
-        var out: std.io.Writer.Allocating = .init(self.allocator);
-        var reader = std.io.Reader.fixed(&buffer);
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        var reader = std.Io.Reader.fixed(&buffer);
 
         var packer = msgpack.PackerIO.init(&reader, &out.writer);
         try packer.write(msgpack_value);
