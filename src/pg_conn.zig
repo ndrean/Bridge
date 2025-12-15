@@ -1,14 +1,15 @@
 //! PostgreSQL configuration and connection management.
 //!
-//! Methods for PG init configuration and connection_string, and connection management.
+//! Methods for building connection strings and managing PostgreSQL connections.
 const std = @import("std");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
+const Config = @import("config.zig");
 
 pub const log = std.log.scoped(.pg_conn);
 
 /// PostgreSQL connection configuration
-/// Centralized storage for database credentials used across the application
+/// Use RuntimeConfig as the source of truth for connection parameters
 pub const PgConf = struct {
     host: []const u8,
     port: u16,
@@ -17,6 +18,19 @@ pub const PgConf = struct {
     database: []const u8,
     /// Enable replication mode (adds replication=database to connection string)
     replication: bool = false,
+
+    /// Create PgConf from RuntimeConfig
+    /// Does not allocate - just references strings from RuntimeConfig
+    pub fn from_runtime_config(runtime_config: *const Config.RuntimeConfig) PgConf {
+        return .{
+            .host = runtime_config.pg_host,
+            .port = runtime_config.pg_port,
+            .user = runtime_config.pg_user,
+            .password = runtime_config.pg_password,
+            .database = runtime_config.pg_database,
+            .replication = false,
+        };
+    }
 
     /// Build a PostgreSQL connection string
     ///
@@ -38,72 +52,6 @@ pub const PgConf = struct {
 
         // Return null-terminated string for C APIs
         return try allocator.dupeZ(u8, conninfo_str);
-    }
-
-    /// Setup PostgreSQL connection configuration from environment variables
-    ///
-    /// Returns a PgConf with owned strings. Caller must call deinit() to free.
-    ///
-    /// Environment variables (matches .env.prod naming):
-    /// - PG_HOST: PostgreSQL host
-    /// - PG_PORT: PostgreSQL port
-    /// - POSTGRES_BRIDGE_USER: Bridge user (fallback to PG_USER)
-    /// - POSTGRES_BRIDGE_PASSWORD: Bridge password (fallback to PG_PASSWORD)
-    /// - PG_DB: Database name
-    pub fn init_from_env(allocator: std.mem.Allocator) !PgConf {
-        const pg_host = std.process.getEnvVarOwned(allocator, "PG_HOST") catch |err| blk: {
-            log.info("PG_HOST env var not set ({t}), using default 127.0.0.1", .{err});
-            break :blk try allocator.dupe(u8, "127.0.0.1");
-        };
-        errdefer allocator.free(pg_host);
-
-        const port_str = std.process.getEnvVarOwned(allocator, "PG_PORT") catch |err| blk: {
-            log.info("PG_PORT env var not set ({t}), using default 5432", .{err});
-            break :blk try allocator.dupe(u8, "5432");
-        };
-        defer allocator.free(port_str); // Port string only needed for parsing
-
-        // Try bridge-specific user first, fallback to PG_USER
-        const user_name = std.process.getEnvVarOwned(allocator, "POSTGRES_BRIDGE_USER") catch blk: {
-            const generic_user = std.process.getEnvVarOwned(allocator, "PG_USER") catch |err| blk2: {
-                log.info("POSTGRES_BRIDGE_USER and PG_USER env vars not set ({t}), using default username", .{err});
-                break :blk2 try allocator.dupe(u8, "postgres");
-            };
-            break :blk generic_user;
-        };
-        errdefer allocator.free(user_name);
-
-        // Try bridge-specific password first, fallback to PG_PASSWORD
-        const password = std.process.getEnvVarOwned(allocator, "POSTGRES_BRIDGE_PASSWORD") catch blk: {
-            const generic_password = std.process.getEnvVarOwned(allocator, "PG_PASSWORD") catch |err| blk2: {
-                log.info("POSTGRES_BRIDGE_PASSWORD and PG_PASSWORD env vars not set ({}), using default", .{err});
-                break :blk2 try allocator.dupe(u8, "postgres");
-            };
-            break :blk generic_password;
-        };
-        errdefer allocator.free(password);
-
-        const database = std.process.getEnvVarOwned(allocator, "PG_DB") catch |err| blk: {
-            log.info("PG_DB env var not set ({}), using default postgres", .{err});
-            break :blk try allocator.dupe(u8, "postgres");
-        };
-        errdefer allocator.free(database);
-
-        return .{
-            .host = pg_host,
-            .port = try std.fmt.parseInt(u16, port_str, 10),
-            .user = user_name,
-            .password = password,
-            .database = database,
-        };
-    }
-
-    /// Free owned strings in PgConf
-    pub fn deinit(self: *PgConf, allocator: std.mem.Allocator) void {
-        allocator.free(self.host);
-        allocator.free(self.user);
-        allocator.free(self.password);
-        allocator.free(self.database);
     }
 };
 

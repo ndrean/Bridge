@@ -24,6 +24,8 @@ const SnapshotContext = struct {
     pg_config: *const pg_conn.PgConf,
     publisher: *nats_publisher.Publisher,
     monitored_tables: []const []const u8,
+    format: encoder_mod.Format,
+    chunk_size: usize,
 };
 
 /// Snapshot listener with thread management
@@ -34,6 +36,8 @@ pub const SnapshotListener = struct {
     should_stop: *std.atomic.Value(bool),
     monitored_tables: []const []const u8,
     thread: ?std.Thread = null,
+    format: encoder_mod.Format,
+    chunk_size: usize,
 
     /// Initialize snapshot listener (does not start the thread)
     pub fn init(
@@ -42,6 +46,8 @@ pub const SnapshotListener = struct {
         publisher: *nats_publisher.Publisher,
         should_stop: *std.atomic.Value(bool),
         monitored_tables: []const []const u8,
+        format: encoder_mod.Format,
+        runtime_config: *const config.RuntimeConfig,
     ) SnapshotListener {
         return .{
             .allocator = allocator,
@@ -50,6 +56,8 @@ pub const SnapshotListener = struct {
             .should_stop = should_stop,
             .monitored_tables = monitored_tables,
             .thread = null,
+            .format = format,
+            .chunk_size = runtime_config.snapshot_chunk_size,
         };
     }
 
@@ -83,6 +91,8 @@ pub const SnapshotListener = struct {
             self.publisher,
             self.should_stop,
             self.monitored_tables,
+            self.format,
+            self.chunk_size,
         );
     }
 };
@@ -174,10 +184,10 @@ fn onSnapshotRequest(
 
     // Get request metadata from message payload (MessagePack: requested_by, etc.)
     const data_ptr = c.natsMsg_GetData(msg);
-    const data_len = c.natsMsg_GetDataLength(msg);
+    const data_len: usize = @intCast(c.natsMsg_GetDataLength(msg));
 
     const requested_by = if (data_len > 0) blk: {
-        const payload = data_ptr[0..@intCast(data_len)];
+        const payload = data_ptr[0..data_len];
         // Try to parse MessagePack for requested_by field
         // For now, just use "nats-consumer"
         _ = payload;
@@ -204,6 +214,8 @@ fn onSnapshotRequest(
         null, // No PostgreSQL connection needed (we create our own)
         table_name,
         snapshot_id,
+        ctx.format,
+        ctx.chunk_size,
     ) catch |err| {
         log.err("Snapshot generation failed for table '{s}': {}", .{ table_name, err });
         return;
@@ -219,6 +231,8 @@ pub fn listenForSnapshotRequests(
     publisher: *nats_publisher.Publisher,
     should_stop: *std.atomic.Value(bool),
     monitored_tables: []const []const u8,
+    format: encoder_mod.Format,
+    chunk_size: usize,
 ) !void {
     log.info("🔔 Starting NATS snapshot listener thread", .{});
 
@@ -228,6 +242,8 @@ pub fn listenForSnapshotRequests(
         .pg_config = pg_config,
         .publisher = publisher,
         .monitored_tables = monitored_tables,
+        .format = format,
+        .chunk_size = chunk_size,
     };
 
     // Subscribe to snapshot.request.> (wildcard for all tables)
@@ -290,6 +306,8 @@ fn generateIncrementalSnapshot(
     _: ?*c.PGconn, // Original connection (not used, we create a new one for snapshot query)
     table_name: []const u8,
     snapshot_id: []const u8,
+    format: encoder_mod.Format,
+    chunk_size: usize,
 ) !void {
     log.info("🔄 Generating incremental snapshot for table '{s}' (snapshot_id={s})", .{
         table_name,
@@ -329,13 +347,16 @@ fn generateIncrementalSnapshot(
         const copy_query = try std.fmt.allocPrintSentinel(
             allocator,
             "COPY (SELECT * FROM {s} ORDER BY id LIMIT {d} OFFSET {d}) TO STDOUT WITH (FORMAT csv, HEADER true)",
-            .{ table_name, config.Snapshot.chunk_size, offset_rows },
+            .{ table_name, chunk_size, offset_rows },
             0,
         );
         defer allocator.free(copy_query);
 
         // Parse CSV COPY data
-        var parser = pg_copy_csv.CopyCsvParser.init(allocator, @ptrCast(conn));
+        var parser = pg_copy_csv.CopyCsvParser.init(
+            allocator,
+            @ptrCast(conn),
+        );
         defer parser.deinit();
 
         parser.executeCopy(copy_query) catch |err| {
@@ -344,7 +365,7 @@ fn generateIncrementalSnapshot(
         };
 
         // Collect rows into array
-        var rows_list = std.ArrayList(pg_copy_csv.CsvRow){};
+        var rows_list: std.ArrayList(pg_copy_csv.CsvRow) = .{};
         defer {
             for (rows_list.items) |*row| {
                 row.deinit();
@@ -374,6 +395,7 @@ fn generateIncrementalSnapshot(
             snapshot_id,
             lsn_str,
             batch,
+            format,
         );
         defer allocator.free(encoded);
 
@@ -408,7 +430,7 @@ fn generateIncrementalSnapshot(
         offset_rows += num_rows;
 
         // If we got fewer rows than chunk_size, we're done
-        if (num_rows < config.Snapshot.chunk_size) {
+        if (num_rows < chunk_size) {
             break;
         }
     }
@@ -422,6 +444,7 @@ fn generateIncrementalSnapshot(
         lsn_str,
         batch,
         total_rows,
+        format,
     );
 
     log.info("✅ Snapshot complete: {s} ({d} batches, {d} rows)", .{
@@ -440,8 +463,8 @@ fn encodeChunkToMessagePack(result: ?*c.PGresult, allocator: std.mem.Allocator) 
     defer buffer.deinit(allocator);
 
     const ArrayListStream = struct {
-        list: *std.ArrayList(u8),
         allocator: std.mem.Allocator,
+        list: *std.ArrayList(u8),
 
         const WriteError = std.mem.Allocator.Error;
         const ReadError = error{};
@@ -458,8 +481,14 @@ fn encodeChunkToMessagePack(result: ?*c.PGresult, allocator: std.mem.Allocator) 
         }
     };
 
-    var write_stream = ArrayListStream{ .list = &buffer, .allocator = allocator };
-    var read_stream = ArrayListStream{ .list = &buffer, .allocator = allocator };
+    var write_stream = ArrayListStream{
+        .list = &buffer,
+        .allocator = allocator,
+    };
+    var read_stream = ArrayListStream{
+        .list = &buffer,
+        .allocator = allocator,
+    };
 
     var packer = msgpack.Pack(
         *ArrayListStream,
@@ -509,9 +538,13 @@ fn encodeCsvRowsToMessagePack(
     snapshot_id: []const u8,
     lsn: []const u8,
     chunk: u32,
+    format: encoder_mod.Format,
 ) ![]const u8 {
     // Use unified encoder (always MessagePack for snapshots)
-    var encoder = encoder_mod.Encoder.init(allocator, .msgpack);
+    var encoder = encoder_mod.Encoder.init(
+        allocator,
+        format, // changed to use passed format
+    );
     defer encoder.deinit();
 
     // Build data array (array of row maps)
@@ -559,9 +592,13 @@ fn publishSnapshotMetadata(
     lsn: []const u8,
     batch_count: u32,
     row_count: u64,
+    format: encoder_mod.Format,
 ) !void {
     // Use unified encoder (always MessagePack for snapshots)
-    var encoder = encoder_mod.Encoder.init(allocator, .msgpack);
+    var encoder = encoder_mod.Encoder.init(
+        allocator,
+        format, // changed to use passed format
+    );
     defer encoder.deinit();
 
     var meta_map = encoder.createMap();
@@ -577,6 +614,7 @@ fn publishSnapshotMetadata(
     const encoded = try encoder.encode(meta_map);
     defer allocator.free(encoded);
 
+    // sentinel for the C-API
     const subject = try std.fmt.allocPrintSentinel(
         allocator,
         config.Snapshot.meta_subject_pattern,
@@ -593,5 +631,9 @@ fn publishSnapshotMetadata(
 
 /// Generate snapshot ID based on current timestamp
 fn generateSnapshotId(allocator: std.mem.Allocator) ![]const u8 {
-    return try std.fmt.allocPrint(allocator, "snap-{d}", .{std.time.timestamp()});
+    return try std.fmt.allocPrint(
+        allocator,
+        "snap-{d}",
+        .{std.time.timestamp()},
+    );
 }

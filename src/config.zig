@@ -213,6 +213,78 @@ pub const Buffers = struct {
     pub const url_buffer_size = 256;
 };
 
+/// Runtime configuration combining compile-time defaults with CLI arguments and environment variables
+/// This struct should be passed to modules instead of having them import config.zig directly
+pub const RuntimeConfig = struct {
+    // HTTP
+    http_port: u16,
+
+    // PostgreSQL connection
+    pg_host: []const u8,
+    pg_port: u16,
+    pg_user: []const u8,
+    pg_password: []const u8,
+    pg_database: []const u8,
+
+    // PostgreSQL replication
+    slot_name: []const u8,
+    publication_name: []const u8,
+
+    // NATS
+    nats_url: []const u8,
+
+    // Batch settings
+    batch_max_events: usize,
+    batch_max_wait_ms: i64,
+    batch_max_payload_bytes: usize,
+    batch_ring_buffer_size: usize,
+
+    // Snapshot settings
+    snapshot_chunk_size: usize,
+
+    /// Create default runtime configuration from compile-time constants
+    /// Note: PostgreSQL connection fields are set to defaults that should be overridden from environment
+    pub fn defaults() RuntimeConfig {
+        return .{
+            .http_port = Http.default_port,
+            .pg_host = "127.0.0.1",
+            .pg_port = 5432,
+            .pg_user = "postgres",
+            .pg_password = "postgres",
+            .pg_database = "postgres",
+            .slot_name = Postgres.default_slot_name,
+            .publication_name = Postgres.default_publication_name,
+            .nats_url = Nats.default_url,
+            .batch_max_events = Batch.max_events,
+            .batch_max_wait_ms = Batch.max_age_ms,
+            .batch_max_payload_bytes = Batch.max_payload_bytes,
+            .batch_ring_buffer_size = Batch.ring_buffer_size,
+            .snapshot_chunk_size = Snapshot.chunk_size,
+        };
+    }
+
+    /// Free owned strings in RuntimeConfig
+    /// Only frees PostgreSQL connection strings that were allocated from environment variables
+    /// Does not free slot_name/publication_name as they reference CLI args or compile-time constants
+    pub fn deinit(self: *RuntimeConfig, allocator: std.mem.Allocator) void {
+        // Only free if not pointing to compile-time constants
+        const default_config = RuntimeConfig.defaults();
+
+        if (self.pg_host.ptr != default_config.pg_host.ptr) {
+            allocator.free(self.pg_host);
+        }
+        if (self.pg_user.ptr != default_config.pg_user.ptr) {
+            allocator.free(self.pg_user);
+        }
+        if (self.pg_password.ptr != default_config.pg_password.ptr) {
+            allocator.free(self.pg_password);
+        }
+        if (self.pg_database.ptr != default_config.pg_database.ptr) {
+            allocator.free(self.pg_database);
+        }
+    }
+};
+
 /// Get default log level based on environment
 pub fn getDefaultLogLevel() std.log.Level {
     const env_log = std.process.getEnvVarOwned(

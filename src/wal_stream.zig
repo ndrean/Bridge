@@ -106,14 +106,15 @@ pub const ReplicationStream = struct {
 
         var buffer: [*c]u8 = undefined;
 
-        // Try to receive data (non-blocking mode with async = 1)
+        // Try to receive data (non-blocking mode with async = 1) and returns the length
         const result = c.PQgetCopyData(self.conn, &buffer, 1);
 
         if (result > 0) {
-            // Got data
+            // Got data with length 'result'
             defer c.PQfreemem(buffer);
-
-            const data = buffer[0..@as(usize, @intCast(result))];
+            const len: usize = @intCast(result);
+            log.debug("len---------:{d}", .{len});
+            const data = buffer[0..len];
 
             // Parse the message
             return try self.parseWalData(data);

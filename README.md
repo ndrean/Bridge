@@ -331,6 +331,14 @@ See `docker-compose.yml` for a complete Docker setup with PostgreSQL + NATS.
 
 The native concurrency of the BEAM and Elixir makes it a natural candidate to consume "consistant" data.
 
+If we passed `--json` to the bridge, we pass `FORMAT=json` to Elixir, and without, we pass `FORMAT=msgpack`.
+
+```sh
+NATS_USER=bridge_user NATS_PASSWORD=bridge_secure_password TABLES=users,test_types MIX_ENV=prod  PG_HOST=localhost PG_PORT=5432 PG_USER=postgres PG_PASSWORD=postgres_password PG_DB=postgres \
+FORMAT=json \
+iex -S mix
+```
+
 **1. Fetch Schemas**
 
 ```elixir

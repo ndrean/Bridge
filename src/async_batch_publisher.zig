@@ -1,3 +1,7 @@
+//! Async batch publisher that offloads flushing to a dedicated thread.
+//!
+//! It holds the complete pipeline: Decode pgoutput tuple → Create CDC event → Enqueue → Batch encoding → Publish to NATS → LSN confirmation tracking
+
 const std = @import("std");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
@@ -7,6 +11,7 @@ const pgoutput = @import("pgoutput.zig");
 const SPSCQueue = @import("spsc_queue.zig").SPSCQueue;
 const Config = @import("config.zig");
 const encoder_mod = @import("encoder.zig");
+const Metrics = @import("metrics.zig").Metrics;
 
 pub const log = std.log.scoped(.async_batch_publisher);
 
@@ -16,6 +21,7 @@ pub const AsyncBatchPublisher = struct {
     publisher: *nats_publisher.Publisher,
     config: batch_publisher.BatchConfig,
     format: encoder_mod.Format,
+    metrics: ?*Metrics, // Optional metrics reference
 
     // Lock-free event queue (SPSC: Single Producer Single Consumer)
     // Producer: Main thread adding WAL events
@@ -36,16 +42,21 @@ pub const AsyncBatchPublisher = struct {
         publisher: *nats_publisher.Publisher,
         config: batch_publisher.BatchConfig,
         format: encoder_mod.Format,
+        metrics: ?*Metrics,
+        runtime_config: *const Config.RuntimeConfig,
     ) !AsyncBatchPublisher {
-        // Initialize lock-free queue with power-of-2 capacity
-        // 4096 events = can buffer ~8 batches worth of events at max_events=500
-        const event_queue = try SPSCQueue(batch_publisher.CDCEvent).init(allocator, Config.Batch.ring_buffer_size);
+        // Initialize lock-free queue with power-of-2 capacity from runtime config
+        const event_queue = try SPSCQueue(batch_publisher.CDCEvent).init(
+            allocator,
+            runtime_config.batch_ring_buffer_size,
+        );
 
         return AsyncBatchPublisher{
             .allocator = allocator,
             .publisher = publisher,
             .config = config,
             .format = format,
+            .metrics = metrics,
             .event_queue = event_queue,
             .last_confirmed_lsn = std.atomic.Value(u64).init(0),
             .fatal_error = std.atomic.Value(bool).init(false),
@@ -165,7 +176,111 @@ pub const AsyncBatchPublisher = struct {
         log.debug("Event added to lock-free queue", .{});
     }
 
+    /// Process CDC event from pgoutput format and enqueue for publishing
+    /// This encapsulates the entire CDC event processing pipeline.
+    /// Returns the event's LSN for tracking, or null if the event was filtered out.
+    pub fn processCdcEvent(
+        self: *AsyncBatchPublisher,
+        rel: pgoutput.RelationMessage,
+        tuple_data: pgoutput.TupleData,
+        operation: []const u8,
+        wal_end: u64,
+    ) !void {
+        // Decode tuple data to get actual column values
+        // Use allocator so decoded values survive and are owned by the event
+        var decoded_values = pgoutput.decodeTuple(
+            self.allocator,
+            tuple_data,
+            rel.columns,
+        ) catch |err| {
+            log.warn("⚠️ Failed to decode tuple: {}", .{err});
+            return;
+        };
+        // NOTE: addEvent() takes ownership of decoded_values.
+        // The flush thread will free them after publishing.
+        errdefer {
+            // Only free on error - if addEvent() fails
+            for (decoded_values.items) |column| {
+                switch (column.value) {
+                    .text => |txt| self.allocator.free(txt),
+                    .numeric => |num| self.allocator.free(num),
+                    .array => |arr| self.allocator.free(arr),
+                    .jsonb => |jsn| self.allocator.free(jsn),
+                    .bytea => |byt| self.allocator.free(byt),
+                    else => {}, // int32, int64, float64, boolean, null don't need freeing
+                }
+            }
+            decoded_values.deinit(self.allocator);
+        }
+
+        // Extract ID value for logging (if present)
+        // Optimize: check length first before memcmp (most column names aren't "id")
+        var id_buf: [64]u8 = undefined;
+        const id_str = blk: {
+            for (decoded_values.items) |column| {
+                // Quick rejection: check length first (avoid memcmp for wrong-length names)
+                if (column.name.len == 2 and column.name[0] == 'i' and column.name[1] == 'd') {
+                    break :blk switch (column.value) {
+                        .int32 => |v| std.fmt.bufPrint(&id_buf, "{d}", .{v}) catch "?",
+                        .int64 => |v| std.fmt.bufPrint(&id_buf, "{d}", .{v}) catch "?",
+                        .text => |v| if (v.len <= id_buf.len) v else "?",
+                        else => "?",
+                    };
+                }
+            }
+            break :blk null;
+        };
+
+        // Convert operation to lowercase for NATS subject
+        const operation_lower = switch (operation[0]) {
+            'I' => "insert", // INSERT
+            'U' => "update", // UPDATE
+            'D' => "delete", // DELETE
+            else => unreachable, // Only these 3 operations exist in CDC
+        };
+
+        // Create NATS subject
+        var subject_buf: [Config.Buffers.subject_buffer_size]u8 = undefined;
+        const subject = try std.fmt.bufPrintZ(
+            &subject_buf,
+            "{s}.{s}.{s}",
+            .{ Config.Nats.subject_cdc_prefix, rel.name, operation_lower },
+        );
+
+        // Generate message ID from WAL LSN for idempotent delivery
+        var msg_id_buf: [Config.Buffers.msg_id_buffer_size]u8 = undefined;
+        const msg_id = try std.fmt.bufPrint(
+            &msg_id_buf,
+            "{x}-{s}-{s}",
+            .{ wal_end, rel.name, operation_lower },
+        );
+
+        // Add to batch publisher with column data, relation_id, and LSN
+        try self.addEvent(
+            subject,
+            rel.name,
+            operation,
+            msg_id,
+            rel.relation_id,
+            decoded_values,
+            wal_end,
+        );
+
+        // Update metrics if available
+        if (self.metrics) |m| {
+            m.incrementCdcEvents();
+        }
+
+        // Log single line with table, operation, and ID
+        if (id_str) |id| {
+            log.info("{s} {s}.{s} id={s} → {s}", .{ operation, rel.namespace, rel.name, id, subject });
+        } else {
+            log.info("{s} {s}.{s} → {s}", .{ operation, rel.namespace, rel.name, subject });
+        }
+    }
+
     /// Get the last LSN that was successfully confirmed by NATS
+    /// Called only when ACK thresholds are met (bytes/time/keepalive)
     pub fn getLastConfirmedLsn(self: *AsyncBatchPublisher) u64 {
         return self.last_confirmed_lsn.load(.seq_cst);
     }
@@ -200,8 +315,7 @@ pub const AsyncBatchPublisher = struct {
         defer {
             // Clean up on thread exit
             for (batch.items) |*event| {
-                var mut_event = event.*;
-                mut_event.deinit(self.allocator);
+                event.deinit(self.allocator);
             }
             batch.deinit(self.allocator);
         }
@@ -226,7 +340,6 @@ pub const AsyncBatchPublisher = struct {
 
                 current_payload_size += event_size;
             }
-
             const now = std.time.milliTimestamp();
             const time_elapsed = now - last_flush_time;
 
@@ -259,6 +372,13 @@ pub const AsyncBatchPublisher = struct {
                 current_payload_size = 0;
 
                 last_flush_time = now;
+
+                // Update queue usage metrics after flushing batch
+                // Queue usage has meaningfully changed - we just drained events
+                if (self.metrics) |m| {
+                    const queue_usage = self.getQueueUsage();
+                    m.updateQueueUsage(queue_usage);
+                }
             } else if (batch.items.len == 0) {
                 // No events available
                 // Check if we should stop immediately (no pending work)

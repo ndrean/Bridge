@@ -6,6 +6,8 @@ defmodule Consumer.Application do
 
   @impl true
   def start(_type, _args) do
+    :persistent_term.put(:format, System.get_env("FORMAT") || "msgpack")
+
     children = [
       Producer.Repo,
       {Task.Supervisor, name: MyTaskSupervisor},
@@ -21,21 +23,20 @@ defmodule Consumer.Application do
   end
 
   defp get_tables do
-    case System.get_env("TABLES") do
-      nil -> ["users", "test_types"]
-      tables_str -> String.split(tables_str, ",") |> Enum.map(&String.trim/1)
-    end
+    System.get_env("TABLES")
+    |> String.split(",")
+    |> Enum.map(&String.trim/1)
   end
 
   defp args do
     [
-      hostname: System.get_env("POSTGRES_HOST") || "localhost",
-      port: String.to_integer(System.get_env("POSTGRES_PORT") || "5432"),
-      username: System.get_env("PG_USER") || "postgres",
-      password: System.get_env("PG_PASSWORD") || "postgres",
-      database: System.get_env("POSTGRES_DB") || "postgres",
+      hostname: System.fetch_env!("PG_HOST"),
+      port: String.to_integer(System.fetch_env!("PG_PORT")),
+      username: System.fetch_env!("PG_USER"),
+      password: System.fetch_env!("PG_PASSWORD"),
+      database: System.fetch_env!("PG_DB"),
       name: PgEx,
-      tables: get_tables() || ["users", "orders"]
+      tables: get_tables()
     ]
   end
 

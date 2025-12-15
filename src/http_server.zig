@@ -10,6 +10,7 @@ pub const log = std.log.scoped(.http_server);
 pub const Server = struct {
     allocator: std.mem.Allocator,
     address: std.net.Address,
+    port: u16,
     should_stop: *std.atomic.Value(bool),
     metrics: ?*metrics_mod.Metrics,
     nats_publisher: ?*nats_publisher.Publisher,
@@ -25,6 +26,7 @@ pub const Server = struct {
         return Server{
             .allocator = allocator,
             .address = try std.net.Address.parseIp4("0.0.0.0", port),
+            .port = port,
             .should_stop = should_stop,
             .metrics = metrics,
             .nats_publisher = nats_pub,
@@ -61,7 +63,7 @@ pub const Server = struct {
         });
         defer server.deinit();
 
-        log.info("✅ HTTP server listening on http://0.0.0.0:{d}", .{self.address.getPort()});
+        log.info("✅ HTTP server listening on http://0.0.0.0:{d}", .{self.port});
         log.info("ℹ️ Available endpoints:", .{});
         log.info("  GET  /health         - Health check", .{});
         log.info("  GET  /status         - Bridge status (JSON)", .{});
@@ -193,7 +195,8 @@ pub const Server = struct {
                 \\  "nats_reconnect_count": {d},
                 \\  "slot_active": {s},
                 \\  "wal_lag_bytes": {d},
-                \\  "wal_lag_mb": {d}
+                \\  "wal_lag_mb": {d},
+                \\  "queue_usage_percent": {d}
                 \\}}
                 \\
             , .{
@@ -208,6 +211,7 @@ pub const Server = struct {
                 if (snap.slot_active) "true" else "false",
                 snap.wal_lag_bytes,
                 snap.wal_lag_bytes / (1024 * 1024), // Convert to MB
+                snap.queue_usage_percent,
             });
 
             try sendResponse(
@@ -272,6 +276,10 @@ pub const Server = struct {
                 \\# TYPE bridge_wal_lag_bytes gauge
                 \\bridge_wal_lag_bytes {d}
                 \\
+                \\# HELP bridge_queue_usage_percent Event queue usage percentage (0-100)
+                \\# TYPE bridge_queue_usage_percent gauge
+                \\bridge_queue_usage_percent {d}
+                \\
             , .{
                 snap.uptime_seconds,
                 snap.wal_messages_received,
@@ -282,6 +290,7 @@ pub const Server = struct {
                 snap.nats_reconnect_count,
                 if (snap.slot_active) @as(u8, 1) else @as(u8, 0),
                 snap.wal_lag_bytes,
+                snap.queue_usage_percent,
             });
 
             try sendResponse(

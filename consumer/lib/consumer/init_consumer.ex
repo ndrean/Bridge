@@ -44,17 +44,23 @@ defmodule Consumer.Init do
 
   @impl true
   def handle_message(message, state) do
-    # dbg(message.topic)
+    dbg(message.topic)
+    format = :persistent_term.get(:format)
 
     try do
-      # Decode MessagePack payload
       Task.Supervisor.start_child(MyTaskSupervisor, fn ->
-        _decoded = Msgpax.unpack!(message.body)
-        # TODO: insert into DB based on schema in state
-        Logger.info("[INIT Consumer] Processed snapshot chunk message")
-      end)
+        decoded =
+          case format do
+            "json" ->
+              _decoded = Jason.decode!(message.body) |> dbg()
 
-      # dbg(decoded)
+            "msgpack" ->
+              _decoded = Msgpax.unpack!(message.body) |> dbg()
+          end
+
+        # TODO: insert into DB based on schema in state
+        Logger.info("[INIT Consumer] Processed snapshot chunk message: #{inspect(decoded)}")
+      end)
 
       {:ack, state}
     rescue
@@ -85,18 +91,18 @@ defmodule Consumer.Init do
       Enum.reduce(tables, [], fn table_name, acc ->
         case Gnat.Jetstream.API.KV.get_value(:gnat, "schemas", table_name) do
           schema_data when is_binary(schema_data) ->
-            # dbg(Jason.decode!(schema_data))
+            case :persistent_term.get(:format) do
+              "json" ->
+                [Jason.decode!(schema_data) | acc]
 
-            case Msgpax.unpack(schema_data) do
-              {:ok, schema} ->
+              "msgpack" ->
+                {:ok, schema} = Msgpax.unpack(schema_data)
+
                 Logger.info(
                   "[INIT Consumer] Fetched schema from KV for table '#{table_name}': \n#{inspect(schema)}\n"
                 )
 
                 [schema | acc]
-
-              _ ->
-                [:err | acc]
             end
 
           _ ->

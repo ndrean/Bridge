@@ -42,7 +42,10 @@ defmodule Consumer.MixProject do
       {:ecto_sql, "~> 3.13"},
       {:req, "~> 0.5"},
       {:protobuf, "~> 0.15.0"},
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
     ]
   end
 

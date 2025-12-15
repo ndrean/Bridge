@@ -24,5 +24,5 @@ config :consumer,
   generators: [timestamp_type: :utc_datetime]
 
 config :consumer, Producer.Repo,
-  url: System.get_env("DATABASE_URL") || "ecto://postgres:postgres@localhost/postgres",
+  url: System.get_env("DATABASE_URL") || "ecto://postgres:postgres_password@localhost/postgres",
   pool_size: String.to_integer(System.get_env("POOL_SIZE") || "5")

@@ -33,6 +33,7 @@ defmodule PgProducer do
 
   @impl GenServer
   def init(opts) do
+    dbg(opts)
     tables = Keyword.get(opts, :tables, ["users"])
     {:ok, pid} = Postgrex.start_link(opts)
     Enum.each(tables, fn table -> create_table(table, pid) end)
@@ -100,7 +101,6 @@ defmodule PgProducer do
       )
       |> Stream.run()
     end)
-    |> dbg()
 
     {:reply, :ok, state}
   end

@@ -25,6 +25,11 @@ pub const Metrics = struct {
     wal_lag_bytes: std.atomic.Value(u64),
     last_wal_check_time: std.atomic.Value(i64),
 
+    // Queue metrics (atomic)
+    // Stored as integer percentage (0-100) to avoid f64 atomic operations
+    queue_usage_percent: std.atomic.Value(u32),
+
+    /// Initialize metrics struct with zeroed atomic counters
     pub fn init() Metrics {
         return .{
             .start_time = std.time.timestamp(),
@@ -39,6 +44,7 @@ pub const Metrics = struct {
             .slot_active = std.atomic.Value(bool).init(false),
             .wal_lag_bytes = std.atomic.Value(u64).init(0),
             .last_wal_check_time = std.atomic.Value(i64).init(0),
+            .queue_usage_percent = std.atomic.Value(u32).init(0),
         };
     }
 
@@ -82,6 +88,13 @@ pub const Metrics = struct {
         self.last_wal_check_time.store(std.time.timestamp(), .monotonic);
     }
 
+    /// Lock-free queue usage update
+    /// Takes percentage as f64 (0.0 to 1.0) and stores as integer (0-100)
+    pub fn updateQueueUsage(self: *Metrics, usage_ratio: f64) void {
+        const percent = @as(u32, @intFromFloat(usage_ratio * 100.0));
+        self.queue_usage_percent.store(percent, .monotonic);
+    }
+
     /// Get current uptime in seconds (lock-free read)
     pub fn getUptimeSeconds(self: *Metrics) i64 {
         return std.time.timestamp() - self.start_time;
@@ -102,6 +115,7 @@ pub const Metrics = struct {
         slot_active: bool,
         wal_lag_bytes: u64,
         last_wal_check_time: i64,
+        queue_usage_percent: u32, // 0-100
     };
 
     /// Get a lock-free snapshot of all metrics
@@ -130,6 +144,7 @@ pub const Metrics = struct {
             .slot_active = self.slot_active.load(.monotonic),
             .wal_lag_bytes = self.wal_lag_bytes.load(.monotonic),
             .last_wal_check_time = self.last_wal_check_time.load(.monotonic),
+            .queue_usage_percent = self.queue_usage_percent.load(.monotonic),
         };
     }
 };

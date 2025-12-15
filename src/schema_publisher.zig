@@ -5,7 +5,7 @@
 //! - Schema change notifications to CDC stream (when relation_id changes)
 //!
 //! Schema information is sourced from PostgreSQL's information_schema and
-//! published as MessagePack payloads for consumers to parse.
+//! published as MessagePack | JSON payloads for consumers to parse.
 
 const std = @import("std");
 const config = @import("config.zig");

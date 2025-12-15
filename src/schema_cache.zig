@@ -18,14 +18,14 @@ pub const log = std.log.scoped(.schema_cache);
 /// from multiple threads (in our case, only the main thread uses this).
 pub const SchemaCache = struct {
     // Map: table_name -> relation_id
-    cache: std.StringHashMap(u32),
     allocator: std.mem.Allocator,
+    cache: std.StringHashMap(u32),
 
     /// Initialize an empty schema cache
     pub fn init(allocator: std.mem.Allocator) SchemaCache {
         return .{
-            .cache = std.StringHashMap(u32).init(allocator),
             .allocator = allocator,
+            .cache = std.StringHashMap(u32).init(allocator),
         };
     }
 

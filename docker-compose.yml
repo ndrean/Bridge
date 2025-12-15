@@ -1,6 +1,5 @@
 services:
   postgres:
-    # image: quay.io/debezium/example-postgres:3.0
     image: postgres:18
     container_name: postgres
     env_file:
@@ -9,12 +8,11 @@ services:
       POSTGRES_PASSWORD: ${PG_PASSWORD}
       POSTGRES_USER: ${PG_USER}
       POSTGRES_DB: postgres
-      POSTGRES_PORT: ${PG_PORT:-5432}
+      POSTGRES_PORT: ${PG_PORT}
     ports:
-      - "${PG_PORT:-5432}:5432"
+      - "${PG_PORT}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/
-      # - ./postgres-init.sql:/docker-entrypoint-initdb.d/init.sql
     command:
       - "postgres"
       - "-c"
@@ -67,7 +65,7 @@ services:
     volumes:
       - nats-data:/data
       - nats-config:/config:ro
-    command: ["-js", "-m", "8222", "-c", "/config/nats-server.conf"]
+    command: [ "-js", "-m", "8222", "-c", "/config/nats-server.conf" ]
     restart: unless-stopped
     networks:
       - cdc-bridge
