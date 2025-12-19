@@ -11,6 +11,10 @@ const std = @import("std");
 const config = @import("config.zig");
 const nats_publisher = @import("nats_publisher.zig");
 const nats_kv = @import("nats_kv.zig");
+// Old lalinsky/nats.zig imports removed (obsolete trial code):
+// const nats_kv_zig = @import("nats_kv_zig.zig");
+// const nats_connection_zig = @import("nats_connection_zig.zig");
+// const nats = @import("nats");
 const pgoutput = @import("pgoutput.zig");
 const msgpack = @import("msgpack");
 const encoder_mod = @import("encoder.zig");
@@ -29,7 +33,7 @@ const ColumnInfo = struct {
     column_default: ?[]const u8,
 };
 
-/// Publish schema information to NATS CDC stream
+/// Publish schema information to NATS INIT stream
 ///
 /// Called when a schema change is detected (relation_id changed).
 /// Publishes schema metadata to "schema.{table_name}" subject.
@@ -110,7 +114,7 @@ pub fn publishSchema(
 /// Args:
 ///   allocator: Memory allocator
 ///   pg_config: PostgreSQL connection configuration
-///   publisher: NATS publisher instance
+///   publisher: NATS publisher instance (nats.c - for fallback)
 ///   monitored_tables: List of tables from the publication to publish schemas for
 ///   format: Encoding format (.msgpack or .json)
 pub fn publishInitialSchemas(
@@ -125,6 +129,7 @@ pub fn publishInitialSchemas(
     // Create a separate PostgreSQL connection (NOT replication mode)
     const conninfo = try pg_config.connInfo(allocator, false);
     defer allocator.free(conninfo);
+    log.debug("------------{s}", .{conninfo});
 
     const conn = c.PQconnectdb(conninfo.ptr);
     if (conn == null) {
@@ -272,7 +277,7 @@ pub fn publishInitialSchemas(
     log.info("✅ Published initial schemas for {d} tables", .{table_schemas.count()});
 }
 
-/// Publish a single table's schema to NATS KV store
+/// Publish a single table's schema to NATS KV store (using nats.c)
 ///
 /// Internal helper function called by publishInitialSchemas.
 /// Encodes column metadata and stores in KV with key: table_name
@@ -325,17 +330,17 @@ fn publishTableSchema(
     const encoded = try encoder.encode(schema_map);
     defer allocator.free(encoded);
 
-    // Open KV store for schemas
+    // Use nats.c KV store (lalinsky/nats.zig trial code removed)
     var kv_store = try nats_kv.KVStore.open(publisher.js, config.Nats.schema_kv_bucket, allocator);
     defer kv_store.deinit();
 
-    // Put schema into KV with key: table_name
+    // Put schema into KV with key: table_name (nats.c requires null-terminated strings)
     const key = try std.fmt.allocPrintSentinel(allocator, "{s}", .{table_only}, 0);
     defer allocator.free(key);
 
     const revision = try kv_store.put(key, encoded);
 
-    log.info("📋 Published schema to KV → schemas.{s} ({d} columns, {d} bytes, revision={d})", .{
+    log.info("📋 Published schema to KV (nats.c) → schemas.{s} ({d} columns, {d} bytes, revision={d})", .{
         table_only,
         columns.len,
         encoded.len,

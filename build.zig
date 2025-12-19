@@ -100,24 +100,6 @@ pub fn build(b: *std.Build) void {
     // Build nats.c library if needed
     const nats_build_step = buildNats(b);
 
-    // Protobuf code generation
-    // const protobuf_dep = b.dependency("protobuf", .{
-    //     .target = target,
-    //     .optimize = optimize,
-    // });
-
-    // TODO: Update gen-proto step for new protobuf API
-    // `zig build gen-proto` step to generate Zig files from .proto definitions
-    // const gen_proto = b.step("gen-proto", "Generate Zig files from protocol buffer definitions");
-    // const protoc_step = protobuf.RunProtocStep.create(protobuf_dep.builder, target, .{
-    //     .destination_directory = b.path("src/proto"),
-    //     .source_files = &.{
-    //         "protocol/pg_logicaldec.proto",
-    //     },
-    //     .include_directories = &.{},
-    // });
-    // gen_proto.dependOn(&protoc_step.step);
-
     const mod = b.addModule("bridge", .{
         .root_source_file = b.path("src/bridge.zig"),
         .target = target,
@@ -127,6 +109,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    // Add nats.zig as a local module (skip build dependencies to avoid Zig 0.14 API issues)
+    // We import the root.zig directly instead of using b.dependency() which triggers the build of mailbox and zul dependencies that aren't Zig 0.15 compatible
+    // const nats_mod = b.addModule("nats", .{
+    //     .root_source_file = b.path("src/nats/src/root.zig"),
+    //     .target = target,
+    //     .optimize = optimize,
+    // });
 
     // Create local zstd module (links system libzstd)
     const zstd_mod = b.addModule("zstd", .{
@@ -146,6 +136,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "bridge", .module = mod },
                 .{ .name = "msgpack", .module = msgpack.module("msgpack") },
                 .{ .name = "zstd", .module = zstd_mod },
+                // .{ .name = "nats", .module = nats_mod },
             },
         }),
     });
@@ -157,7 +148,6 @@ pub fn build(b: *std.Build) void {
     exe.addIncludePath(b.path("libs/nats-install/include"));
     exe.addLibraryPath(b.path("libs/nats-install/lib"));
     exe.addObjectFile(b.path("libs/nats-install/lib/libnats_static.a"));
-    // exe.root_module.addImport("protobuf", protobuf_dep.module("protobuf"));
 
     // Link OpenSSL (required for NATS TLS support)
     exe.linkSystemLibrary("ssl");
@@ -211,6 +201,10 @@ pub fn build(b: *std.Build) void {
     const clean_nats_step = b.step("clean-nats", "Clean nats.c build artifacts");
     const rm_nats_build = b.addSystemCommand(&.{ "rm", "-rf", "libs/nats.c/build", "libs/nats-install" });
     clean_nats_step.dependOn(&rm_nats_build.step);
+
+    // ===== Test executables =====
+    // Old lalinsky/nats.zig test files removed (obsolete trial code)
+    // If needed, new tests for g41797/nats can be added here
 
     // ===== Commented out test executables - files moved to src/test_files/ =====
     // Uncomment and update paths if needed for testing

@@ -1,0 +1,24 @@
+# NATS Server Configuration Template
+# This file uses environment variable placeholders: ${NATS_BRIDGE_USER}, ${NATS_BRIDGE_PASSWORD}
+# The nats-config-gen container automatically generates the final config at startup
+port: 4222
+
+# Enable JetStream
+jetstream {
+    # Store directory (mounted Docker volume)
+    store_dir: "/data"
+
+    # Max memory and storage
+    max_memory_store: 1GB
+    max_file_store: 10GB
+    
+}
+
+# Logging
+debug: false
+trace: false
+logtime: true
+
+authorization {
+    token: "${NATS_TOKEN}"
+}

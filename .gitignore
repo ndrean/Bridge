@@ -21,3 +21,5 @@ postgres-data/
 *.tar.xz
 
 src/test_files/
+/docs/
+/demo/

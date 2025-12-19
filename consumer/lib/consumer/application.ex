@@ -1,5 +1,6 @@
 defmodule Consumer.Application do
   @moduledoc false
+  alias GenLSP.Requests.Initialize
 
   use Application
   require Logger
@@ -13,6 +14,7 @@ defmodule Consumer.Application do
       {Task.Supervisor, name: MyTaskSupervisor},
       {Gnat.ConnectionSupervisor, gnat_supervisor_settings()},
       {PgProducer, args()},
+      {Initializer, []},
       # JetStream pull consumer for CDC events
       {Consumer.Init, consumer_init_settings()},
       {Consumer.Cdc, consumer_cdc_settings()}

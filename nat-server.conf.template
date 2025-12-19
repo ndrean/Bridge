@@ -19,16 +19,3 @@ debug: false
 trace: false
 logtime: true
 
-accounts {
-  BRIDGE: {
-    jetstream: {
-      max_memory: 1GB
-      max_file: 10GB
-      max_streams: 10
-      max_consumers: 10
-    }
-    users: [
-      { user: "${NATS_BRIDGE_USER}", password: "${NATS_BRIDGE_PASSWORD}" }
-    ]
-  }
-}

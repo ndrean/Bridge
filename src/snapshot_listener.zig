@@ -18,6 +18,13 @@ const encoder_mod = @import("encoder.zig");
 const zstd = @import("zstd");
 const nats_kv = @import("nats_kv.zig");
 const RuntimeConfig = @import("config.zig").RuntimeConfig;
+// g41797/nats library (vendored with mailbox included, zul replaced with std)
+// Currently commented out due to Zig 0.14→0.15 API incompatibilities:
+// - readAll() removed in Zig 0.15 (Client.zig:204)
+// - error set changes (messages.zig:257)
+// - message structure changes (snapshot_listener.zig:187)
+// TODO: Uncomment when g41797/nats is ported to Zig 0.15+
+// const nats = @import("nats");
 
 pub const log = std.log.scoped(.snapshot_listener);
 
@@ -98,6 +105,7 @@ pub const SnapshotListener = struct {
 
     /// Background listening loop (internal)
     fn listenLoop(self: *SnapshotListener) !void {
+        // Run nats.c subscriber (production)
         try listenForSnapshotRequests(
             self.allocator,
             self.pg_config,
@@ -111,6 +119,77 @@ pub const SnapshotListener = struct {
             self.js_ctx,
         );
     }
+
+    // ========================================================================
+    // PoC: g41797/nats Core NATS subscriber (COMMENTED OUT - Zig 0.15 incompatible)
+    // ========================================================================
+    // This PoC demonstrates using the g41797/nats pure Zig library for Core NATS
+    // pub/sub instead of nats.c. It was successfully vendored with:
+    // - mailbox.zig vendored into src/nats/src/mailbox.zig
+    // - zul dependency replaced with std.crypto for UUID generation
+    //
+    // However, the library itself needs porting to Zig 0.15 API:
+    // 1. Client.zig:204 - readAll() removed, need to use read() with loop
+    // 2. messages.zig:257 - error set mismatch (Interrupted not expected)
+    // 3. Message structure - .subject field not in Envelope struct
+    //
+    // Uncomment when g41797/nats is updated for Zig 0.15+
+    // ========================================================================
+    //
+    // /// PoC: Core NATS subscriber (no JetStream, just pub/sub)
+    // fn testCoreNatsSubscriber(
+    //     allocator: std.mem.Allocator,
+    //     should_stop: *std.atomic.Value(bool),
+    // ) !void {
+    //     log.info("🧪 PoC: Connecting to Core NATS with g41797/nats...", .{});
+    //
+    //     // Create Core NATS connection
+    //     var core = nats.Core{};
+    //     const connect_opts = nats.protocol.ConnectOpts{}; // Use defaults
+    //     core.CONNECT(allocator, connect_opts) catch |err| {
+    //         log.err("🧪 PoC: Failed to connect: {}", .{err});
+    //         return err;
+    //     };
+    //     defer core.DISCONNECT();
+    //
+    //     log.info("🧪 PoC: Connected! Subscribing to 'init.schema' with Core NATS...", .{});
+    //
+    //     // Subscribe to init.schema
+    //     const sid = "1"; // Subscription ID
+    //     core.SUB("init.schema", null, sid) catch |err| {
+    //         log.err("🧪 PoC: Failed to subscribe: {}", .{err});
+    //         return err;
+    //     };
+    //
+    //     log.info("🧪 PoC: Subscribed! Waiting for messages from Elixir on 'init.schema'...", .{});
+    //
+    //     // Listen for messages (using internal connection)
+    //     while (!should_stop.load(.acquire)) {
+    //         if (core.connection) |conn| {
+    //             const msg = conn.waitMessageNMT(nats.protocol.SECNS * 5, null) catch |err| {
+    //                 if (err == error.Timeout) {
+    //                     log.debug("🧪 PoC: No message (5s timeout)", .{});
+    //                     continue;
+    //                 }
+    //                 log.err("🧪 PoC: Error receiving: {}", .{err});
+    //                 std.Thread.sleep(1 * std.time.ns_per_s);
+    //                 continue;
+    //             };
+    //             defer conn.reuse(msg);
+    //
+    //             const payload = msg.letter.getPayload() orelse "(empty)";
+    //             log.info("🧪 PoC: ✅ Received from Elixir on '{s}': {s}", .{
+    //                 msg.subject,
+    //                 payload,
+    //             });
+    //         } else {
+    //             log.err("🧪 PoC: Connection lost", .{});
+    //             break;
+    //         }
+    //     }
+    //
+    //     log.info("🧪 PoC: Subscriber stopping...", .{});
+    // }
 };
 
 /// Publish snapshot error to NATS for consumer feedback

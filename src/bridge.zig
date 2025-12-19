@@ -249,6 +249,15 @@ pub fn main() !void {
     var publisher = try initNatsPublisher(allocator, &metrics);
     defer publisher.deinit();
 
+    // Initialize nats.zig connection for KV operations
+    // DISABLED: nats.zig has multiple stability issues:
+    // 1. "unreachable" panic in parser when opening KV buckets with auth
+    // 2. Segfault in JSON parsing during connection (arena allocator corruption)
+    // Sticking with nats.c (stable) until nats.zig matures
+    // const nats_conn_zig = @import("nats_connection_zig.zig");
+    // var nats_kv_conn = try nats_conn_zig.NatsConnection.init(allocator);
+    // defer nats_kv_conn.deinit();
+
     // Make publisher available to HTTP server for stream management
     http_srv.nats_publisher = &publisher;
 

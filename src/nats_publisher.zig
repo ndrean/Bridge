@@ -163,7 +163,9 @@ pub const Publisher = struct {
             );
 
         if (nats_user != null and nats_password != null) {
-            log.info("NATS authentication enabled for user: {s}", .{nats_user.?});
+            log.info("NATS authentication enabled (user:password) for user: {s}", .{nats_user.?});
+        } else {
+            log.info("NATS authentication disabled (no credentials provided)", .{});
         }
 
         return Publisher{
