@@ -97,6 +97,7 @@ defmodule Consumer.Init do
   end
 
   defp fetch_schemas_from_kv do
+    :ok = Gnat.pub(:gnat, "init.schema", "Hello from Elixir!") |> dbg()
     # Get tables from environment
     tables =
       System.get_env("TABLES")
