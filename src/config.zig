@@ -163,14 +163,14 @@ pub const Snapshot = struct {
     /// NATS subject pattern for data chunks: "init.snap.<table>.<snapshot_id>.<chunk>"
     pub const data_subject_pattern = "init.snap.{s}.{s}.{d}";
 
-    /// NATS subject pattern for snapshot start notification: "init.start.<table>"
-    pub const start_subject_pattern = "init.start.{s}";
+    /// NATS subject pattern for snapshot start notification: "init.snap.start.<table>"
+    pub const start_subject_pattern = "init.snap.start.{s}";
 
-    /// NATS subject pattern for snapshot errors: "init.error.<table>"
-    pub const error_subject_pattern = "init.error.{s}";
+    /// NATS subject pattern for snapshot errors: "init.snap.error.<table>"
+    pub const error_subject_pattern = "init.snap.error.{s}";
 
-    /// NATS subject pattern for metadata: "init.meta.<table>"
-    pub const meta_subject_pattern = "init.meta.{s}";
+    /// NATS subject pattern for metadata: "init.snap.meta.<table>"
+    pub const meta_subject_pattern = "init.snap.meta.{s}";
 
     /// NATS KV bucket name for schemas
     pub const kv_bucket_schemas = "schemas";
@@ -178,8 +178,8 @@ pub const Snapshot = struct {
     /// NATS KV bucket name for zstd dictionaries
     pub const kv_bucket_dictionaries = "dictionaries";
 
-    /// Message ID pattern for data chunks: "init-<table>-<snapshot_id>-<chunk>"
-    pub const data_msg_id_pattern = "init-{s}-{s}-{d}";
+    /// Message ID pattern for data chunks: "snap-<table>-<snapshot_id>-<chunk>"
+    pub const data_msg_id_pattern = "snap-{s}-{s}-{d}";
 };
 
 /// Logging and metrics configuration
@@ -191,6 +191,27 @@ pub const Metrics = struct {
     /// Enable debug logging
     pub const debug_enabled = false;
     pub const metric_log_interval_seconds = 15;
+};
+
+/// Event classification and semantic routing configuration
+/// Enables intelligent routing of CDC events based on business logic state transitions
+///
+/// Instead of hardcoded column names, transition rules are configured per-table at runtime.
+/// The bridge doesn't make assumptions about which columns are semantically important -
+/// that's domain knowledge that belongs in the application configuration.
+///
+/// Example configuration via environment variable:
+///   TRANSITION_RULES=users:status,kyc_level;orders:state,payment_status
+///
+/// This creates table-specific rules:
+///   - "users" table watches: status, kyc_level
+///   - "orders" table watches: state, payment_status
+///   - Other tables: no transition detection (zero overhead)
+pub const EventClassification = struct {
+    /// Per-table transition column rules
+    /// Key: table name (e.g., "users", "orders")
+    /// Value: list of column names to watch for transitions
+    pub const TransitionRules = std.StringHashMap([]const []const u8);
 };
 
 /// Reconnection and retry configuration
@@ -235,6 +256,20 @@ pub const Buffers = struct {
 
     /// URL buffer size
     pub const url_buffer_size = 256;
+
+    /// Event data buffer size (per-event packed column storage)
+    /// Default: 15 → 2^15 = 32KB per event
+    /// Configurable via environment variable BASE_BUF (log2 of desired size)
+    /// If a row exceeds this size, the bridge will panic to prevent data loss
+    /// Example: BASE_BUF=16 → 64KB, BASE_BUF=14 → 16KB
+    pub const default_event_data_buffer_log2: u6 = 15; // 2^15 = 32KB
+
+    /// Ring buffer event count (number of pre-allocated event slots)
+    /// Default: 65536 events
+    /// Configurable via environment variable RING_BUFFER_COUNT
+    /// Total memory = event_count × event_buffer_size
+    /// Example: 65536 slots × 32KB = 2GB slab
+    pub const default_ring_buffer_count: usize = 65536;
 };
 
 /// Runtime configuration combining compile-time defaults with CLI arguments and environment variables
@@ -270,6 +305,9 @@ pub const RuntimeConfig = struct {
     enable_compression: bool,
     recipe: CompressionRecipe,
 
+    // Buffer settings
+    event_data_buffer_log2: u6,
+
     /// Create default runtime configuration from compile-time constants
     /// Note: PostgreSQL connection fields are set to defaults that should be overridden from environment
     pub fn defaults() RuntimeConfig {
@@ -286,10 +324,11 @@ pub const RuntimeConfig = struct {
             .batch_max_events = Batch.max_events,
             .batch_max_wait_ms = Batch.max_age_ms,
             .batch_max_payload_bytes = Batch.max_payload_bytes,
-            .batch_ring_buffer_size = Batch.ring_buffer_size,
+            .batch_ring_buffer_size = Buffers.default_ring_buffer_count,
             .snapshot_chunk_size = Snapshot.chunk_size,
             .enable_compression = false, // disabled by default
             .recipe = .binary, // optimal balance for snapshots (94% compression, 6ms/MB)
+            .event_data_buffer_log2 = Buffers.default_event_data_buffer_log2,
         };
     }
 

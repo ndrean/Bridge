@@ -13,6 +13,10 @@ jetstream {
     max_file_store: 10GB
     
 }
+websocket {
+    listen: 9222
+    no_tls: true
+}
 
 # Logging
 debug: false

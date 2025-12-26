@@ -38,7 +38,7 @@ WORKDIR /build
 COPY . .
 
 # Clean any existing builds
-RUN rm -rf libs/nats-install libs/nats.c/build libs/libpq-install zig-out zig-cache
+RUN rm -rf libs/libpq-install zig-out zig-cache
 
 RUN zig build -Doptimize=ReleaseFast
 

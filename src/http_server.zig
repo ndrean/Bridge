@@ -106,9 +106,8 @@ pub const Server = struct {
 
         log.info("👋 HTTP server stopped", .{});
 
-        // Release NATS thread-local storage
-        // This is required when user-created threads call NATS C library APIs
-        c.nats_ReleaseThreadMemory();
+        // REMOVED: nats_ReleaseThreadMemory() no longer needed with pure Zig NATS
+        // Pure Zig NATS doesn't have thread-local storage that needs cleanup
     }
 
     fn handleRequest(self: *Server, stream: std.net.Stream) !void {

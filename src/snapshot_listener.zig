@@ -9,43 +9,191 @@ const std = @import("std");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 const pg_conn = @import("pg_conn.zig");
-const nats_publisher = @import("nats_publisher.zig");
 const publication_mod = @import("publication.zig");
 const config = @import("config.zig");
 const msgpack = @import("msgpack");
 const pg_copy_csv = @import("pg_copy_csv.zig");
 const encoder_mod = @import("encoder.zig");
+const streaming_encoder = @import("streaming_encoder.zig");
 const zstd = @import("zstd");
-const nats_kv = @import("nats_kv.zig");
 const RuntimeConfig = @import("config.zig").RuntimeConfig;
-// g41797/nats library (vendored with mailbox included, zul replaced with std)
-// Currently commented out due to Zig 0.14→0.15 API incompatibilities:
-// - readAll() removed in Zig 0.15 (Client.zig:204)
-// - error set changes (messages.zig:257)
-// - message structure changes (snapshot_listener.zig:187)
-// TODO: Uncomment when g41797/nats is ported to Zig 0.15+
-// const nats = @import("nats");
+const dictionaries_cache = @import("dictionaries_cache.zig");
+const nats = @import("nats");
 
 pub const log = std.log.scoped(.snapshot_listener);
+
+/// Publish to NATS JetStream with retry logic and exponential backoff
+/// Matches the retry strategy used in batch_publisher.zig for consistency
+/// Checks should_stop flag during retries to allow graceful shutdown
+fn publishWithRetry(
+    js: *nats.JS,
+    subject: []const u8,
+    headers: ?*nats.pool.Headers,
+    payload: []const u8,
+    should_stop: *std.atomic.Value(bool),
+) !void {
+    var retry_count: u32 = 0;
+    const max_retries = 5;
+    var backoff_ms: u64 = 100; // Start with 100ms
+
+    while (!should_stop.load(.acquire)) {
+        const result = js.PUBLISH(subject, headers, payload);
+
+        if (result) |_| {
+            // SUCCESS
+            return;
+        } else |err| {
+            // FAILURE
+            log.err("❌ NATS publish failed for {s} (attempt {d}/{d}): {}", .{
+                subject,
+                retry_count + 1,
+                max_retries + 1,
+                err,
+            });
+
+            if (retry_count >= max_retries) {
+                // Exhausted retries
+                log.err("🔴 FATAL: Exhausted retries for snapshot publish to {s}", .{subject});
+                return err;
+            }
+
+            // Wait before retrying (exponential backoff), but check should_stop periodically
+            log.warn("⏳ Retrying in {d}ms...", .{backoff_ms});
+
+            // Sleep in small increments to allow faster shutdown response
+            const sleep_increment_ms = 50; // Check every 50ms
+            var elapsed_ms: u64 = 0;
+            while (elapsed_ms < backoff_ms) {
+                if (should_stop.load(.acquire)) {
+                    log.info("🛑 Shutdown requested during retry backoff - aborting", .{});
+                    return error.ShutdownRequested;
+                }
+                std.Thread.sleep(sleep_increment_ms * std.time.ns_per_ms);
+                elapsed_ms += sleep_increment_ms;
+            }
+
+            // Double the wait for next time, capped at 5 seconds
+            backoff_ms = @min(backoff_ms * 2, 5000);
+            retry_count += 1;
+        }
+    }
+
+    // If we exit the loop due to should_stop, return error
+    log.info("🛑 Shutdown requested - aborting publish", .{});
+    return error.ShutdownRequested;
+}
+
+// Global dictionary cache for pre-trained zstd dictionaries
+// Initialized once on bridge startup and read-only afterwards (thread-safe)
+var global_dictionaries: ?*dictionaries_cache.DictionariesCache = null;
+var dictionaries_mutex: std.Thread.Mutex = .{};
+var dictionaries_allocator: ?std.mem.Allocator = null;
+
+// Global dictionary manager for zstd compression with digested dictionaries
+var global_dict_manager: ?*zstd.DictionaryManager = null;
+
+/// Primary key metadata for a table (used for chunked snapshots)
+const PkMetadata = struct {
+    name: []const u8,
+    is_numeric: bool,
+
+    pub fn deinit(self: PkMetadata, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+    }
+};
+
+/// Query PostgreSQL system catalogs to discover the primary key of a table
+/// This is critical for chunked snapshots - we need to know which column to use for WHERE > last_value
+/// Supports single-column primary keys (composite keys not yet supported)
+fn getTablePrimaryKey(
+    allocator: std.mem.Allocator,
+    conn: *c.PGconn,
+    table_name: []const u8,
+) !PkMetadata {
+    // Parse schema.table or default to public
+    var schema: []const u8 = "public";
+    var table: []const u8 = table_name;
+
+    if (std.mem.indexOf(u8, table_name, ".")) |dot_idx| {
+        schema = table_name[0..dot_idx];
+        table = table_name[dot_idx + 1 ..];
+    }
+
+    // Query system catalogs for primary key column
+    const query = try std.fmt.allocPrintSentinel(
+        allocator,
+        \\SELECT a.attname, format_type(a.atttypid, a.atttypmod)
+        \\FROM pg_index i
+        \\JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+        \\WHERE i.indrelid = '"{s}"."{s}"'::regclass
+        \\  AND i.indisprimary
+        \\  AND array_length(i.indkey, 1) = 1;
+    ,
+        .{ schema, table },
+        0,
+    );
+    defer allocator.free(query);
+
+    const res = c.PQexec(conn, query.ptr);
+    defer c.PQclear(res);
+
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
+        log.err("Failed to query primary key for table '{s}': {s}", .{
+            table_name,
+            c.PQerrorMessage(conn),
+        });
+        return error.QueryFailed;
+    }
+
+    const ntuples = c.PQntuples(res);
+    if (ntuples == 0) {
+        log.err("❌ Table '{s}' has no single-column primary key. Chunked snapshots require a PK.", .{table_name});
+        return error.NoPrimaryKey;
+    }
+
+    if (ntuples > 1) {
+        log.err("❌ Table '{s}' has composite primary key. Only single-column PKs are currently supported.", .{table_name});
+        return error.CompositePrimaryKey;
+    }
+
+    const pk_name = std.mem.span(c.PQgetvalue(res, 0, 0));
+    const pk_type = std.mem.span(c.PQgetvalue(res, 0, 1));
+
+    // Determine if quotes are needed in WHERE clause (numeric types don't need quotes)
+    const is_numeric = std.mem.indexOf(u8, pk_type, "int") != null or
+        std.mem.indexOf(u8, pk_type, "serial") != null or
+        std.mem.indexOf(u8, pk_type, "bigserial") != null;
+
+    log.info("📋 Discovered primary key for '{s}': column='{s}', type='{s}', numeric={}", .{
+        table_name,
+        pk_name,
+        pk_type,
+        is_numeric,
+    });
+
+    return .{
+        .name = try allocator.dupe(u8, pk_name),
+        .is_numeric = is_numeric,
+    };
+}
 
 /// Snapshot request context passed to NATS callback
 const SnapshotContext = struct {
     allocator: std.mem.Allocator,
     pg_config: *const pg_conn.PgConf,
-    publisher: *nats_publisher.Publisher,
+    js: *nats.JS, // JetStream connection for publishing
     monitored_tables: []const []const u8,
     format: encoder_mod.Format,
     chunk_size: usize,
     enable_compression: bool,
     recipe: config.CompressionRecipe,
-    js_ctx: ?*anyopaque, // JetStream context for KV access
+    // js_ctx: ?*anyopaque, // JetStream context for KV access (optional)
 };
 
 /// Snapshot listener with thread management
 pub const SnapshotListener = struct {
     allocator: std.mem.Allocator,
     pg_config: *const pg_conn.PgConf,
-    publisher: *nats_publisher.Publisher,
     should_stop: *std.atomic.Value(bool),
     monitored_tables: []const []const u8,
     thread: ?std.Thread = null,
@@ -53,23 +201,19 @@ pub const SnapshotListener = struct {
     chunk_size: usize,
     enable_compression: bool,
     recipe: config.CompressionRecipe,
-    js_ctx: ?*anyopaque, // JetStream context for dictionary fetching
 
     /// Initialize snapshot listener (does not start the thread)
     pub fn init(
         allocator: std.mem.Allocator,
         pg_config: *const pg_conn.PgConf,
-        publisher: *nats_publisher.Publisher,
         should_stop: *std.atomic.Value(bool),
         monitored_tables: []const []const u8,
         format: encoder_mod.Format,
         runtime_config: *const config.RuntimeConfig,
-        js_ctx: ?*anyopaque,
     ) SnapshotListener {
         return .{
             .allocator = allocator,
             .pg_config = pg_config,
-            .publisher = publisher,
             .should_stop = should_stop,
             .monitored_tables = monitored_tables,
             .thread = null,
@@ -77,7 +221,6 @@ pub const SnapshotListener = struct {
             .chunk_size = runtime_config.snapshot_chunk_size,
             .enable_compression = runtime_config.enable_compression,
             .recipe = runtime_config.recipe,
-            .js_ctx = js_ctx,
         };
     }
 
@@ -99,70 +242,931 @@ pub const SnapshotListener = struct {
 
     /// Deinit - cleanup resources (call after join)
     pub fn deinit(self: *SnapshotListener) void {
-        // No resources to clean up currently
         _ = self;
+        // Cleanup global dictionaries cache
+        deinitDictionaries();
     }
 
     /// Background listening loop (internal)
     fn listenLoop(self: *SnapshotListener) !void {
-        // Run nats.c subscriber (production)
-        try listenForSnapshotRequests(
+        // Spawn schema request handler thread (nats.zig)
+        log.info("📋 Spawning schema request listener (nats.zig)...", .{});
+        const schema_thread = try std.Thread.spawn(.{}, listenForSchemaRequestsZig, .{
             self.allocator,
             self.pg_config,
-            self.publisher,
+            self.should_stop,
+            self.monitored_tables,
+            self.format,
+        });
+
+        // Spawn snapshot request handler thread (pure g41797/nats - no nats.c dependency!)
+        log.info("📸 Spawning snapshot request listener (pure g41797/nats)...", .{});
+        const snapshot_thread = try std.Thread.spawn(.{}, listenForSnapshotRequestsZig, .{
+            self.allocator,
+            self.pg_config,
             self.should_stop,
             self.monitored_tables,
             self.format,
             self.chunk_size,
             self.enable_compression,
             self.recipe,
-            self.js_ctx,
+        });
+
+        // Keep main thread alive - just sleep until stop signal
+        while (!self.should_stop.load(.seq_cst)) {
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+
+        // Wait for threads to finish
+        schema_thread.join();
+        snapshot_thread.join();
+    }
+
+    // Listens for schema requests on "init.schema" subject and responds with
+    // fresh schema data queried from PostgreSQL information_schema.
+
+    /// Column information from information_schema
+    const SchemaColumnInfo = struct {
+        name: []const u8,
+        position: u32,
+        data_type: []const u8,
+        is_nullable: bool,
+        column_default: ?[]const u8,
+    };
+
+    /// Schema request handler - listens on "init.schema" and responds with table schemas
+    /// Note: Thread functions cannot return errors - all errors must be caught internally
+    fn listenForSchemaRequestsZig(
+        allocator: std.mem.Allocator,
+        pg_config: *const pg_conn.PgConf,
+        should_stop: *std.atomic.Value(bool),
+        monitored_tables: []const []const u8,
+        format: encoder_mod.Format,
+    ) void {
+        const reconnect_delay_ms = 2000; // 2 seconds between reconnect attempts
+
+        // Outer reconnection loop
+        while (!should_stop.load(.acquire)) {
+            log.info("📋 Schema listener: Connecting to NATS with g41797/nats...", .{});
+
+            // Create Core NATS connection
+            var core = nats.Core{};
+            const connect_opts = nats.protocol.ConnectOpts{}; // Use defaults
+            core.CONNECT(allocator, connect_opts) catch |err| {
+                log.err("📋 Schema listener: Failed to connect: {} - retrying in {d}ms", .{ err, reconnect_delay_ms });
+                std.Thread.sleep(reconnect_delay_ms * std.time.ns_per_ms);
+                continue;
+            };
+            defer core.DISCONNECT();
+
+            log.info("📋 Schema listener: Connected! Subscribing to 'init.schema'...", .{});
+
+            // Subscribe to init.schema
+            const sid = "schema-listener-1";
+            core.SUB("init.schema", null, sid) catch |err| {
+                log.err("📋 Schema listener: Failed to subscribe: {} - reconnecting", .{err});
+                std.Thread.sleep(reconnect_delay_ms * std.time.ns_per_ms);
+                continue;
+            };
+
+            log.info("📋 Schema listener: ✅ Subscribed to 'init.schema'! Waiting for schema requests...", .{});
+
+            // Listen for schema requests
+            while (!should_stop.load(.acquire)) {
+                if (core.connection) |conn| {
+                    const msg = conn.waitMessageNMT(nats.protocol.SECNS * 5, null) catch |err| {
+                        if (err == error.Timeout) {
+                            continue; // Normal timeout, keep polling
+                        }
+                        log.err("📋 Schema listener: Error receiving: {} - reconnecting", .{err});
+                        std.Thread.sleep(reconnect_delay_ms * std.time.ns_per_ms);
+                        break; // Break inner loop to trigger reconnection
+                    };
+                    defer conn.reuse(msg);
+
+                    const payload = msg.letter.getPayload() orelse "(empty)";
+                    log.info("📋 Schema request received: {s}", .{payload});
+
+                    // Query PostgreSQL for schemas and publish response
+                    handleSchemaRequest(
+                        allocator,
+                        &core,
+                        pg_config,
+                        monitored_tables,
+                        format,
+                    ) catch |err| {
+                        log.err("📋 Failed to handle schema request: {}", .{err});
+                    };
+                } else {
+                    log.err("📋 Schema listener: Connection lost - reconnecting", .{});
+                    break; // Break inner loop to trigger reconnection
+                }
+            }
+        }
+
+        log.info("📋 Schema listener stopping...", .{});
+    }
+
+    /// Handle a single schema request by querying PostgreSQL and publishing response
+    fn handleSchemaRequest(
+        allocator: std.mem.Allocator,
+        core: *nats.Core,
+        pg_config: *const pg_conn.PgConf,
+        monitored_tables: []const []const u8,
+        format: encoder_mod.Format,
+    ) !void {
+        // Create PostgreSQL connection
+        const conninfo = try pg_config.connInfo(allocator, false);
+        defer allocator.free(conninfo);
+
+        const conn = c.PQconnectdb(conninfo.ptr);
+        if (conn == null) return error.ConnectionFailed;
+        defer c.PQfinish(conn);
+
+        if (c.PQstatus(conn) != c.CONNECTION_OK) {
+            return error.ConnectionFailed;
+        }
+
+        // Build IN clause for monitored tables
+        var in_clause: std.ArrayList(u8) = .empty;
+        defer in_clause.deinit(allocator);
+
+        try in_clause.appendSlice(allocator, "(");
+        for (monitored_tables, 0..) |table, i| {
+            if (i > 0) try in_clause.appendSlice(allocator, ", ");
+
+            // Extract table name if it's "schema.table" format
+            const table_name = blk: {
+                if (std.mem.indexOf(u8, table, ".")) |idx| {
+                    break :blk table[idx + 1 ..];
+                }
+                break :blk table;
+            };
+
+            try in_clause.appendSlice(allocator, "'");
+            try in_clause.appendSlice(allocator, table_name);
+            try in_clause.appendSlice(allocator, "'");
+        }
+        try in_clause.appendSlice(allocator, ")");
+
+        // Query information_schema
+        const query = try std.fmt.allocPrintSentinel(
+            allocator,
+            \\SELECT
+            \\    t.table_schema,
+            \\    t.table_name,
+            \\    c.column_name,
+            \\    c.ordinal_position,
+            \\    c.data_type,
+            \\    c.is_nullable,
+            \\    c.column_default
+            \\FROM information_schema.tables t
+            \\JOIN information_schema.columns c
+            \\    ON t.table_schema = c.table_schema
+            \\    AND t.table_name = c.table_name
+            \\WHERE t.table_schema = 'public'
+            \\    AND t.table_type = 'BASE TABLE'
+            \\    AND t.table_name IN {s}
+            \\ORDER BY t.table_name, c.ordinal_position
+        ,
+            .{in_clause.items},
+            0,
         );
+        defer allocator.free(query);
+
+        const result = c.PQexec(conn, query.ptr);
+        defer c.PQclear(result);
+
+        if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
+            return error.QueryFailed;
+        }
+
+        const num_rows: usize = @intCast(c.PQntuples(result));
+        if (num_rows == 0) {
+            log.warn("📋 No schemas found for monitored tables", .{});
+            return;
+        }
+
+        // Group columns by table
+        var table_schemas = std.StringHashMap(std.ArrayList(SchemaColumnInfo)).init(allocator);
+        defer {
+            var it = table_schemas.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                for (entry.value_ptr.items) |col| {
+                    allocator.free(col.name);
+                    allocator.free(col.data_type);
+                    if (col.column_default) |d| allocator.free(d);
+                }
+                entry.value_ptr.deinit(allocator);
+            }
+            table_schemas.deinit();
+        }
+
+        // Parse rows and group by table
+        for (0..num_rows) |ui| {
+            const i: c_int = @intCast(ui);
+            const table_schema = std.mem.span(c.PQgetvalue(result, i, 0));
+            const table_name = std.mem.span(c.PQgetvalue(result, i, 1));
+            const column_name = std.mem.span(c.PQgetvalue(result, i, 2));
+            const position_str = std.mem.span(c.PQgetvalue(result, i, 3));
+            const data_type = std.mem.span(c.PQgetvalue(result, i, 4));
+            const is_nullable_str = std.mem.span(c.PQgetvalue(result, i, 5));
+            const column_default_ptr = c.PQgetvalue(result, i, 6);
+
+            const position = try std.fmt.parseInt(u32, position_str, 10);
+            const is_nullable = std.mem.eql(u8, is_nullable_str, "YES");
+            const column_default = if (c.PQgetisnull(result, i, 6) == 1)
+                null
+            else
+                std.mem.span(column_default_ptr);
+
+            // Build full table name: schema.table
+            const full_table_name = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ table_schema, table_name });
+
+            const entry = try table_schemas.getOrPut(full_table_name);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = std.ArrayList(SchemaColumnInfo){};
+            } else {
+                allocator.free(full_table_name);
+            }
+
+            try entry.value_ptr.append(allocator, .{
+                .name = try allocator.dupe(u8, column_name),
+                .position = position,
+                .data_type = try allocator.dupe(u8, data_type),
+                .is_nullable = is_nullable,
+                .column_default = if (column_default) |d| try allocator.dupe(u8, d) else null,
+            });
+        }
+
+        // Publish each table's schema as response
+        var it = table_schemas.iterator();
+        while (it.next()) |entry| {
+            const table_name = entry.key_ptr.*;
+            const columns = entry.value_ptr.items;
+
+            try publishSchemaResponse(allocator, core, table_name, columns, format);
+        }
+
+        log.info("📋 Published schemas for {d} tables", .{table_schemas.count()});
+    }
+
+    /// Publish schema response to NATS using nats.zig
+    fn publishSchemaResponse(
+        allocator: std.mem.Allocator,
+        core: *nats.Core,
+        table_name: []const u8,
+        columns: []const SchemaColumnInfo,
+        format: encoder_mod.Format,
+    ) !void {
+        // Extract just table name (remove schema prefix)
+        const table_only = blk: {
+            if (std.mem.indexOf(u8, table_name, ".")) |idx| {
+                break :blk table_name[idx + 1 ..];
+            }
+            break :blk table_name;
+        };
+
+        // Build payload
+        var encoder = encoder_mod.Encoder.init(allocator, format);
+        defer encoder.deinit();
+
+        var schema_map = encoder.createMap();
+        defer schema_map.free(allocator);
+
+        try schema_map.put("table", try encoder.createString(table_only));
+        try schema_map.put("schema", try encoder.createString(table_name));
+        try schema_map.put("timestamp", encoder.createInt(std.time.timestamp()));
+
+        var columns_array = try encoder.createArray(columns.len);
+        for (columns, 0..) |col, i| {
+            var col_map = encoder.createMap();
+            try col_map.put("name", try encoder.createString(col.name));
+            try col_map.put("position", encoder.createInt(@intCast(col.position)));
+            try col_map.put("data_type", try encoder.createString(col.data_type));
+            try col_map.put("is_nullable", encoder.createBool(col.is_nullable));
+
+            if (col.column_default) |default_val| {
+                try col_map.put("column_default", try encoder.createString(default_val));
+            } else {
+                try col_map.put("column_default", encoder.createNull());
+            }
+
+            try columns_array.setIndex(i, col_map);
+        }
+        try schema_map.put("columns", columns_array);
+
+        const encoded = try encoder.encode(schema_map);
+        defer allocator.free(encoded);
+
+        // Publish to schema.{table_name} subject
+        const subject = try std.fmt.allocPrint(allocator, "schema.{s}", .{table_only});
+        defer allocator.free(subject);
+
+        core.PUB(subject, null, encoded) catch |err| {
+            log.err("📋 Failed to publish schema for {s}: {}", .{ table_only, err });
+            return err;
+        };
+
+        log.info("📋 ✅ Published schema → schema.{s} ({d} columns, {d} bytes)", .{
+            table_only,
+            columns.len,
+            encoded.len,
+        });
+    }
+
+    /// Snapshot request handler - listens on "snapshot.request.>" and generates snapshots
+    /// Note: Thread functions cannot return errors - all errors must be caught internally
+    fn listenForSnapshotRequestsZig(
+        allocator: std.mem.Allocator,
+        pg_config: *const pg_conn.PgConf,
+        should_stop: *std.atomic.Value(bool),
+        monitored_tables: []const []const u8,
+        format: encoder_mod.Format,
+        chunk_size: usize,
+        enable_compression: bool,
+        recipe: config.CompressionRecipe,
+    ) void {
+        const reconnect_delay_ms = 2000; // 2 seconds between reconnect attempts
+
+        // Outer reconnection loop
+        while (!should_stop.load(.acquire)) {
+            log.info("📸 Snapshot listener (nats.zig): Connecting to NATS...", .{});
+
+            // Create Core NATS connection
+            var core = nats.Core{};
+            const connect_opts = nats.protocol.ConnectOpts{};
+            core.CONNECT(allocator, connect_opts) catch |err| {
+                log.err("📸 Snapshot listener: Failed to connect: {} - retrying in {d}ms", .{ err, reconnect_delay_ms });
+                std.Thread.sleep(reconnect_delay_ms * std.time.ns_per_ms);
+                continue;
+            };
+            defer core.DISCONNECT();
+
+            log.info("📸 Snapshot listener: Connected! Subscribing to 'init.snapshot.>'...", .{});
+
+            // Subscribe to init.snapshot.> wildcard
+            const sid = "snapshot-listener-1";
+            core.SUB("init.snapshot.>", null, sid) catch |err| {
+                log.err("📸 Snapshot listener: Failed to subscribe: {} - reconnecting", .{err});
+                std.Thread.sleep(reconnect_delay_ms * std.time.ns_per_ms);
+                continue;
+            };
+
+            log.info("📸 Snapshot listener: ✅ Subscribed! Waiting for snapshot requests...", .{});
+
+            // Listen for snapshot requests
+            while (!should_stop.load(.acquire)) {
+                if (core.connection) |conn| {
+                    const msg = conn.waitMessageNMT(nats.protocol.SECNS * 5, null) catch |err| {
+                        if (err == error.Timeout) {
+                            continue; // Normal timeout, keep polling
+                        }
+                        log.err("📸 Snapshot listener: Error receiving: {} - reconnecting", .{err});
+                        std.Thread.sleep(reconnect_delay_ms * std.time.ns_per_ms);
+                        break; // Break inner loop to trigger reconnection
+                    };
+                    defer conn.reuse(msg);
+
+                    // Extract table name from subject: init.snapshot.<table>
+                    const subject = msg.letter.subject.body() orelse {
+                        log.err("📸 No subject in message", .{});
+                        continue;
+                    };
+
+                    const table_name = blk: {
+                        const prefix = "init.snapshot.";
+                        if (std.mem.startsWith(u8, subject, prefix)) {
+                            break :blk subject[prefix.len..];
+                        }
+                        log.err("📸 Invalid snapshot request subject: {s}", .{subject});
+                        continue;
+                    };
+
+                    log.info("📸 Snapshot request received for table: {s}", .{table_name});
+
+                    // Validate table is monitored
+                    const is_monitored = publication_mod.isTableMonitored(table_name, monitored_tables);
+                    if (!is_monitored) {
+                        log.warn("📸 Table '{s}' not in monitored tables", .{table_name});
+                        // TODO: Implement publishSnapshotErrorZig if needed for error reporting
+                        // For now, just log the error - consumers won't get notification
+                        continue;
+                    }
+
+                    // Generate snapshot ID
+                    const snapshot_id = generateSnapshotId(allocator) catch |err| {
+                        log.err("Failed to generate snapshot ID: {}", .{err});
+                        continue;
+                    };
+                    defer allocator.free(snapshot_id);
+
+                    log.info("📸 Generating snapshot for '{s}' (id={s})", .{ table_name, snapshot_id });
+
+                    // Generate snapshot (without KV/dictionary, using pure g41797/nats JetStream)
+                    generateIncrementalSnapshotZig(
+                        allocator,
+                        pg_config,
+                        table_name,
+                        snapshot_id,
+                        format,
+                        chunk_size,
+                        enable_compression,
+                        recipe,
+                        should_stop,
+                    ) catch |err| {
+                        log.err("📸 Snapshot generation failed for '{s}': {}", .{ table_name, err });
+                        // TODO: Implement publishSnapshotErrorZig if needed for error reporting
+                        // For now, just log the error - consumers won't get notification
+                        continue;
+                    };
+
+                    log.info("📸 ✅ Snapshot completed for '{s}'", .{table_name});
+                } else {
+                    log.err("📸 Snapshot listener: Connection lost - reconnecting", .{});
+                    break; // Break inner loop to trigger reconnection
+                }
+            }
+        }
+
+        log.info("📸 Snapshot listener stopping...", .{});
+    }
+
+    /// Generate incremental snapshot
+    fn generateIncrementalSnapshotZig(
+        allocator: std.mem.Allocator,
+        pg_config: *const pg_conn.PgConf,
+        table_name: []const u8,
+        snapshot_id: []const u8,
+        format: encoder_mod.Format,
+        chunk_size: usize,
+        enable_compression: bool,
+        recipe: config.CompressionRecipe,
+        should_stop: *std.atomic.Value(bool),
+    ) !void {
+        log.info("📸 Generating snapshot for '{s}' (id={s}, compression={}, chunk_size={d})", .{
+            table_name,
+            snapshot_id,
+            enable_compression,
+            chunk_size,
+        });
+
+        // Create JetStream connection for publishing snapshot data
+        const connect_opts = nats.protocol.ConnectOpts{};
+        var js = nats.JS.CONNECT(allocator, connect_opts) catch |err| {
+            log.err("📸 Failed to connect to JetStream: {}", .{err});
+            return error.JetStreamConnectionFailed;
+        };
+        defer js.DISCONNECT();
+
+        log.info("📸 Connected to JetStream for snapshot publishing", .{});
+
+        // Create PostgreSQL connection
+        const conninfo = try pg_config.connInfo(allocator, false);
+        defer allocator.free(conninfo);
+
+        const conn = c.PQconnectdb(conninfo.ptr);
+        if (conn == null) return error.ConnectionFailed;
+        defer c.PQfinish(conn);
+
+        if (c.PQstatus(conn) != c.CONNECTION_OK) {
+            return error.ConnectionFailed;
+        }
+
+        // Begin REPEATABLE READ transaction for snapshot consistency
+        const begin_result = c.PQexec(conn, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+        defer c.PQclear(begin_result);
+
+        if (c.PQresultStatus(begin_result) != c.PGRES_COMMAND_OK) {
+            log.err("BEGIN failed: {s}", .{c.PQerrorMessage(conn)});
+            return error.TransactionFailed;
+        }
+
+        // Get snapshot LSN
+        const lsn_query = "SELECT pg_current_wal_lsn()::text";
+        const lsn_result = c.PQexec(conn, lsn_query.ptr);
+        defer c.PQclear(lsn_result);
+
+        if (c.PQresultStatus(lsn_result) != c.PGRES_TUPLES_OK) {
+            return error.QueryFailed;
+        }
+
+        const lsn_str: []const u8 = std.mem.span(c.PQgetvalue(lsn_result, 0, 0));
+        log.info("📸 Snapshot started at LSN: {s}", .{lsn_str});
+
+        // Publish snapshot start notification (NO dictionary_id)
+        publishSnapshotStartZig(
+            allocator,
+            &js,
+            table_name,
+            snapshot_id,
+            lsn_str,
+            format,
+            null, // NO dictionary
+            enable_compression,
+            should_stop,
+        ) catch |err| {
+            log.warn("Failed to publish snapshot start: {}", .{err});
+        };
+
+        // Discover primary key for this table
+        const pk = try getTablePrimaryKey(allocator, conn.?, table_name);
+        defer pk.deinit(allocator);
+
+        // Create arena for snapshot processing
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        // Process chunks using streaming encoder
+        var batch: u32 = 0;
+        var total_rows: u64 = 0;
+        var last_val: []const u8 = try allocator.dupe(u8, if (pk.is_numeric) "0" else "");
+        defer allocator.free(last_val);
+
+        // Pre-allocate encoding buffer (2MB for chunk data)
+        const encode_buffer = try allocator.alloc(u8, 2 * 1024 * 1024);
+        defer allocator.free(encode_buffer);
+
+        while (true) {
+            _ = arena.reset(.retain_capacity);
+            const chunk_alloc = arena.allocator();
+
+            // Build COPY query with dynamic PK column
+            // Quote value if string type (UUID, varchar, etc.)
+            const where_clause = if (pk.is_numeric)
+                try std.fmt.allocPrint(chunk_alloc, "\"{s}\" > {s}", .{ pk.name, last_val })
+            else
+                try std.fmt.allocPrint(chunk_alloc, "\"{s}\" > '{s}'", .{ pk.name, last_val });
+
+            const copy_query = try std.fmt.allocPrintSentinel(
+                chunk_alloc,
+                "COPY (SELECT * FROM \"{s}\" WHERE {s} ORDER BY \"{s}\" LIMIT {d}) TO STDOUT WITH (FORMAT csv, HEADER true)",
+                .{ table_name, where_clause, pk.name, chunk_size },
+                0,
+            );
+
+            // Initialize streaming encoder with fixed buffer
+            var encoder = streaming_encoder.StreamingEncoder.init(encode_buffer);
+
+            // Stream: PostgreSQL COPY → Parser → Encoder (zero intermediate allocations)
+            var parser = pg_copy_csv.CopyCsvParser.init(chunk_alloc, @ptrCast(conn));
+            defer parser.deinit();
+
+            const num_rows = parser.streamToEncoder(copy_query, &encoder) catch |err| {
+                log.err("Stream encoding failed: {}", .{err});
+                _ = c.PQexec(conn, "ROLLBACK");
+                return error.StreamEncodingFailed;
+            };
+
+            if (num_rows == 0) break;
+
+            total_rows += num_rows;
+
+            // On first chunk, publish schema so consumer knows column order
+            if (batch == 0) {
+                const col_names = parser.columnNames() orelse return error.NoHeader;
+                try publishSchemaZig(
+                    chunk_alloc,
+                    &js,
+                    table_name,
+                    snapshot_id,
+                    col_names,
+                    format,
+                    should_stop,
+                );
+            }
+
+            // Get the encoded MessagePack data (no allocation - slice of encode_buffer)
+            const encoded = encoder.getWritten();
+
+            // Get dictionary info for headers
+            var dict_id_opt: ?[]const u8 = null;
+            if (enable_compression and global_dict_manager != null) {
+                dictionaries_mutex.lock();
+                if (global_dictionaries) |cache| {
+                    if (cache.getDictId(table_name)) |dict_id| {
+                        dict_id_opt = dict_id;
+                    }
+                }
+                dictionaries_mutex.unlock();
+            }
+
+            // Compress if enabled (with dictionary if available)
+            const payload = if (enable_compression) blk: {
+                const zstd_recipe: zstd.CompressionRecipe = @enumFromInt(@intFromEnum(recipe));
+                var compressor = try zstd.Compressor.init(.{ .recipe = zstd_recipe });
+                defer compressor.deinit();
+
+                // Try to use dictionary compression if available
+                if (global_dict_manager) |manager| {
+                    dictionaries_mutex.lock();
+                    defer dictionaries_mutex.unlock();
+
+                    if (manager.getCDict(table_name)) |cdict| {
+                        const result = try compressor.compress_using_cdict(allocator, encoded, cdict);
+                        log.info("🗜️  Compressed chunk {d}: {d} → {d} bytes ({d:.1}% reduction, with dictionary)", .{
+                            batch,
+                            encoded.len,
+                            result.len,
+                            @as(f64, @floatFromInt(encoded.len - result.len)) / @as(f64, @floatFromInt(encoded.len)) * 100.0,
+                        });
+                        break :blk result;
+                    }
+                }
+
+                // No dictionary available - use standard compression
+                const result = try compressor.compress(allocator, encoded);
+                log.info("🗜️  Compressed chunk {d}: {d} → {d} bytes ({d:.1}% reduction, no dictionary)", .{
+                    batch,
+                    encoded.len,
+                    result.len,
+                    @as(f64, @floatFromInt(encoded.len - result.len)) / @as(f64, @floatFromInt(encoded.len)) * 100.0,
+                });
+                break :blk result;
+            } else encoded;
+            defer if (enable_compression) allocator.free(payload);
+
+            // Publish chunk to JetStream with Nats-Msg-Id header for deduplication
+            // Use chunk_alloc (arena) for all per-chunk allocations
+            const subject = try std.fmt.allocPrint(
+                chunk_alloc,
+                config.Snapshot.data_subject_pattern,
+                .{ table_name, snapshot_id, batch },
+            );
+
+            const msg_id_buf = try std.fmt.allocPrint(
+                chunk_alloc,
+                config.Snapshot.data_msg_id_pattern,
+                .{ table_name, snapshot_id, batch },
+            );
+
+            // Create headers with metadata for versioning and deduplication
+            var headers = nats.pool.Headers{};
+            try headers.init(chunk_alloc, 512);
+            defer headers.deinit();
+
+            // Deduplication
+            try headers.append("Nats-Msg-Id", msg_id_buf);
+
+            // Content metadata
+            try headers.append("Content-Type", "application/msgpack");
+            if (enable_compression) {
+                try headers.append("Content-Encoding", "zstd");
+                // Add dictionary ID if compression used a dictionary
+                if (dict_id_opt) |dict_id| {
+                    try headers.append("X-Zstd-Dict-ID", dict_id);
+                }
+            }
+
+            // Snapshot versioning
+            try headers.append("X-Format", "array"); // Tells consumer: expect [[v1,v2,...]]
+            try headers.append("X-Snapshot-Version", "1.0");
+
+            // Schema reference (will be published separately)
+            const schema_ref = try std.fmt.allocPrint(chunk_alloc, "{s}.{s}", .{ table_name, snapshot_id });
+            try headers.append("X-Schema-Ref", schema_ref);
+
+            // Progress tracking for consumers
+            const chunk_num_str = try std.fmt.allocPrint(chunk_alloc, "{d}", .{batch});
+            try headers.append("X-Snapshot-Chunk-Num", chunk_num_str);
+
+            const rows_in_chunk_str = try std.fmt.allocPrint(chunk_alloc, "{d}", .{num_rows});
+            try headers.append("X-Snapshot-Rows-In-Chunk", rows_in_chunk_str);
+
+            const total_rows_str = try std.fmt.allocPrint(chunk_alloc, "{d}", .{total_rows});
+            try headers.append("X-Snapshot-Total-Rows-So-Far", total_rows_str);
+
+            // Flag final chunk when we receive fewer rows than chunk_size
+            if (num_rows < chunk_size) {
+                try headers.append("X-Snapshot-Final-Chunk", "true");
+            }
+
+            // Publish to JetStream with headers and retry logic
+            try publishWithRetry(&js, subject, &headers, payload, should_stop);
+
+            log.info("📦 Published chunk {d} ({d} rows, {d} bytes) → {s} (msg_id={s})", .{
+                batch,
+                num_rows,
+                payload.len,
+                subject,
+                msg_id_buf,
+            });
+
+            batch += 1;
+
+            // Update last_val from parser's last row
+            // For streaming encoder, we need to extract from the parsed header
+            if (num_rows > 0) {
+                const header_cols = parser.columnNames() orelse return error.NoHeader;
+                var pk_idx: ?usize = null;
+                for (header_cols, 0..) |name, i| {
+                    if (std.mem.eql(u8, name, pk.name)) {
+                        pk_idx = i;
+                        break;
+                    }
+                }
+
+                // Note: streaming encoder doesn't store rows, so we can't extract the last PK value
+                // For now, this is a limitation - we'd need to modify StreamingEncoder to track last row
+                // Fallback: assume sequential integer IDs and increment
+                if (pk.is_numeric and pk_idx != null) {
+                    const new_val = try std.fmt.allocPrint(
+                        allocator,
+                        "{d}",
+                        .{try std.fmt.parseInt(i64, last_val, 10) + @as(i64, @intCast(num_rows))},
+                    );
+                    allocator.free(last_val);
+                    last_val = new_val;
+                } else {
+                    // For non-numeric or when we can't determine, log warning
+                    log.warn("⚠️  Streaming encoder doesn't support non-sequential PK pagination yet", .{});
+                }
+            }
+
+            // Break if we got fewer rows than requested (end of table)
+            if (num_rows < chunk_size) break;
+        }
+
+        // Commit transaction
+        const commit_result = c.PQexec(conn, "COMMIT");
+        defer c.PQclear(commit_result);
+
+        if (c.PQresultStatus(commit_result) != c.PGRES_COMMAND_OK) {
+            log.err("COMMIT failed: {s}", .{c.PQerrorMessage(conn)});
+            return error.TransactionFailed;
+        }
+
+        log.info("✅ Transaction committed", .{});
+
+        // Publish metadata (NO dictionary_id)
+        try publishSnapshotMetadataZig(
+            allocator,
+            &js,
+            table_name,
+            snapshot_id,
+            lsn_str,
+            batch,
+            total_rows,
+            format,
+            null, // NO dictionary
+            enable_compression,
+            should_stop,
+        );
+
+        log.info("✅ Snapshot complete: {s} ({d} batches, {d} rows)", .{
+            snapshot_id,
+            batch,
+            total_rows,
+        });
+    }
+
+    /// Publish snapshot start notification using g41797/nats JetStream
+    fn publishSnapshotStartZig(
+        allocator: std.mem.Allocator,
+        js: *nats.JS,
+        table_name: []const u8,
+        snapshot_id: []const u8,
+        lsn: []const u8,
+        format: encoder_mod.Format,
+        dictionary_id: ?[]const u8,
+        compression_enabled: bool,
+        should_stop: *std.atomic.Value(bool),
+    ) !void {
+        var encoder = encoder_mod.Encoder.init(allocator, format);
+        defer encoder.deinit();
+
+        var start_map = encoder.createMap();
+        defer start_map.free(allocator);
+
+        // Parse PostgreSQL LSN string to u64 integer
+        const lsn_int = try parsePgLsn(lsn);
+
+        try start_map.put("snapshot_id", try encoder.createString(snapshot_id));
+        try start_map.put("table", try encoder.createString(table_name));
+        try start_map.put("lsn", encoder.createInt(@intCast(lsn_int)));
+        try start_map.put("timestamp", encoder.createInt(std.time.timestamp()));
+        try start_map.put("status", try encoder.createString("starting"));
+        try start_map.put("format", try encoder.createString(@tagName(format)));
+        try start_map.put("compression_enabled", encoder.createBool(compression_enabled));
+
+        if (dictionary_id) |dict_id| {
+            try start_map.put("dictionary_id", try encoder.createString(dict_id));
+        }
+
+        const encoded = try encoder.encode(start_map);
+        defer allocator.free(encoded);
+
+        const subject = try std.fmt.allocPrint(
+            allocator,
+            config.Snapshot.start_subject_pattern,
+            .{table_name},
+        );
+        defer allocator.free(subject);
+
+        // Publish to JetStream with retry logic (no msg_id needed for start notification)
+        try publishWithRetry(js, subject, null, encoded, should_stop);
+
+        log.info("🚀 Published snapshot start → {s} (LSN watermark: {s})", .{ subject, lsn });
+    }
+
+    /// Publish snapshot metadata using g41797/nats JetStream
+    fn publishSnapshotMetadataZig(
+        allocator: std.mem.Allocator,
+        js: *nats.JS,
+        table_name: []const u8,
+        snapshot_id: []const u8,
+        lsn: []const u8,
+        batch_count: u32,
+        row_count: u64,
+        format: encoder_mod.Format,
+        dictionary_id: ?[]const u8,
+        compression_enabled: bool,
+        should_stop: *std.atomic.Value(bool),
+    ) !void {
+        var encoder = encoder_mod.Encoder.init(allocator, format);
+        defer encoder.deinit();
+
+        var meta_map = encoder.createMap();
+        defer meta_map.free(allocator);
+
+        // Parse PostgreSQL LSN string to u64 integer
+        const lsn_int = try parsePgLsn(lsn);
+
+        try meta_map.put("snapshot_id", try encoder.createString(snapshot_id));
+        try meta_map.put("lsn", encoder.createInt(@intCast(lsn_int)));
+        try meta_map.put("timestamp", encoder.createInt(std.time.timestamp()));
+        try meta_map.put("batch_count", encoder.createInt(@intCast(batch_count)));
+        try meta_map.put("row_count", encoder.createInt(@intCast(row_count)));
+        try meta_map.put("table", try encoder.createString(table_name));
+        try meta_map.put("compression_enabled", encoder.createBool(compression_enabled));
+
+        if (dictionary_id) |dict_id| {
+            try meta_map.put("dictionary_id", try encoder.createString(dict_id));
+        }
+
+        const encoded = try encoder.encode(meta_map);
+        defer allocator.free(encoded);
+
+        const subject = try std.fmt.allocPrint(
+            allocator,
+            config.Snapshot.meta_subject_pattern,
+            .{table_name},
+        );
+        defer allocator.free(subject);
+
+        // Create headers for metadata message
+        var headers = nats.pool.Headers{};
+        try headers.init(allocator, 256);
+        defer headers.deinit();
+
+        try headers.append("Content-Type", "application/msgpack");
+        try headers.append("X-Snapshot-Version", "1.0");
+        try headers.append("X-Message-Type", "snapshot-complete");
+
+        // Publish to JetStream with retry logic
+        try publishWithRetry(js, subject, &headers, encoded, should_stop);
+
+        log.info("📋 Published snapshot metadata → {s}", .{subject});
     }
 
     // ========================================================================
-    // PoC: g41797/nats Core NATS subscriber (COMMENTED OUT - Zig 0.15 incompatible)
+    // PoC: g41797/nats Core NATS subscriber (Testing Zig 0.15+ compatibility)
     // ========================================================================
     // This PoC demonstrates using the g41797/nats pure Zig library for Core NATS
-    // pub/sub instead of nats.c. It was successfully vendored with:
+    // pub/sub instead of nats.c. Successfully vendored with:
     // - mailbox.zig vendored into src/nats/src/mailbox.zig
     // - zul dependency replaced with std.crypto for UUID generation
-    //
-    // However, the library itself needs porting to Zig 0.15 API:
-    // 1. Client.zig:204 - readAll() removed, need to use read() with loop
-    // 2. messages.zig:257 - error set mismatch (Interrupted not expected)
-    // 3. Message structure - .subject field not in Envelope struct
-    //
-    // Uncomment when g41797/nats is updated for Zig 0.15+
     // ========================================================================
-    //
-    // /// PoC: Core NATS subscriber (no JetStream, just pub/sub)
+
+    // / PoC: Core NATS subscriber (no JetStream, just pub/sub)
+    // / Note: Thread functions cannot return errors - all errors must be caught internally
     // fn testCoreNatsSubscriber(
     //     allocator: std.mem.Allocator,
     //     should_stop: *std.atomic.Value(bool),
-    // ) !void {
+    // ) void {
     //     log.info("🧪 PoC: Connecting to Core NATS with g41797/nats...", .{});
-    //
+
     //     // Create Core NATS connection
     //     var core = nats.Core{};
     //     const connect_opts = nats.protocol.ConnectOpts{}; // Use defaults
     //     core.CONNECT(allocator, connect_opts) catch |err| {
     //         log.err("🧪 PoC: Failed to connect: {}", .{err});
-    //         return err;
+    //         return; // Cannot propagate error from thread function
     //     };
     //     defer core.DISCONNECT();
-    //
+
     //     log.info("🧪 PoC: Connected! Subscribing to 'init.schema' with Core NATS...", .{});
-    //
+
     //     // Subscribe to init.schema
     //     const sid = "1"; // Subscription ID
     //     core.SUB("init.schema", null, sid) catch |err| {
     //         log.err("🧪 PoC: Failed to subscribe: {}", .{err});
-    //         return err;
+    //         return; // Cannot propagate error from thread function
     //     };
-    //
+
     //     log.info("🧪 PoC: Subscribed! Waiting for messages from Elixir on 'init.schema'...", .{});
-    //
+
     //     // Listen for messages (using internal connection)
     //     while (!should_stop.load(.acquire)) {
     //         if (core.connection) |conn| {
@@ -176,10 +1180,11 @@ pub const SnapshotListener = struct {
     //                 continue;
     //             };
     //             defer conn.reuse(msg);
-    //
+
     //             const payload = msg.letter.getPayload() orelse "(empty)";
+    //             const subject = msg.letter.subject.body() orelse "(no subject)";
     //             log.info("🧪 PoC: ✅ Received from Elixir on '{s}': {s}", .{
-    //                 msg.subject,
+    //                 subject,
     //                 payload,
     //             });
     //         } else {
@@ -187,7 +1192,7 @@ pub const SnapshotListener = struct {
     //             break;
     //         }
     //     }
-    //
+
     //     log.info("🧪 PoC: Subscriber stopping...", .{});
     // }
 };
@@ -195,19 +1200,19 @@ pub const SnapshotListener = struct {
 /// Publish snapshot error to NATS for consumer feedback
 fn publishSnapshotError(
     allocator: std.mem.Allocator,
-    publisher: *nats_publisher.Publisher,
+    js: *nats.JS,
     table_name: []const u8,
     error_type: []const u8,
     available_tables: []const []const u8,
     snapshot_id: ?[]const u8,
     error_message: ?[]const u8,
     format: encoder_mod.Format,
+    should_stop: *std.atomic.Value(bool),
 ) !void {
-    const subject = try std.fmt.allocPrintSentinel(
+    const subject = try std.fmt.allocPrint(
         allocator,
         config.Snapshot.error_subject_pattern,
         .{table_name},
-        0,
     );
     defer allocator.free(subject);
 
@@ -240,8 +1245,8 @@ fn publishSnapshotError(
     const payload = try encoder.encode(map);
     defer allocator.free(payload);
 
-    try publisher.publish(subject, payload, null);
-    try publisher.flushAsync();
+    // Publish to JetStream with retry logic (Core NATS pub goes through JetStream connection)
+    try publishWithRetry(js, subject, null, payload, should_stop);
 
     log.err("❌ Published snapshot error → {s}: {s}", .{ subject, error_type });
 }
@@ -282,7 +1287,7 @@ fn onSnapshotRequest(
         // Publish error to NATS so consumer gets feedback
         publishSnapshotError(
             ctx.allocator,
-            ctx.publisher,
+            ctx.js,
             table_name,
             "table_not_in_publication",
             ctx.monitored_tables,
@@ -313,6 +1318,12 @@ fn onSnapshotRequest(
         requested_by,
     });
 
+    // Publish dictionary before snapshot (if available)
+    _ = publishDictionary(ctx.allocator, ctx.js, table_name) catch |err| {
+        log.warn("⚠️  Dictionary publishing failed for table '{s}': {} (continuing without dictionary)", .{ table_name, err });
+        // Continue without dictionary - graceful degradation
+    };
+
     // Generate snapshot ID
     const snapshot_id = generateSnapshotId(ctx.allocator) catch |err| {
         log.err("Failed to generate snapshot ID: {}", .{err});
@@ -324,7 +1335,7 @@ fn onSnapshotRequest(
     generateIncrementalSnapshot(
         ctx.allocator,
         ctx.pg_config,
-        ctx.publisher,
+        ctx.js,
         null, // No PostgreSQL connection needed (we create our own)
         table_name,
         snapshot_id,
@@ -348,7 +1359,7 @@ fn onSnapshotRequest(
         // Publish error notification to NATS for consumer feedback
         publishSnapshotError(
             ctx.allocator,
-            ctx.publisher,
+            ctx.js,
             table_name,
             @errorName(err),
             ctx.monitored_tables,
@@ -365,11 +1376,12 @@ fn onSnapshotRequest(
     log.info("✅ Snapshot request for '{s}' completed successfully", .{table_name});
 }
 
-/// Main entry point: Subscribe to NATS for snapshot requests
-pub fn listenForSnapshotRequests(
+/// DEPRECATED: Old nats.c-based snapshot listener (kept for reference)
+/// Use listenForSnapshotRequestsZig instead (pure g41797/nats)
+fn listenForSnapshotRequestsOld(
     allocator: std.mem.Allocator,
     pg_config: *const pg_conn.PgConf,
-    publisher: *nats_publisher.Publisher,
+    nc: ?*c.natsConnection,
     should_stop: *std.atomic.Value(bool),
     monitored_tables: []const []const u8,
     format: encoder_mod.Format,
@@ -380,11 +1392,19 @@ pub fn listenForSnapshotRequests(
 ) !void {
     log.info("🔔 Starting NATS snapshot listener thread", .{});
 
+    // Create JetStream connection
+    const connect_opts = nats.protocol.ConnectOpts{};
+    var js = nats.JS.CONNECT(allocator, connect_opts) catch |err| {
+        log.err("Failed to connect to JetStream: {}", .{err});
+        return error.JetStreamConnectionFailed;
+    };
+    defer js.DISCONNECT();
+
     // Create context for NATS callback
     var ctx = SnapshotContext{
         .allocator = allocator,
         .pg_config = pg_config,
-        .publisher = publisher,
+        .js = &js,
         .monitored_tables = monitored_tables,
         .format = format,
         .chunk_size = chunk_size,
@@ -397,7 +1417,7 @@ pub fn listenForSnapshotRequests(
     var sub: ?*c.natsSubscription = null;
     const status = c.natsConnection_Subscribe(
         &sub,
-        publisher.nc,
+        nc,
         config.Snapshot.request_subject_wildcard,
         onSnapshotRequest,
         &ctx,
@@ -414,7 +1434,7 @@ pub fn listenForSnapshotRequests(
 
     // Flush to ensure server processed the subscription
     // This sends PING and waits for PONG to verify subscription was registered
-    const flush_status = c.natsConnection_Flush(publisher.nc);
+    const flush_status = c.natsConnection_Flush(nc);
     if (flush_status != c.NATS_OK) {
         log.err("⚠️ Failed to flush after subscription: {s}", .{
             std.mem.span(c.natsStatus_GetText(flush_status)),
@@ -424,7 +1444,7 @@ pub fn listenForSnapshotRequests(
 
     // Check if server had any errors processing the subscription
     var last_err_text: [*c]const u8 = null;
-    const last_err = c.natsConnection_GetLastError(publisher.nc, &last_err_text);
+    const last_err = c.natsConnection_GetLastError(nc, &last_err_text);
     if (last_err != c.NATS_OK) {
         const err_msg = if (last_err_text != null) std.mem.span(last_err_text) else "unknown";
         log.err("Server error after subscription: {s}", .{err_msg});
@@ -440,16 +1460,15 @@ pub fn listenForSnapshotRequests(
 
     log.info("🥁 Snapshot listener thread stopped", .{});
 
-    // Release NATS thread-local storage
-    // This is required when user-created threads call NATS C library APIs
-    c.nats_ReleaseThreadMemory();
+    // REMOVED: nats_ReleaseThreadMemory() no longer needed with pure Zig NATS
+    // Pure Zig NATS doesn't have thread-local storage that needs cleanup
 }
 
 /// Generate incremental snapshot in chunks and publish to NATS
 fn generateIncrementalSnapshot(
     allocator: std.mem.Allocator,
     pg_config: *const pg_conn.PgConf,
-    publisher: *nats_publisher.Publisher,
+    js: *nats.JS,
     _: ?*c.PGconn, // Original connection (not used, we create a new one for snapshot query)
     table_name: []const u8,
     snapshot_id: []const u8,
@@ -458,20 +1477,26 @@ fn generateIncrementalSnapshot(
     enable_compression: bool,
     recipe: config.CompressionRecipe,
     js_ctx: ?*anyopaque, // JetStream context for KV access (optional)
+    should_stop: *std.atomic.Value(bool),
 ) !void {
     log.info("🔄 Generating incremental snapshot for table '{s}' (snapshot_id={s})", .{
         table_name,
         snapshot_id,
     });
 
-    // Fetch dictionary from NATS KV if compression is enabled
-    const dict_entry = if (enable_compression and js_ctx != null) blk: {
-        break :blk try fetchDictionary(allocator, js_ctx.?, table_name);
+    _ = js_ctx; // No longer using KV - dictionaries are pre-trained and in global cache
+
+    // Get dictionary ID from global cache if compression is enabled
+    const dict_id_opt = if (enable_compression and global_dict_manager != null) blk: {
+        dictionaries_mutex.lock();
+        defer dictionaries_mutex.unlock();
+        if (global_dictionaries) |cache| {
+            if (cache.getDictId(table_name)) |dict_id| {
+                break :blk dict_id;
+            }
+        }
+        break :blk null;
     } else null;
-    defer if (dict_entry) |entry| {
-        allocator.free(entry.dict_id);
-        allocator.free(entry.data);
-    };
 
     // Create a separate connection for snapshot query
     const conninfo = try pg_config.connInfo(allocator, false);
@@ -511,16 +1536,16 @@ fn generateIncrementalSnapshot(
 
     // Publish snapshot start notification with LSN watermark
     // Consumers use this to filter CDC events with LSN < snapshot_lsn
-    const dict_id_opt = if (dict_entry) |entry| entry.dict_id else null;
     publishSnapshotStart(
         allocator,
-        publisher,
+        js,
         table_name,
         snapshot_id,
         lsn_str,
         format,
         dict_id_opt,
         enable_compression,
+        should_stop,
     ) catch |err| {
         log.warn("Failed to publish snapshot start notification: {}", .{err});
     };
@@ -529,23 +1554,33 @@ fn generateIncrementalSnapshot(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
+    // Discover primary key for this table
+    const pk = try getTablePrimaryKey(allocator, conn.?, table_name);
+    defer pk.deinit(allocator);
+
     // Use COPY CSV format to fetch rows in chunks
-    // Use WHERE id > last_id instead of OFFSET for better performance on large tables
+    // Use WHERE pk > last_val instead of OFFSET for better performance on large tables
     var batch: u32 = 0;
     var total_rows: u64 = 0;
-    var last_id: i64 = 0; // Track last ID instead of offset
+    var last_val: []const u8 = try allocator.dupe(u8, if (pk.is_numeric) "0" else "");
+    defer allocator.free(last_val);
 
     while (true) {
         // Reset arena for this chunk (retains capacity for efficiency)
         _ = arena.reset(.retain_capacity);
         const chunk_alloc = arena.allocator();
 
-        // Build COPY CSV query with WHERE id > last_id for efficient chunking
-        // This is much faster than OFFSET for large tables
+        // Build COPY CSV query with dynamic PK column
+        // Quote value if string type (UUID, varchar, etc.)
+        const where_clause = if (pk.is_numeric)
+            try std.fmt.allocPrint(chunk_alloc, "\"{s}\" > {s}", .{ pk.name, last_val })
+        else
+            try std.fmt.allocPrint(chunk_alloc, "\"{s}\" > '{s}'", .{ pk.name, last_val });
+
         const copy_query = try std.fmt.allocPrintSentinel(
             chunk_alloc,
-            "COPY (SELECT * FROM {s} WHERE id > {d} ORDER BY id LIMIT {d}) TO STDOUT WITH (FORMAT csv, HEADER true)",
-            .{ table_name, last_id, chunk_size },
+            "COPY (SELECT * FROM \"{s}\" WHERE {s} ORDER BY \"{s}\" LIMIT {d}) TO STDOUT WITH (FORMAT csv, HEADER true)",
+            .{ table_name, where_clause, pk.name, chunk_size },
             0,
         );
 
@@ -596,37 +1631,46 @@ fn generateIncrementalSnapshot(
             format,
         );
 
-        // Compress if enabled
+        // Compress if enabled (with dictionary if available)
         const payload = if (enable_compression) blk: {
-            // Convert config.CompressionRecipe to zstd.CompressionRecipe
             const zstd_recipe: zstd.CompressionRecipe = @enumFromInt(@intFromEnum(recipe));
-            const cctx = try zstd.init_compressor(.{ .recipe = zstd_recipe });
-            defer _ = zstd.free_compressor(cctx);
+            var compressor = try zstd.Compressor.init(.{ .recipe = zstd_recipe });
+            defer compressor.deinit();
 
-            // Load dictionary if available (improves compression ratio significantly)
-            if (dict_entry) |entry| {
-                _ = try zstd.load_compression_dictionary(cctx, entry.data);
+            // Try to use dictionary compression if available
+            if (global_dict_manager) |manager| {
+                dictionaries_mutex.lock();
+                defer dictionaries_mutex.unlock();
+
+                if (manager.getCDict(table_name)) |cdict| {
+                    const result = try compressor.compress_using_cdict(allocator, encoded, cdict);
+                    log.info("🗜️  Compressed chunk {d}: {d} → {d} bytes ({d:.1}% reduction, with dictionary)", .{
+                        batch,
+                        encoded.len,
+                        result.len,
+                        @as(f64, @floatFromInt(encoded.len - result.len)) / @as(f64, @floatFromInt(encoded.len)) * 100.0,
+                    });
+                    break :blk result;
+                }
             }
 
-            const compressed = try zstd.compress(allocator, cctx, encoded);
-            const compression_note = if (dict_entry != null) "with dictionary" else "without dictionary";
-            log.info("🗜️  Compressed chunk {d}: {d} → {d} bytes ({d:.1}% reduction, {s})", .{
+            // No dictionary available - use standard compression
+            const result = try compressor.compress(allocator, encoded);
+            log.info("🗜️  Compressed chunk {d}: {d} → {d} bytes ({d:.1}% reduction, no dictionary)", .{
                 batch,
                 encoded.len,
-                compressed.len,
-                @as(f64, @floatFromInt(encoded.len - compressed.len)) / @as(f64, @floatFromInt(encoded.len)) * 100.0,
-                compression_note,
+                result.len,
+                @as(f64, @floatFromInt(encoded.len - result.len)) / @as(f64, @floatFromInt(encoded.len)) * 100.0,
             });
-            break :blk compressed;
+            break :blk result;
         } else encoded;
         defer if (enable_compression) allocator.free(payload);
 
-        // Publish chunk to NATS: init.snap.users.snap-1733507200.0
-        const subject = try std.fmt.allocPrintSentinel(
+        // Publish chunk to JetStream with Nats-Msg-Id header for deduplication
+        const subject = try std.fmt.allocPrint(
             allocator,
             config.Snapshot.data_subject_pattern,
             .{ table_name, snapshot_id, batch },
-            0,
         );
         defer allocator.free(subject);
 
@@ -638,26 +1682,58 @@ fn generateIncrementalSnapshot(
         );
         defer allocator.free(msg_id_buf);
 
-        try publisher.publish(subject, payload, msg_id_buf);
-        try publisher.flushAsync();
+        // Create headers with metadata for versioning and deduplication
+        var headers = nats.pool.Headers{};
+        try headers.init(allocator, 256);
+        defer headers.deinit();
 
-        log.info("📦 Published snapshot chunk {d} ({d} rows, {d} bytes {s}) → {s}", .{
+        // Deduplication
+        try headers.append("Nats-Msg-Id", msg_id_buf);
+
+        // Content metadata
+        try headers.append("Content-Type", "application/msgpack");
+        if (enable_compression) {
+            try headers.append("Content-Encoding", "zstd");
+            // Add dictionary ID if compression used a dictionary
+            if (dict_id_opt) |dict_id| {
+                try headers.append("X-Zstd-Dict-ID", dict_id);
+            }
+        }
+
+        // Publish to JetStream with headers and retry logic
+        try publishWithRetry(js, subject, &headers, payload, should_stop);
+
+        log.info("📦 Published chunk {d} ({d} rows, {d} bytes {s}) → {s} (msg_id={s})", .{
             batch,
             num_rows,
             payload.len,
             if (enable_compression) "compressed" else "uncompressed",
             subject,
+            msg_id_buf,
         });
 
         batch += 1;
 
-        // Update last_id from the last row's id field (first column)
-        // This assumes 'id' is the first column in ORDER BY id
+        // Update last_val from the last row's PK column
+        // Find PK column index in the CSV header
         if (num_rows > 0) {
-            const last_row = rows_list.items[num_rows - 1];
-            if (last_row.fields.len > 0) {
-                if (last_row.fields[0].value) |id_str| {
-                    last_id = std.fmt.parseInt(i64, id_str, 10) catch last_id;
+            const header_cols = parser.columnNames() orelse return error.NoHeader;
+            var pk_idx: ?usize = null;
+            for (header_cols, 0..) |name, i| {
+                if (std.mem.eql(u8, name, pk.name)) {
+                    pk_idx = i;
+                    break;
+                }
+            }
+
+            if (pk_idx) |idx| {
+                const last_row = rows_list.items[num_rows - 1];
+                if (idx < last_row.fields.len) {
+                    if (last_row.fields[idx].value) |pk_val| {
+                        // Update high-water mark (dupe into stable allocator)
+                        allocator.free(last_val);
+                        last_val = try allocator.dupe(u8, pk_val);
+                    }
                 }
             }
         }
@@ -682,7 +1758,7 @@ fn generateIncrementalSnapshot(
     // Publish metadata: init.users.meta
     try publishSnapshotMetadata(
         allocator,
-        publisher,
+        js,
         table_name,
         snapshot_id,
         lsn_str,
@@ -691,6 +1767,7 @@ fn generateIncrementalSnapshot(
         format,
         dict_id_opt,
         enable_compression,
+        should_stop,
     );
 
     log.info("✅ Snapshot complete: {s} ({d} batches, {d} rows)", .{
@@ -778,7 +1855,7 @@ fn encodeCsvRows(
 /// Publish snapshot metadata to NATS
 fn publishSnapshotMetadata(
     allocator: std.mem.Allocator,
-    publisher: *nats_publisher.Publisher,
+    js: *nats.JS,
     table_name: []const u8,
     snapshot_id: []const u8,
     lsn: []const u8,
@@ -787,18 +1864,15 @@ fn publishSnapshotMetadata(
     format: encoder_mod.Format,
     dictionary_id: ?[]const u8,
     compression_enabled: bool,
+    should_stop: *std.atomic.Value(bool),
 ) !void {
-    // Use unified encoder (always MessagePack for snapshots)
-    var encoder = encoder_mod.Encoder.init(
-        allocator,
-        format, // changed to use passed format
-    );
+    var encoder = encoder_mod.Encoder.init(allocator, format);
     defer encoder.deinit();
 
     var meta_map = encoder.createMap();
     defer meta_map.free(allocator);
 
-    // Parse PostgreSQL LSN string to u64 integer (same format as CDC events)
+    // Parse PostgreSQL LSN string to u64 integer
     const lsn_int = try parsePgLsn(lsn);
 
     try meta_map.put("snapshot_id", try encoder.createString(snapshot_id));
@@ -809,7 +1883,6 @@ fn publishSnapshotMetadata(
     try meta_map.put("table", try encoder.createString(table_name));
     try meta_map.put("compression_enabled", encoder.createBool(compression_enabled));
 
-    // Add dictionary_id if compression is enabled
     if (dictionary_id) |dict_id| {
         try meta_map.put("dictionary_id", try encoder.createString(dict_id));
     }
@@ -817,17 +1890,15 @@ fn publishSnapshotMetadata(
     const encoded = try encoder.encode(meta_map);
     defer allocator.free(encoded);
 
-    // sentinel for the C-API
-    const subject = try std.fmt.allocPrintSentinel(
+    const subject = try std.fmt.allocPrint(
         allocator,
         config.Snapshot.meta_subject_pattern,
         .{table_name},
-        0,
     );
     defer allocator.free(subject);
 
-    try publisher.publish(subject, encoded, null);
-    try publisher.flushAsync();
+    // Publish to JetStream with retry logic
+    try publishWithRetry(js, subject, null, encoded, should_stop);
 
     log.info("📋 Published snapshot metadata → {s}", .{subject});
 }
@@ -837,13 +1908,14 @@ fn publishSnapshotMetadata(
 /// Consumers should filter CDC events with LSN < snapshot_lsn to avoid duplicates
 fn publishSnapshotStart(
     allocator: std.mem.Allocator,
-    publisher: *nats_publisher.Publisher,
+    js: *nats.JS,
     table_name: []const u8,
     snapshot_id: []const u8,
     lsn: []const u8,
     format: encoder_mod.Format,
     dictionary_id: ?[]const u8,
     compression_enabled: bool,
+    should_stop: *std.atomic.Value(bool),
 ) !void {
     var encoder = encoder_mod.Encoder.init(allocator, format);
     defer encoder.deinit();
@@ -870,23 +1942,125 @@ fn publishSnapshotStart(
     const encoded = try encoder.encode(start_map);
     defer allocator.free(encoded);
 
-    const subject = try std.fmt.allocPrintSentinel(
+    const subject = try std.fmt.allocPrint(
         allocator,
         config.Snapshot.start_subject_pattern,
         .{table_name},
-        0,
     );
     defer allocator.free(subject);
 
-    try publisher.publish(subject, encoded, null);
-    try publisher.flushAsync();
+    // Create headers for start message
+    var headers = nats.pool.Headers{};
+    try headers.init(allocator, 256);
+    defer headers.deinit();
+
+    try headers.append("Content-Type", "application/msgpack");
+    try headers.append("X-Snapshot-Version", "1.0");
+    try headers.append("X-Message-Type", "snapshot-start");
+
+    // Publish to JetStream with retry logic
+    try publishWithRetry(js, subject, &headers, encoded, should_stop);
 
     log.info("🚀 Published snapshot start → {s} (LSN watermark: {s})", .{ subject, lsn });
+}
+
+/// Publish schema (column names) to NATS so consumer knows the array field order
+/// Subject: snapshot.schema.{table_name}.{snapshot_id}
+fn publishSchemaZig(
+    allocator: std.mem.Allocator,
+    js: *nats.JS,
+    table_name: []const u8,
+    snapshot_id: []const u8,
+    column_names: [][]const u8,
+    format: encoder_mod.Format,
+    should_stop: *std.atomic.Value(bool),
+) !void {
+    var encoder = encoder_mod.Encoder.init(allocator, format);
+    defer encoder.deinit();
+
+    var schema_map = encoder.createMap();
+    defer schema_map.free(allocator);
+
+    // Build schema array
+    var schema_array = try encoder.createArray(column_names.len);
+    for (column_names, 0..) |col_name, idx| {
+        try schema_array.setIndex(idx, try encoder.createString(col_name));
+    }
+
+    try schema_map.put("table", try encoder.createString(table_name));
+    try schema_map.put("snapshot_id", try encoder.createString(snapshot_id));
+    try schema_map.put("schema", schema_array);
+    try schema_map.put("timestamp", encoder.createInt(std.time.timestamp()));
+
+    const encoded = try encoder.encode(schema_map);
+    defer allocator.free(encoded);
+
+    const subject = try std.fmt.allocPrint(
+        allocator,
+        "snapshot.schema.{s}.{s}",
+        .{ table_name, snapshot_id },
+    );
+    defer allocator.free(subject);
+
+    // Create headers for schema message
+    var headers = nats.pool.Headers{};
+    try headers.init(allocator, 256);
+    defer headers.deinit();
+
+    try headers.append("Content-Type", "application/msgpack");
+    try headers.append("X-Schema-Version", "1.0");
+    try headers.append("X-Column-Count", try std.fmt.allocPrint(allocator, "{d}", .{column_names.len}));
+
+    // Publish to JetStream with retry logic
+    try publishWithRetry(js, subject, &headers, encoded, should_stop);
+
+    log.info("📋 Published schema → {s} ({d} columns)", .{ subject, column_names.len });
 }
 
 /// Generate snapshot ID based on current timestamp with random entropy
 /// Format: snap-{timestamp}-{random_u16}
 /// Prevents collisions when multiple snapshots are requested in the same second
+/// Publish pre-trained dictionary to NATS for a specific table
+/// Subject: init.dict.{table_name}
+/// Returns true if dictionary was published, false if not available (graceful degradation)
+fn publishDictionary(
+    allocator: std.mem.Allocator,
+    js: *nats.JS,
+    table_name: []const u8,
+    should_stop: *std.atomic.Value(bool),
+) !bool {
+    // Get dictionary from global cache
+    dictionaries_mutex.lock();
+    defer dictionaries_mutex.unlock();
+
+    if (global_dictionaries) |cache| {
+        if (cache.get(table_name)) |dict_entry| {
+            const subject = try std.fmt.allocPrint(
+                allocator,
+                "init.dict.{s}",
+                .{table_name},
+            );
+            defer allocator.free(subject);
+
+            // Publish dictionary binary data with retry logic
+            publishWithRetry(js, subject, null, dict_entry.data, should_stop) catch |err| {
+                log.warn("⚠️  Failed to publish dictionary for table '{s}' after retries: {}", .{ table_name, err });
+                return false;
+            };
+
+            log.info("📚 Published dictionary for table '{s}' (id={s}, size={d} bytes)", .{
+                table_name,
+                dict_entry.dict_id,
+                dict_entry.data.len,
+            });
+            return true;
+        }
+    }
+
+    log.debug("No dictionary available for table '{s}' (compression will work without it)", .{table_name});
+    return false;
+}
+
 fn generateSnapshotId(allocator: std.mem.Allocator) ![]const u8 {
     var prng = std.Random.DefaultPrng.init(@intCast(std.time.microTimestamp()));
     const random_suffix = prng.random().int(u16);
@@ -898,142 +2072,254 @@ fn generateSnapshotId(allocator: std.mem.Allocator) ![]const u8 {
     );
 }
 
-/// Initialize dictionaries by checking existence in NATS KV store
-/// Called once at bridge startup to verify dictionaries are available
-/// Does not cache dictionaries - they are fetched on-demand per snapshot
-pub fn initializeDictionaries(
-    allocator: std.mem.Allocator,
-    js_ctx: ?*anyopaque,
-    monitored_tables: []const []const u8,
-) !void {
-    if (js_ctx == null) {
-        log.warn("⚠️  JetStream context not available, skipping dictionary initialization", .{});
-        return;
-    }
+/// Cleanup global dictionaries cache
+/// Called on shutdown to free all dictionary memory
+pub fn deinitDictionaries() void {
+    dictionaries_mutex.lock();
+    defer dictionaries_mutex.unlock();
 
-    log.info("🔍 Checking dictionaries in NATS KV store for {d} tables", .{monitored_tables.len});
-
-    // Open dictionaries KV bucket
-    const bucket_name = try allocator.dupeZ(u8, config.Snapshot.kv_bucket_dictionaries);
-    defer allocator.free(bucket_name);
-
-    var kv_store = nats_kv.KVStore.open(js_ctx.?, bucket_name, allocator) catch |err| {
-        log.warn("⚠️  Failed to open dictionaries KV bucket: {} (compression will work without dictionaries)", .{err});
-        return; // Graceful degradation
-    };
-    defer kv_store.deinit();
-
-    var found_count: usize = 0;
-    var missing_count: usize = 0;
-
-    for (monitored_tables) |table_name| {
-        // Generate dictionary ID for this table
-        const dict_id = try std.fmt.allocPrint(allocator, "dict_{s}_001", .{table_name});
-        defer allocator.free(dict_id);
-
-        const dict_key = try allocator.dupeZ(u8, dict_id);
-        defer allocator.free(dict_key);
-
-        // Check if dictionary exists
-        const dict_data = kv_store.get(dict_key) catch |err| {
-            log.warn("⚠️  Dictionary check failed for table '{s}' (key={s}): {}", .{
-                table_name,
-                dict_id,
-                err,
-            });
-            missing_count += 1;
-            continue;
-        };
-
-        if (dict_data) |data| {
-            defer allocator.free(data);
-            log.info("✅ Dictionary found for table '{s}' (id={s}, size={d} bytes)", .{
-                table_name,
-                dict_id,
-                data.len,
-            });
-            found_count += 1;
-        } else {
-            log.warn("⚠️  No dictionary found for table '{s}' (key={s})", .{
-                table_name,
-                dict_id,
-            });
-            missing_count += 1;
+    // Cleanup dictionary manager first (it depends on dictionaries cache)
+    if (global_dict_manager) |manager| {
+        if (dictionaries_allocator) |alloc| {
+            manager.deinit();
+            alloc.destroy(manager);
+            global_dict_manager = null;
+            log.debug("Dictionary manager cleaned up", .{});
         }
     }
 
-    if (found_count == monitored_tables.len) {
-        log.info("✅ All {d} dictionaries available in NATS KV", .{found_count});
-    } else if (found_count > 0) {
-        log.warn("⚠️  {d}/{d} dictionaries available ({d} missing)", .{
-            found_count,
+    // Cleanup dictionaries cache
+    if (global_dictionaries) |cache| {
+        if (dictionaries_allocator) |alloc| {
+            cache.deinit();
+            alloc.destroy(cache);
+            global_dictionaries = null;
+            dictionaries_allocator = null;
+            log.debug("Dictionaries cache cleaned up", .{});
+        }
+    }
+}
+
+/// Train and initialize dictionaries for monitored tables
+/// Called once at bridge startup to pre-train zstd dictionaries from sample data
+/// Dictionaries are stored in global_dictionaries HashMap
+pub fn initializeDictionaries(
+    allocator: std.mem.Allocator,
+    pg_config: *const pg_conn.PgConf,
+    monitored_tables: []const []const u8,
+) !void {
+    log.info("📚 Training zstd dictionaries for {d} tables", .{monitored_tables.len});
+
+    // Create global dictionaries cache
+    dictionaries_mutex.lock();
+    defer dictionaries_mutex.unlock();
+
+    if (global_dictionaries == null) {
+        const cache = try allocator.create(dictionaries_cache.DictionariesCache);
+        cache.* = dictionaries_cache.DictionariesCache.init(allocator);
+        global_dictionaries = cache;
+        dictionaries_allocator = allocator;
+    }
+
+    var trained_count: usize = 0;
+    var failed_count: usize = 0;
+
+    for (monitored_tables) |table_name| {
+        log.info("🔨 Training dictionary for table '{s}'...", .{table_name});
+
+        // Collect sample data from table
+        const samples = collectSampleData(allocator, pg_config, table_name) catch |err| {
+            log.warn("⚠️  Failed to collect samples for table '{s}': {} (skipping)", .{ table_name, err });
+            failed_count += 1;
+            continue;
+        };
+        defer {
+            for (samples) |sample| allocator.free(sample);
+            allocator.free(samples);
+        }
+
+        if (samples.len == 0) {
+            log.warn("⚠️  No samples collected for table '{s}' (empty table?)", .{table_name});
+            failed_count += 1;
+            continue;
+        }
+
+        // Calculate total sample size
+        var total_sample_size: usize = 0;
+        for (samples) |sample| {
+            total_sample_size += sample.len;
+        }
+
+        log.debug("Collected {d} samples, total size: {d} bytes", .{ samples.len, total_sample_size });
+
+        // Dictionary training requires total sample size to be much larger than dict size
+        // Typical recommendation is 100x, but we'll use a minimum of 10x
+        const dict_size: usize = 8 * 1024; // Use smaller 8KB dictionary for better success rate
+        const min_sample_size = dict_size * 10; // At least 10x dict size
+
+        if (total_sample_size < min_sample_size) {
+            log.warn("⚠️  Insufficient sample data for table '{s}' ({d} bytes, need at least {d} bytes) - skipping dictionary training", .{
+                table_name,
+                total_sample_size,
+                min_sample_size,
+            });
+            failed_count += 1;
+            continue;
+        }
+
+        const dictionary = zstd.train_dictionary(allocator, samples, dict_size) catch |err| {
+            log.warn("⚠️  Dictionary training failed for table '{s}': {} (skipping)", .{ table_name, err });
+            failed_count += 1;
+            continue;
+        };
+        errdefer allocator.free(dictionary);
+
+        // Generate dictionary ID (version 1)
+        const dict_id = try std.fmt.allocPrint(allocator, "dict_{s}_v1", .{table_name});
+        errdefer allocator.free(dict_id);
+
+        // Store in cache
+        try global_dictionaries.?.put(table_name, dict_id, dictionary);
+
+        log.info("✅ Dictionary trained for table '{s}' (id={s}, size={d} bytes, {d} samples)", .{
+            table_name,
+            dict_id,
+            dictionary.len,
+            samples.len,
+        });
+        trained_count += 1;
+    }
+
+    if (trained_count == monitored_tables.len) {
+        log.info("✅ All {d} dictionaries trained successfully", .{trained_count});
+    } else if (trained_count > 0) {
+        log.warn("⚠️  {d}/{d} dictionaries trained ({d} failed)", .{
+            trained_count,
             monitored_tables.len,
-            missing_count,
+            failed_count,
         });
     } else {
-        log.warn("⚠️  No dictionaries found for any tables (compression will work without dictionaries)", .{});
+        log.warn("⚠️  No dictionaries trained (compression will work without dictionaries)", .{});
     }
+
+    // Initialize dictionary manager and load trained dictionaries
+    if (trained_count > 0) {
+        log.info("📦 Loading dictionaries into DictionaryManager...", .{});
+        const manager = try allocator.create(zstd.DictionaryManager);
+        manager.* = zstd.DictionaryManager.init(allocator);
+        global_dict_manager = manager;
+
+        // Load each trained dictionary into the manager (digest as CDict for compression)
+        const compression_level = 3; // Use level 3 (default)
+        var it = global_dictionaries.?.cache.iterator();
+        while (it.next()) |entry| {
+            const table_name_key = entry.key_ptr.*;
+            const dict_entry = entry.value_ptr.*;
+
+            manager.loadTableCDict(table_name_key, dict_entry.data, compression_level) catch |err| {
+                log.warn("⚠️  Failed to load CDict for table '{s}': {}", .{ table_name_key, err });
+                continue;
+            };
+
+            log.info("✅ Loaded CDict for table '{s}' (dict_id={s})", .{
+                table_name_key,
+                dict_entry.dict_id,
+            });
+        }
+
+        log.info("✅ DictionaryManager initialized with {d} compression dictionaries", .{trained_count});
+    }
+}
+
+/// Collect sample data from table for dictionary training
+/// Returns array of sample rows (caller owns the memory)
+fn collectSampleData(
+    allocator: std.mem.Allocator,
+    pg_config: *const pg_conn.PgConf,
+    table_name: []const u8,
+) ![][]const u8 {
+    const max_samples = 100; // Collect up to 100 sample rows
+    const max_sample_size = 10 * 1024; // Limit each sample to 10KB
+
+    // Connect to PostgreSQL
+    const conn = try pg_conn.connect(allocator, pg_config.*);
+    defer c.PQfinish(conn);
+
+    // Query to get sample rows (random sampling)
+    const query_str = try std.fmt.allocPrint(
+        allocator,
+        "SELECT * FROM {s} ORDER BY RANDOM() LIMIT {d}",
+        .{ table_name, max_samples },
+    );
+    defer allocator.free(query_str);
+
+    // Add null terminator for C API
+    const query = try allocator.dupeZ(u8, query_str);
+    defer allocator.free(query);
+
+    // Execute query
+    const result = c.PQexec(conn, query.ptr);
+    defer c.PQclear(result);
+
+    if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
+        const err_msg = c.PQresultErrorMessage(result);
+        log.err("Sample query failed for table '{s}': {s}", .{ table_name, err_msg });
+        return error.QueryFailed;
+    }
+
+    const nrows = c.PQntuples(result);
+    const ncols = c.PQnfields(result);
+
+    if (nrows == 0) {
+        return try allocator.alloc([]const u8, 0);
+    }
+
+    var samples = std.ArrayList([]const u8){};
+    errdefer {
+        for (samples.items) |sample| allocator.free(sample);
+        samples.deinit(allocator);
+    }
+
+    // Convert each row to MessagePack array format (same as snapshot chunks)
+    var row_idx: usize = 0;
+    while (row_idx < nrows) : (row_idx += 1) {
+        var buffer: [10 * 1024]u8 = undefined; // 10KB buffer per sample
+        var encoder = streaming_encoder.StreamingEncoder.init(&buffer);
+
+        // Encode row as MessagePack array
+        try encoder.beginRow(@intCast(ncols));
+
+        var col_idx: usize = 0;
+        while (col_idx < ncols) : (col_idx += 1) {
+            if (c.PQgetisnull(result, @intCast(row_idx), @intCast(col_idx)) == 1) {
+                try encoder.writeNull();
+            } else {
+                const value_ptr = c.PQgetvalue(result, @intCast(row_idx), @intCast(col_idx));
+                const value_len = c.PQgetlength(result, @intCast(row_idx), @intCast(col_idx));
+                const value = value_ptr[0..@intCast(value_len)];
+                try encoder.writeString(value);
+            }
+        }
+
+        // Sync position from writer before getting written data
+        _ = encoder.getPos();
+        const written = encoder.getWritten();
+
+        if (written.len > max_sample_size) {
+            log.warn("Sample row {d} too large ({d} bytes), skipping", .{ row_idx, written.len });
+            continue;
+        }
+
+        // Copy sample to owned memory
+        const sample = try allocator.dupe(u8, written);
+        try samples.append(allocator, sample);
+    }
+
+    return samples.toOwnedSlice(allocator);
 }
 
 /// Generate dictionary ID from table name
 /// Format: {table}_dict
 fn generateDictionaryId(allocator: std.mem.Allocator, table_name: []const u8) ![]const u8 {
     return try std.fmt.allocPrint(allocator, "{s}_dict", .{table_name});
-}
-
-/// Fetch zstd dictionary from NATS KV store
-/// Returns dictionary entry with ID and binary data, or null if not found (graceful degradation)
-fn fetchDictionary(
-    allocator: std.mem.Allocator,
-    js_ctx: *anyopaque,
-    table_name: []const u8,
-) !?struct { dict_id: []const u8, data: []const u8 } {
-    // Generate dictionary ID for this table (e.g., "dict_users_001")
-    // The version number is managed externally when training dictionaries
-    const dict_id = try std.fmt.allocPrint(allocator, "dict_{s}_001", .{table_name});
-    errdefer allocator.free(dict_id);
-
-    // Open dictionaries KV bucket
-    const bucket_name = try allocator.dupeZ(u8, config.Snapshot.kv_bucket_dictionaries);
-    defer allocator.free(bucket_name);
-
-    var kv_store = nats_kv.KVStore.open(js_ctx, bucket_name, allocator) catch |err| {
-        log.warn("Failed to open dictionaries KV bucket: {} (compression will work without dictionary)", .{err});
-        return null; // Graceful degradation
-    };
-    defer kv_store.deinit();
-
-    // Fetch dictionary from KV
-    const dict_key = try allocator.dupeZ(u8, dict_id);
-    defer allocator.free(dict_key);
-
-    const dict_data = kv_store.get(dict_key) catch |err| {
-        log.warn("Failed to fetch dictionary for table '{s}' (key={s}): {} (compression will work without dictionary)", .{
-            table_name,
-            dict_id,
-            err,
-        });
-        allocator.free(dict_id);
-        return null; // Graceful degradation
-    };
-
-    if (dict_data == null) {
-        log.warn("No dictionary found for table '{s}' (key={s}) (compression will work without dictionary)", .{
-            table_name,
-            dict_id,
-        });
-        allocator.free(dict_id);
-        return null;
-    }
-
-    log.info("📚 Fetched dictionary for table '{s}' from KV (id={s}, size={d} bytes)", .{
-        table_name,
-        dict_id,
-        dict_data.?.len,
-    });
-
-    return .{
-        .dict_id = dict_id, // Caller owns
-        .data = dict_data.?, // Caller owns
-    };
 }

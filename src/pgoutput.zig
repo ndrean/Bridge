@@ -55,6 +55,21 @@ pub const DecodedValue = union(enum) {
     bytea: []const u8, // BYTEA - raw bytes or hex/base64 encoded
 };
 
+/// Type tag for packed buffer storage (separate from data)
+/// Used in CDCEvent.ColumnView to identify value type without storing the full union
+pub const ValueTag = enum(u8) {
+    null = 0,
+    boolean = 1,
+    int32 = 2,
+    int64 = 3,
+    float64 = 4,
+    text = 5,
+    numeric = 6,
+    jsonb = 7,
+    array = 8,
+    bytea = 9,
+};
+
 /// Decoded column (name + value pair)
 /// Used instead of HashMap for better performance - we only iterate, never lookup by key
 pub const Column = struct {
@@ -443,10 +458,10 @@ pub fn decodeTuple(
     tuple: TupleData,
     columns: []const RelationMessage.ColumnInfo,
 ) !std.ArrayList(Column) {
-    var decoded_columns = std.ArrayList(Column){};
-    errdefer decoded_columns.deinit(allocator);
-
     if (tuple.cols.len != columns.len) return error.ColumnMismatch;
+
+    var decoded_columns: std.ArrayList(Column) = .empty;
+    errdefer decoded_columns.deinit(allocator);
 
     // Pre-allocate capacity for all columns
     try decoded_columns.ensureTotalCapacity(allocator, columns.len);

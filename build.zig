@@ -1,68 +1,5 @@
 const std = @import("std");
 
-/// Build nats.c library using CMake
-fn buildNats(b: *std.Build) *std.Build.Step {
-    const nats_step = b.step("build-nats", "Build nats.c library using CMake");
-
-    // Check if library already exists
-    const nats_lib_path = "libs/nats-install/lib/libnats_static.a";
-    const nats_lib_exists = blk: {
-        std.fs.cwd().access(nats_lib_path, .{}) catch {
-            break :blk false;
-        };
-        break :blk true;
-    };
-
-    if (nats_lib_exists) {
-        std.debug.print("nats.c library already built at {s}\n", .{nats_lib_path});
-        return nats_step;
-    }
-
-    // Create build directory
-    const mkdir_cmd = b.addSystemCommand(&.{ "mkdir", "-p", "libs/nats.c/build" });
-    nats_step.dependOn(&mkdir_cmd.step);
-
-    // Run CMake configure
-    const cmake_cmd = b.addSystemCommand(&.{
-        "cmake",
-        "-S",
-        "libs/nats.c",
-        "-B",
-        "libs/nats.c/build",
-        "-DCMAKE_BUILD_TYPE=Release",
-        "-DBUILD_TESTING=OFF",
-        "-DNATS_BUILD_STREAMING=OFF",
-        "-DNATS_BUILD_WITH_TLS=ON",
-        "-DNATS_BUILD_EXAMPLES=OFF",
-        "-DNATS_BUILD_LIB_SHARED=OFF",
-        "-DCMAKE_INSTALL_PREFIX=libs/nats-install",
-    });
-    cmake_cmd.step.dependOn(&mkdir_cmd.step);
-    nats_step.dependOn(&cmake_cmd.step);
-
-    // Run CMake build
-    const build_cmd = b.addSystemCommand(&.{
-        "cmake",
-        "--build",
-        "libs/nats.c/build",
-        "--config",
-        "Release",
-    });
-    build_cmd.step.dependOn(&cmake_cmd.step);
-    nats_step.dependOn(&build_cmd.step);
-
-    // Run CMake install
-    const install_cmd = b.addSystemCommand(&.{
-        "cmake",
-        "--install",
-        "libs/nats.c/build",
-    });
-    install_cmd.step.dependOn(&build_cmd.step);
-    nats_step.dependOn(&install_cmd.step);
-
-    return nats_step;
-}
-
 /// Link vendored libpq static libraries to an executable
 fn linkLibpq(exe: *std.Build.Step.Compile, b: *std.Build) void {
     // Check if vendored libpq exists
@@ -97,9 +34,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Build nats.c library if needed
-    const nats_build_step = buildNats(b);
-
     const mod = b.addModule("bridge", .{
         .root_source_file = b.path("src/bridge.zig"),
         .target = target,
@@ -110,13 +44,25 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Add nats.zig as a local module (skip build dependencies to avoid Zig 0.14 API issues)
-    // We import the root.zig directly instead of using b.dependency() which triggers the build of mailbox and zul dependencies that aren't Zig 0.15 compatible
-    // const nats_mod = b.addModule("nats", .{
-    //     .root_source_file = b.path("src/nats/src/root.zig"),
-    //     .target = target,
-    //     .optimize = optimize,
-    // });
+    const mailbox_dep = b.dependency("mailbox", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const zul_dep = b.dependency("zul", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const nats_dep = b.dependency("nats", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const nats_mod = nats_dep.module("nats");
+
+    nats_mod.addImport("mailbox", mailbox_dep.module("mailbox"));
+    nats_mod.addImport("zul", zul_dep.module("zul"));
 
     // Create local zstd module (links system libzstd)
     const zstd_mod = b.addModule("zstd", .{
@@ -137,19 +83,15 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "msgpack", .module = msgpack.module("msgpack") },
                 .{ .name = "zstd", .module = zstd_mod },
                 // .{ .name = "nats", .module = nats_mod },
+
+                .{ .name = "nats", .module = nats_dep.module("nats") },
+
+                // .{ .name = "mailbox", .module = mailbox.module("mailbox") },
             },
         }),
     });
 
-    // Ensure nats.c is built before compiling
-    exe.step.dependOn(nats_build_step);
-
-    // Link against NATS C library
-    exe.addIncludePath(b.path("libs/nats-install/include"));
-    exe.addLibraryPath(b.path("libs/nats-install/lib"));
-    exe.addObjectFile(b.path("libs/nats-install/lib/libnats_static.a"));
-
-    // Link OpenSSL (required for NATS TLS support)
+    // Link OpenSSL (required for pure Zig NATS TLS support)
     exe.linkSystemLibrary("ssl");
     exe.linkSystemLibrary("crypto");
 

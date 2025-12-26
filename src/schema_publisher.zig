@@ -9,12 +9,13 @@
 
 const std = @import("std");
 const config = @import("config.zig");
+const nats = @import("nats");
 const nats_publisher = @import("nats_publisher.zig");
-const nats_kv = @import("nats_kv.zig");
+// KV operations removed - not in use
+// const nats_kv = @import("nats_kv.zig");
 // Old lalinsky/nats.zig imports removed (obsolete trial code):
 // const nats_kv_zig = @import("nats_kv_zig.zig");
 // const nats_connection_zig = @import("nats_connection_zig.zig");
-// const nats = @import("nats");
 const pgoutput = @import("pgoutput.zig");
 const msgpack = @import("msgpack");
 const encoder_mod = @import("encoder.zig");
@@ -57,10 +58,10 @@ pub fn publishSchema(
         schema_version,
     });
 
-    // Build subject: schema.{table_name}
+    // Build subject: init.schema.{table_name} (matches INIT stream with init.> pattern)
     const subject = try std.fmt.allocPrintSentinel(
         allocator,
-        "schema.{s}",
+        "init.schema.{s}",
         .{relation.name},
         0,
     );
@@ -99,8 +100,13 @@ pub fn publishSchema(
     var msg_id_buf: [64]u8 = undefined;
     const msg_id = try std.fmt.bufPrint(&msg_id_buf, "schema-{s}-{d}", .{ relation.name, relation.relation_id });
 
-    try publisher.publish(subject, encoded, msg_id);
-    try publisher.flushAsync();
+    // Create headers with message ID for deduplication
+    var headers = nats.pool.Headers{};
+    try headers.init(allocator, 256);
+    defer headers.deinit();
+    try headers.append("Nats-Msg-Id", msg_id);
+
+    try publisher.publish(subject, &headers, encoded);
 
     log.info("✅ Schema published: {s} ({d} columns)", .{ relation.name, relation.columns.len });
 }
@@ -120,9 +126,9 @@ pub fn publishSchema(
 pub fn publishInitialSchemas(
     allocator: std.mem.Allocator,
     pg_config: *const pg_conn.PgConf,
-    publisher: *nats_publisher.Publisher,
+    _: *nats_publisher.Publisher, // unused (KV publishing removed)
     monitored_tables: []const []const u8,
-    format: encoder_mod.Format,
+    _: encoder_mod.Format, // unused (KV publishing removed)
 ) !void {
     log.info("📋 Querying and publishing initial schemas to NATS KV...", .{});
 
@@ -258,92 +264,34 @@ pub fn publishInitialSchemas(
         });
     }
 
-    // Publish each table's schema to KV store
+    // Clean up table schemas (KV publishing removed - schemas now published via CDC stream)
     var it = table_schemas.iterator();
     while (it.next()) |entry| {
-        const table_name = entry.key_ptr.*;
         const columns = entry.value_ptr.*;
-        defer {
-            for (columns.items) |col| {
-                allocator.free(col.name);
-                allocator.free(col.data_type);
-                if (col.column_default) |d| allocator.free(d);
-            }
+        for (columns.items) |col| {
+            allocator.free(col.name);
+            allocator.free(col.data_type);
+            if (col.column_default) |d| allocator.free(d);
         }
-
-        try publishTableSchema(allocator, publisher, table_name, columns.items, format);
     }
 
-    log.info("✅ Published initial schemas for {d} tables", .{table_schemas.count()});
+    log.info("✅ Queried schemas for {d} tables (schemas now published via snapshot_listener)", .{table_schemas.count()});
 }
 
-/// Publish a single table's schema to NATS KV store (using nats.c)
-///
-/// Internal helper function called by publishInitialSchemas.
-/// Encodes column metadata and stores in KV with key: table_name
-fn publishTableSchema(
-    allocator: std.mem.Allocator,
-    publisher: *nats_publisher.Publisher,
-    table_name: []const u8,
-    columns: []const ColumnInfo,
-    format: encoder_mod.Format,
-) !void {
-    // Extract just the table name (remove schema prefix if present)
-    const table_only = blk: {
-        if (std.mem.indexOf(u8, table_name, ".")) |idx| {
-            break :blk table_name[idx + 1 ..];
-        }
-        break :blk table_name;
-    };
-
-    // Build payload with unified encoder
-    var encoder = encoder_mod.Encoder.init(allocator, format);
-    defer encoder.deinit();
-
-    var schema_map = encoder.createMap();
-    defer schema_map.free(allocator);
-
-    // Add schema fields
-    try schema_map.put("table", try encoder.createString(table_only));
-    try schema_map.put("schema", try encoder.createString(table_name));
-    try schema_map.put("timestamp", encoder.createInt(std.time.timestamp()));
-
-    // Add columns array
-    var columns_array = try encoder.createArray(columns.len);
-    for (columns, 0..) |col, i| {
-        var col_map = encoder.createMap();
-        try col_map.put("name", try encoder.createString(col.name));
-        try col_map.put("position", encoder.createInt(@intCast(col.position)));
-        try col_map.put("data_type", try encoder.createString(col.data_type));
-        try col_map.put("is_nullable", encoder.createBool(col.is_nullable));
-
-        if (col.column_default) |default_val| {
-            try col_map.put("column_default", try encoder.createString(default_val));
-        } else {
-            try col_map.put("column_default", encoder.createNull());
-        }
-
-        try columns_array.setIndex(i, col_map);
-    }
-    try schema_map.put("columns", columns_array);
-
-    const encoded = try encoder.encode(schema_map);
-    defer allocator.free(encoded);
-
-    // Use nats.c KV store (lalinsky/nats.zig trial code removed)
-    var kv_store = try nats_kv.KVStore.open(publisher.js, config.Nats.schema_kv_bucket, allocator);
-    defer kv_store.deinit();
-
-    // Put schema into KV with key: table_name (nats.c requires null-terminated strings)
-    const key = try std.fmt.allocPrintSentinel(allocator, "{s}", .{table_only}, 0);
-    defer allocator.free(key);
-
-    const revision = try kv_store.put(key, encoded);
-
-    log.info("📋 Published schema to KV (nats.c) → schemas.{s} ({d} columns, {d} bytes, revision={d})", .{
-        table_only,
-        columns.len,
-        encoded.len,
-        revision,
-    });
-}
+// REMOVED: KV-based schema publishing (not in use)
+// This function was used to publish schemas to NATS KV store using nats.c
+// Schema publishing is now done via snapshot_listener when handling schema requests
+//
+// /// Publish a single table's schema to NATS KV store (using nats.c)
+// ///
+// /// Internal helper function called by publishInitialSchemas.
+// /// Encodes column metadata and stores in KV with key: table_name
+// fn publishTableSchema(
+//     allocator: std.mem.Allocator,
+//     publisher: *nats_publisher.Publisher,
+//     table_name: []const u8,
+//     columns: []const ColumnInfo,
+//     format: encoder_mod.Format,
+// ) !void {
+//     ... (removed for brevity)
+// }

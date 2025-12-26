@@ -77,14 +77,14 @@ fn initNatsPublisher(
 }
 
 /// Initialize async batch publisher (does NOT start the thread - caller must call start())
-/// The thread MUST be started after the publisher is at its final memory location
+/// Returns heap-allocated BatchPublisher to ensure stable memory address for flush thread
 fn initBatchPublisher(
     allocator: std.mem.Allocator,
     publisher: *nats_publisher.Publisher,
     format: encoder_mod.Format,
     metrics: *metrics_mod.Metrics,
     runtime_config: *const Config.RuntimeConfig,
-) !batch_publisher.BatchPublisher {
+) !*batch_publisher.BatchPublisher {
     const batch_config = batch_publisher.BatchConfig{
         .max_events = runtime_config.batch_max_events,
         .max_wait_ms = runtime_config.batch_max_wait_ms,
@@ -171,6 +171,11 @@ pub fn main() !void {
     else
         std.heap.c_allocator;
 
+    // Snapshot allocator (used by snapshot_listener for chunk processing)
+    // Debug: Use GPA for leak detection
+    // Release: Use c_allocator for better performance
+    const snap_base_alloc = if (IS_DEBUG) allocator else std.heap.c_allocator;
+
     // Parse command-line arguments and build runtime config
     const parsed = try args.Args.parseArgs(allocator);
     const parsed_args = parsed.args;
@@ -249,15 +254,6 @@ pub fn main() !void {
     var publisher = try initNatsPublisher(allocator, &metrics);
     defer publisher.deinit();
 
-    // Initialize nats.zig connection for KV operations
-    // DISABLED: nats.zig has multiple stability issues:
-    // 1. "unreachable" panic in parser when opening KV buckets with auth
-    // 2. Segfault in JSON parsing during connection (arena allocator corruption)
-    // Sticking with nats.c (stable) until nats.zig matures
-    // const nats_conn_zig = @import("nats_connection_zig.zig");
-    // var nats_kv_conn = try nats_conn_zig.NatsConnection.init(allocator);
-    // defer nats_kv_conn.deinit();
-
     // Make publisher available to HTTP server for stream management
     http_srv.nats_publisher = &publisher;
 
@@ -270,22 +266,14 @@ pub fn main() !void {
     // Store monitored tables for validation (used by schema changes and snapshot requests)
     const monitored_tables = replication_ctx.tables;
 
-    try schema_publisher.publishInitialSchemas(
-        allocator,
-        &pg_config,
-        &publisher,
-        monitored_tables,
-        parsed_args.encoding_format,
-    );
-
-    // Initialize dictionaries from NATS KV if compression is enabled
+    // Train dictionaries from sample data if compression is enabled
     if (runtime_config.enable_compression) {
         snapshot_listener.initializeDictionaries(
             allocator,
-            publisher.js, // JetStream context
+            &pg_config,
             monitored_tables,
         ) catch |err| {
-            log.warn("⚠️  Dictionary initialization failed: {} (compression will work without dictionaries)", .{err});
+            log.warn("⚠️  Dictionary training failed: {} (compression will work without dictionaries)", .{err});
             // Continue without dictionaries - graceful degradation
         };
     }
@@ -293,41 +281,47 @@ pub fn main() !void {
     // === Start thread: snapshot listener
     log.info("Starting snapshot listener thread...", .{});
     var snap_listener = snapshot_listener.SnapshotListener.init(
-        allocator,
+        snap_base_alloc,
         &pg_config,
-        &publisher,
         &should_stop,
         monitored_tables,
         parsed_args.encoding_format,
         &runtime_config,
-        publisher.js, // Pass JetStream context for dictionary fetching
     );
     try snap_listener.start();
     defer snap_listener.join();
     defer snap_listener.deinit();
     log.info("✅ Snapshot listener thread started\n", .{});
 
-    // === Start thread: CDC async publisher (at final memory location)
+    // === Start thread: CDC async publisher (heap-allocated for stable address)
     // Use c_allocator (thread-safe) for cross-thread allocations:
     // Main thread allocates CDC event data, flush thread deallocates it
-    var batch_pub = try initBatchPublisher(
+    // Returns *BatchPublisher to ensure memory stability for flush thread
+    const batch_pub = try initBatchPublisher(
         event_alloc,
         &publisher,
         parsed_args.encoding_format,
         &metrics,
         &runtime_config,
     );
-    // Start flush thread AFTER batch_pub is at its final memory location
+    // Start flush thread - batch_pub is now at stable heap address
     try batch_pub.start();
     defer batch_pub.join();
-    defer batch_pub.deinit();
+    defer batch_pub.deinit(); // Will free the heap-allocated BatchPublisher itself
 
-    // === Initialize EventProcessor (main thread CDC processor)
+    // === Parse transition rules from environment variable
+    // Format: "table1:col1,col2;table2:col3,col4"
+    // Example: "users:status,kyc_level;orders:state,payment_status"
+    var transition_rules = try args.Args.parseTransitionRules(allocator);
+    defer args.Args.deinitTransitionRules(&transition_rules, allocator);
+
+    // === Initialize EventProcessor (in this main thread, the CDC processing)
     // EventProcessor enqueues to the SPSC queue that BatchPublisher consumes
     var event_proc = event_processor.EventProcessor.init(
         event_alloc, // Use thread-safe allocator for cross-thread data
-        &batch_pub.event_queue, // Reference to the SPSC queue
+        batch_pub, // Already a pointer - no need for &
         &metrics,
+        &transition_rules, // Pass transition rules for table-specific semantic routing
     );
 
     const batch_config = batch_publisher.BatchConfig{
@@ -354,7 +348,7 @@ pub fn main() !void {
     metrics.setConnected(true);
 
     // CDC events are published to subjects like "cdc.table.operation"
-    log.info("ℹ️ Subject pattern: \x1b[1m {s} \x1b[0m", .{Config.Nats.cdc_subject_wildcard});
+    // log.info("ℹ️ Subject pattern: \x1b[1m {s} \x1b[0m", .{Config.Nats.cdc_subject_wildcard});
 
     // <--- Metrics setup
     const present = std.time.timestamp();
@@ -403,12 +397,8 @@ pub fn main() !void {
             break;
         }
 
-        // Reclaim published events from flush thread (memory ownership cycle)
-        // Now actually frees memory since we're using c_allocator directly
-        const reclaimed = batch_pub.reclaimEvents();
-        if (reclaimed > 0) {
-            log.debug("Reclaimed and freed {d} published events", .{reclaimed});
-        }
+        // Zero-allocation ring buffer: no need to reclaim events!
+        // Slots are automatically returned to free_slots queue by flush thread
 
         if (pg_stream.receiveMessage()) |maybe_msg| {
             if (maybe_msg) |wal_msg_val| {
@@ -449,7 +439,9 @@ pub fn main() !void {
                                 // Relations persist in the map, so clone with main allocator
                                 // (arena will be destroyed at end of scope)
                                 const cloned_rel_ptr = try rel.clone(allocator);
-                                defer allocator.destroy(cloned_rel_ptr);
+                                // NOTE: Don't defer destroy - relation is stored in map and freed on:
+                                // 1. Replacement by new relation (old_rel.deinit below)
+                                // 2. Program exit (relation_map cleanup at line 385-391)
 
                                 // Check if schema changed for a monitored table
                                 const schema_changed = try schema_cache.hasChanged(rel.name, rel.relation_id);
@@ -464,11 +456,15 @@ pub fn main() !void {
                                     cloned_rel_ptr.relation_id,
                                     cloned_rel_ptr.*,
                                 );
-                                // If relation already exists, free the returned old one
+                                // If relation already exists, free the old one
                                 if (result) |old_entry| {
                                     var old_rel = old_entry.value;
                                     old_rel.deinit(allocator);
                                 }
+                                // Free ONLY the pointer wrapper, NOT the nested data
+                                // The map now owns the nested data (namespace, name, columns)
+                                allocator.destroy(cloned_rel_ptr);
+
                                 log.debug("RELATION: {s}.{s} (id={d}, {d} columns)", .{ rel.namespace, rel.name, rel.relation_id, rel.columns.len });
                             },
                             .begin => |b| {
@@ -478,8 +474,10 @@ pub fn main() !void {
                                 // tupleData contains the new row values
                                 if (relation_map.get(ins.relation_id)) |rel| {
                                     try event_proc.processCdcEvent(
+                                        arena_allocator,
                                         rel,
                                         ins.tuple_data,
+                                        null, // No old tuple for INSERT
                                         "INSERT",
                                         wal_msg.wal_end,
                                     );
@@ -489,8 +487,10 @@ pub fn main() !void {
                             .update => |upd| {
                                 if (relation_map.get(upd.relation_id)) |rel| {
                                     try event_proc.processCdcEvent(
+                                        arena_allocator,
                                         rel,
                                         upd.new_tuple,
+                                        upd.old_tuple, // Pass old tuple for REPLICA IDENTITY FULL
                                         "UPDATE",
                                         wal_msg.wal_end,
                                     );
@@ -500,8 +500,10 @@ pub fn main() !void {
                             .delete => |del| {
                                 if (relation_map.get(del.relation_id)) |rel| {
                                     try event_proc.processCdcEvent(
+                                        arena_allocator,
                                         rel,
-                                        del.old_tuple,
+                                        del.old_tuple, // Delete passes the old tuple as the main data
+                                        null, // No secondary tuple for DELETE
                                         "DELETE",
                                         wal_msg.wal_end,
                                     );
@@ -614,8 +616,7 @@ pub fn main() !void {
             metrics.setConnected(false);
             log.info("Attempting to reconnect in 2 seconds...", .{});
 
-            // Reclaim events during idle time
-            _ = batch_pub.reclaimEvents();
+            // Zero-allocation ring buffer: no reclaim needed
 
             std.Thread.sleep(2000 * std.time.ns_per_ms); // 2 seconds
 
@@ -655,7 +656,7 @@ pub fn main() !void {
     // CRITICAL: Signal should_stop BEFORE waiting for completion
     batch_pub.should_stop.store(true, .seq_cst);
 
-    const initial_queue_len = batch_pub.event_queue.len();
+    const initial_queue_len = batch_pub.pending_events.len();
     if (initial_queue_len > 0) {
         log.info("📤 Queue has {d} events waiting to be published...", .{initial_queue_len});
     }
@@ -668,14 +669,14 @@ pub fn main() !void {
     while (!batch_pub.isFlushComplete()) {
         const elapsed = std.time.timestamp() - start_time;
         if (elapsed > shutdown_timeout_seconds) {
-            const remaining = batch_pub.event_queue.len();
+            const remaining = batch_pub.pending_events.len();
             log.warn("⚠️ Shutdown timeout reached - {d} events may not have been published", .{remaining});
             break;
         }
 
         // Log progress every second
         if (elapsed - last_log_time >= 1) {
-            const remaining = batch_pub.event_queue.len();
+            const remaining = batch_pub.pending_events.len();
             if (remaining > 0 or !batch_pub.isFlushComplete()) {
                 log.info("📊 Draining: {d} events in queue, flush thread working...", .{remaining});
             }

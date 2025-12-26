@@ -76,10 +76,6 @@ services:
       file: docker-compose.yml
       service: postgres
 
-  nats-config-gen:
-    extends:
-      file: docker-compose.yml
-      service: nats-config-gen
   nats-server:
     extends:
       file: docker-compose.yml

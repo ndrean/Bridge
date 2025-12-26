@@ -1,6 +1,5 @@
 defmodule Consumer.Application do
   @moduledoc false
-  alias GenLSP.Requests.Initialize
 
   use Application
   require Logger
@@ -8,16 +7,18 @@ defmodule Consumer.Application do
   @impl true
   def start(_type, _args) do
     :persistent_term.put(:format, System.get_env("FORMAT") || "msgpack")
+    :ets.new(:snapshot_schemas, [:named_table, :public, :set])
 
     children = [
       Producer.Repo,
       {Task.Supervisor, name: MyTaskSupervisor},
       {Gnat.ConnectionSupervisor, gnat_supervisor_settings()},
+      {Gnat.ConsumerSupervisor, schema_snap_settings()},
       {PgProducer, args()},
-      {Initializer, []},
       # JetStream pull consumer for CDC events
-      {Consumer.Init, consumer_init_settings()},
-      {Consumer.Cdc, consumer_cdc_settings()}
+      {Task, fn -> publish_schema_snap() end},
+      {Consumer.Cdc, consumer_cdc_settings()},
+      {Consumer.Snap, consumer_snap_settings()}
     ]
 
     opts = [strategy: :one_for_one, name: Consumer.Supervisor]
@@ -42,6 +43,16 @@ defmodule Consumer.Application do
     ]
   end
 
+  defp schema_snap_settings do
+    %{
+      connection_name: :gnat,
+      consuming_function: {SchemaConsumer, :handle_message},
+      subscription_topics: [
+        %{topic: "schema.>"}
+      ]
+    }
+  end
+
   defp consumer_cdc_settings do
     %Gnat.Jetstream.API.Consumer{
       # consumer position tracking is persisted
@@ -57,16 +68,16 @@ defmodule Consumer.Application do
     }
   end
 
-  defp consumer_init_settings do
+  defp consumer_snap_settings do
     %Gnat.Jetstream.API.Consumer{
       # consumer position tracking is persisted
-      durable_name: "ex_init_consumer_1",
+      durable_name: "ex_snap_consumer_1",
       stream_name: "INIT",
       ack_policy: :explicit,
       # 60 seconds in nanoseconds
       ack_wait: 60_000_000_000,
       max_deliver: 3,
-      filter_subject: "init.>",
+      filter_subject: "init.snap.>",
       deliver_policy: :all,
       max_batch: 100
     }
@@ -78,7 +89,7 @@ defmodule Consumer.Application do
       backoff_period: 4_000,
       connection_settings: [
         %{
-          host: System.get_env("NATS_HOST") || "127.0.0.1",
+          host: System.get_env("NATS_HOST") || "localhost",
           port: String.to_integer(System.get_env("NATS_PORT") || "4222"),
           username: System.get_env("NATS_USER"),
           password: System.get_env("NATS_PASSWORD")
@@ -90,5 +101,34 @@ defmodule Consumer.Application do
         }
       ]
     }
+  end
+
+  defp publish_schema_snap do
+    # wait loop for NATS connection establishment
+    case Process.whereis(:gnat) do
+      nil ->
+        Logger.debug("[INIT Consumer] Waiting for NATS connection...")
+        Process.send_after(self(), :retry, 100)
+
+        receive do
+          :retry ->
+            Logger.debug("Loop-----")
+            publish_schema_snap()
+        after
+          2_000 ->
+            Logger.error("[INIT Consumer] 🔴 Timeout waiting for NATS connection")
+            raise "Timeout waiting for NATS connection"
+        end
+
+      _pid ->
+        # ensure JetStream is enabled by the server
+        true = Gnat.server_info(:gnat).jetstream
+        Logger.info("[INIT Consumer] ❇️ NATS connection established with JetStream enabled")
+
+        tables = System.get_env("TABLES")
+        Gnat.pub(:gnat, "init.schema", tables) |> dbg()
+
+        # receive_messages()
+    end
   end
 end

@@ -12,67 +12,175 @@ const batch_publisher = @import("batch_publisher.zig");
 
 pub const log = std.log.scoped(.event_processor);
 
+/// Format a DecodedValue for human-readable logging
+/// Returns a string representation allocated in the provided arena
+fn formatValueForLog(arena: std.mem.Allocator, value: pgoutput.DecodedValue) ![]const u8 {
+    return switch (value) {
+        .null => "NULL",
+        .boolean => |v| if (v) "true" else "false",
+        .int32 => |v| try std.fmt.allocPrint(arena, "{d}", .{v}),
+        .int64 => |v| try std.fmt.allocPrint(arena, "{d}", .{v}),
+        .float64 => |v| try std.fmt.allocPrint(arena, "{d}", .{v}),
+        .text => |v| if (v.len > 50)
+            try std.fmt.allocPrint(arena, "\"{s}...\" ({d} chars)", .{ v[0..47], v.len })
+        else
+            try std.fmt.allocPrint(arena, "\"{s}\"", .{v}),
+        .numeric => |v| v,
+        .jsonb => |v| if (v.len > 50)
+            try std.fmt.allocPrint(arena, "{s}... ({d} chars)", .{ v[0..47], v.len })
+        else
+            v,
+        .array => |v| if (v.len > 50)
+            try std.fmt.allocPrint(arena, "{s}... ({d} chars)", .{ v[0..47], v.len })
+        else
+            v,
+        .bytea => |v| try std.fmt.allocPrint(arena, "<bytea {d} bytes>", .{v.len}),
+    };
+}
+
+/// Compare two DecodedValue instances for equality
+/// Used for transition detection to determine if a column's value changed
+fn valuesEqual(a: pgoutput.DecodedValue, b: pgoutput.DecodedValue) bool {
+    // First check if types match
+    if (@as(std.meta.Tag(pgoutput.DecodedValue), a) != @as(std.meta.Tag(pgoutput.DecodedValue), b)) {
+        return false;
+    }
+
+    // Compare based on type
+    return switch (a) {
+        .null => true, // Both are null
+        .boolean => |av| av == b.boolean,
+        .int32 => |av| av == b.int32,
+        .int64 => |av| av == b.int64,
+        .float64 => |av| av == b.float64,
+        .text => |av| std.mem.eql(u8, av, b.text),
+        .numeric => |av| std.mem.eql(u8, av, b.numeric),
+        .jsonb => |av| std.mem.eql(u8, av, b.jsonb),
+        .array => |av| std.mem.eql(u8, av, b.array),
+        .bytea => |av| std.mem.eql(u8, av, b.bytea),
+    };
+}
+
 /// Event processor that runs in the main thread
 /// Decodes pgoutput tuples, creates CDC events, and enqueues them to the SPSC queue
 pub const EventProcessor = struct {
     allocator: std.mem.Allocator,
-    event_queue: *SPSCQueue(*batch_publisher.CDCEvent),
+    batch_publisher: *batch_publisher.BatchPublisher, // Reference to batch publisher for ring buffer access
     metrics: ?*Metrics, // Optional metrics reference
+    transition_rules: *const Config.EventClassification.TransitionRules, // Per-table transition column rules
 
     pub fn init(
         allocator: std.mem.Allocator,
-        event_queue: *SPSCQueue(*batch_publisher.CDCEvent),
+        batch_pub: *batch_publisher.BatchPublisher,
         metrics: ?*Metrics,
+        transition_rules: *const Config.EventClassification.TransitionRules,
     ) EventProcessor {
         return .{
             .allocator = allocator,
-            .event_queue = event_queue,
+            .batch_publisher = batch_pub,
             .metrics = metrics,
+            .transition_rules = transition_rules,
         };
     }
 
     /// Process CDC event from pgoutput format and enqueue for publishing
-    /// This encapsulates the entire CDC event processing pipeline.
-    /// Returns the event's LSN for tracking, or null if the event was filtered out.
+    /// Handles REPLICA IDENTITY FULL by accepting optional old_tuple_data
+    ///
+    /// arena_allocator: Used for temporary allocations during tuple decoding.
+    ///                  The caller resets the arena after processing each WAL message.
+    /// tuple_data: Main data (New for Insert/Update, Old for Delete)
+    /// old_tuple_data: Extra Old data (Only for Update with REPLICA IDENTITY FULL)
     pub fn processCdcEvent(
         self: *EventProcessor,
+        arena_allocator: std.mem.Allocator,
         rel: pgoutput.RelationMessage,
         tuple_data: pgoutput.TupleData,
+        old_tuple_data: ?pgoutput.TupleData,
         operation: []const u8,
         wal_end: u64,
     ) !void {
-        // Decode tuple data to get actual column values
-        // Use allocator so decoded values survive and are owned by the event
-        var decoded_values = pgoutput.decodeTuple(
-            self.allocator,
-            tuple_data,
-            rel.columns,
-        ) catch |err| {
-            log.warn("⚠️ Failed to decode tuple: {}", .{err});
-            return;
-        };
-        // NOTE: addEvent() takes ownership of decoded_values.
-        // The flush thread will free them after publishing.
-        errdefer {
-            // Only free on error - if addEvent() fails
-            for (decoded_values.items) |column| {
-                switch (column.value) {
-                    .text => |txt| self.allocator.free(txt),
-                    .numeric => |num| self.allocator.free(num),
-                    .array => |arr| self.allocator.free(arr),
-                    .jsonb => |jsn| self.allocator.free(jsn),
-                    .bytea => |byt| self.allocator.free(byt),
-                    else => {}, // int32, int64, float64, boolean, null don't need freeing
+        // We will collect ALL columns (Old + New) in this list
+        var all_columns: std.ArrayList(pgoutput.Column) = .empty;
+        // No defer deinit needed because we use the arena_allocator which is reset per message
+
+        // Track transition detection results
+        var is_transition = false;
+        var transition_column_name: ?[]const u8 = null;
+        var old_value_str: ?[]const u8 = null;
+        var new_value_str: ?[]const u8 = null;
+
+        // 1. Handle "Old" Tuple (REPLICA IDENTITY FULL Updates) + Transition Detection
+        if (old_tuple_data) |old_data| {
+            // Decode the raw WAL bytes for the old tuple
+            const old_decoded = pgoutput.decodeTuple(arena_allocator, old_data, rel.columns) catch |err| {
+                log.warn("⚠️ Failed to decode old tuple: {}", .{err});
+                return;
+            };
+
+            // 2. Decode "Main" Tuple (The standard New values)
+            const main_decoded = pgoutput.decodeTuple(arena_allocator, tuple_data, rel.columns) catch |err| {
+                log.warn("⚠️ Failed to decode tuple: {}", .{err});
+                return;
+            };
+
+            // Check if this table has transition rules configured
+            // If not, cols_to_watch will be null and we skip transition detection entirely (zero overhead)
+            const cols_to_watch = self.transition_rules.get(rel.name);
+
+            // Single pass: Add old.* columns AND detect transitions (if table has rules)
+            for (old_decoded.items, 0..) |col, i| {
+                // A. Always add old.* column to output
+                const prefixed_name = try std.fmt.allocPrint(arena_allocator, "old.{s}", .{col.name});
+                try all_columns.append(arena_allocator, .{
+                    .name = prefixed_name,
+                    .value = col.value,
+                });
+
+                // B. Transition detection (ONLY if table has rules AND this is an UPDATE)
+                if (cols_to_watch) |watch_list| {
+                    if (operation[0] == 'U' and !is_transition and i < main_decoded.items.len) {
+                        // Check if THIS column is in the watch list for THIS table
+                        const is_monitored = for (watch_list) |w_col| {
+                            if (std.mem.eql(u8, col.name, w_col)) break true;
+                        } else false;
+
+                        if (is_monitored) {
+                            const new_val = main_decoded.items[i].value;
+                            if (!valuesEqual(col.value, new_val)) {
+                                is_transition = true;
+                                transition_column_name = col.name;
+
+                                // Format old and new values for logging
+                                old_value_str = try formatValueForLog(arena_allocator, col.value);
+                                new_value_str = try formatValueForLog(arena_allocator, new_val);
+
+                                log.debug("🔄 Transition detected: {s}.{s} changed from {s} to {s}", .{
+                                    rel.name,
+                                    col.name,
+                                    old_value_str.?,
+                                    new_value_str.?,
+                                });
+                            }
+                        }
+                    }
                 }
             }
-            decoded_values.deinit(self.allocator);
+
+            // Add all new columns to output
+            try all_columns.appendSlice(arena_allocator, main_decoded.items);
+        } else {
+            // No old tuple data - just process new/main tuple (INSERT or DELETE)
+            const main_decoded = pgoutput.decodeTuple(arena_allocator, tuple_data, rel.columns) catch |err| {
+                log.warn("⚠️ Failed to decode tuple: {}", .{err});
+                return;
+            };
+            try all_columns.appendSlice(arena_allocator, main_decoded.items);
         }
 
-        // Extract ID value for logging (if present)
-        // Optimize: check length first before memcmp (most column names aren't "id")
+        // Extract ID value for logging (scan for "id" column in the combined list)
         var id_buf: [64]u8 = undefined;
         const id_str = blk: {
-            for (decoded_values.items) |column| {
+            for (all_columns.items) |column| {
                 // Quick rejection: check length first (avoid memcmp for wrong-length names)
                 if (column.name.len == 2 and column.name[0] == 'i' and column.name[1] == 'd') {
                     break :blk switch (column.value) {
@@ -94,13 +202,31 @@ pub const EventProcessor = struct {
             else => unreachable, // Only these 3 operations exist in CDC
         };
 
+        // Determine subject suffix based on transition detection
+        // Only applies to UPDATE operations on tables with configured transition rules:
+        //   - If transition detected: .transition
+        //   - Otherwise: .data
+        // For other operations or tables without rules: no suffix (backward compatible)
+        const has_rules = self.transition_rules.contains(rel.name);
+        const suffix = if (has_rules and operation[0] == 'U')
+            if (is_transition) "transition" else "data"
+        else
+            null;
+
         // Create NATS subject
         var subject_buf: [Config.Buffers.subject_buffer_size]u8 = undefined;
-        const subject = try std.fmt.bufPrintZ(
-            &subject_buf,
-            "{s}.{s}.{s}",
-            .{ Config.Nats.subject_cdc_prefix, rel.name, operation_lower },
-        );
+        const subject = if (suffix) |s|
+            try std.fmt.bufPrintZ(
+                &subject_buf,
+                "{s}.{s}.{s}.{s}",
+                .{ Config.Nats.subject_cdc_prefix, rel.name, operation_lower, s },
+            )
+        else
+            try std.fmt.bufPrintZ(
+                &subject_buf,
+                "{s}.{s}.{s}",
+                .{ Config.Nats.subject_cdc_prefix, rel.name, operation_lower },
+            );
 
         // Generate message ID from WAL LSN for idempotent delivery
         var msg_id_buf: [Config.Buffers.msg_id_buffer_size]u8 = undefined;
@@ -108,17 +234,16 @@ pub const EventProcessor = struct {
             &msg_id_buf,
             "{x}-{s}-{s}",
             .{ wal_end, rel.name, operation_lower },
-            // or rather .{wal_end, relation_id, row_index} in case of multiple rwo changes with same wal_end, or multiple ops on the same table in same record? PG WAL records can contain multiple row changes!
         );
 
-        // Enqueue event to SPSC queue
+        // Enqueue event to ring buffer using the COMBINED list (zero-allocation!)
         try self.addEvent(
             subject,
             rel.name,
             operation,
             msg_id,
             rel.relation_id,
-            decoded_values,
+            all_columns,
             wal_end,
         );
 
@@ -128,16 +253,42 @@ pub const EventProcessor = struct {
         }
 
         // Log single line with table, operation, and ID
-        if (id_str) |id| {
-            log.info("{s} {s}.{s} id={s} → {s}", .{ operation, rel.namespace, rel.name, id, subject });
+        // Include transition details when detected
+        if (is_transition and transition_column_name != null) {
+            if (id_str) |id| {
+                log.info("{s} {s}.{s} id={s} [{s}: {s} → {s}] → {s}", .{
+                    operation,
+                    rel.namespace,
+                    rel.name,
+                    id,
+                    transition_column_name.?,
+                    old_value_str.?,
+                    new_value_str.?,
+                    subject,
+                });
+            } else {
+                log.info("{s} {s}.{s} [{s}: {s} → {s}] → {s}", .{
+                    operation,
+                    rel.namespace,
+                    rel.name,
+                    transition_column_name.?,
+                    old_value_str.?,
+                    new_value_str.?,
+                    subject,
+                });
+            }
         } else {
-            log.info("{s} {s}.{s} → {s}", .{ operation, rel.namespace, rel.name, subject });
+            if (id_str) |id| {
+                log.info("{s} {s}.{s} id={s} → {s}", .{ operation, rel.namespace, rel.name, id, subject });
+            } else {
+                log.info("{s} {s}.{s} → {s}", .{ operation, rel.namespace, rel.name, subject });
+            }
         }
     }
 
-    /// Add an event to the lock-free queue. Wait-free operation (no locks, no blocking).
-    /// Takes ownership of the `data` ArrayList - caller must not free it.
-    /// Allocates event on heap and pushes pointer to queue.
+    /// Add an event to the pre-allocated ring buffer. Zero-allocation operation!
+    /// Copies column data into packed buffer - caller must free decoded_values after this returns.
+    /// Writes event data directly into a free slot from the ring buffer.
     fn addEvent(
         self: *EventProcessor,
         subject: []const u8,
@@ -145,75 +296,142 @@ pub const EventProcessor = struct {
         operation: []const u8,
         msg_id: []const u8,
         relation_id: u32,
-        data: ?std.ArrayList(pgoutput.Column),
+        decoded_values: std.ArrayList(pgoutput.Column),
         lsn: u64,
     ) !void {
         log.debug("📥 Adding event to queue: {s} {s}", .{ operation, table });
 
-        // Only copy the strings (subject, table, operation, msg_id)
-        // Take ownership of the columns ArrayList directly (zero-copy for column data)
-        const owned_subject = try self.allocator.dupeZ(u8, subject);
-        errdefer self.allocator.free(owned_subject);
+        // Get a free slot from the ring buffer with backpressure retry + watchdog
+        // Exit if flush thread has fatal error (NATS dead) to prevent infinite spinning
+        var retry_count: usize = 0;
+        const max_retries_before_fatal_check = 1000; // Check fatal error every 1000 retries
+        var timer = std.time.Timer.start() catch null; // Optional timer for watchdog
+        const watchdog_timeout_ns = std.time.ns_per_s * 30; // 30 second hard timeout
 
-        const owned_table = try self.allocator.dupe(u8, table);
-        errdefer self.allocator.free(owned_table);
+        const slot_idx = while (true) {
+            if (self.batch_publisher.free_slots.pop()) |idx| {
+                break idx;
+            }
 
-        const owned_operation = try self.allocator.dupe(u8, operation);
-        errdefer self.allocator.free(owned_operation);
+            retry_count += 1;
 
-        const owned_msg_id = try self.allocator.dupe(u8, msg_id);
-        errdefer self.allocator.free(owned_msg_id);
+            // 1. Check if flush thread has encountered a fatal error (e.g., NATS permanently down)
+            if (retry_count % max_retries_before_fatal_check == 0) {
+                if (self.batch_publisher.hasFatalError()) {
+                    log.err("🔴 Flush thread has fatal error - aborting event processing", .{});
+                    return error.PublisherFatalError;
+                }
+            }
 
-        // Allocate event on heap instead of stack
-        const event_ptr = try self.allocator.create(batch_publisher.CDCEvent);
-        errdefer self.allocator.destroy(event_ptr);
+            // 2. Watchdog: Hard timeout if flush thread is completely stuck (NATS client hung)
+            if (timer) |*t| {
+                if (t.read() > watchdog_timeout_ns) {
+                    log.err("🔴 FATAL: Flush thread blocked for >30s without setting fatal_error", .{});
+                    log.err("    This indicates NATS client library is hung. Forcing shutdown.", .{});
+                    self.batch_publisher.fatal_error.store(true, .seq_cst);
+                    return error.FlushThreadStalled;
+                }
+            }
 
-        event_ptr.* = batch_publisher.CDCEvent{
-            .subject = owned_subject,
-            .table = owned_table,
-            .operation = owned_operation,
-            .msg_id = owned_msg_id,
-            .relation_id = relation_id,
-            .data = data, // Transfer ownership - no copy!
-            .lsn = lsn,
+            // Log warning on first retry, then periodically
+            if (retry_count == 1 or retry_count % 100 == 0) {
+                log.warn(
+                    "⚠️ Ring buffer full! Applying backpressure (retry #{d}). Capacity: {d}",
+                    .{ retry_count, self.batch_publisher.events.len },
+                );
+            }
+
+            // Yield CPU to flush thread
+            std.Thread.yield() catch {};
         };
-        // If push fails with unexpected error, clean up the event
-        errdefer {
-            event_ptr.deinit(self.allocator);
-            self.allocator.destroy(event_ptr);
+
+        // Success - got a free slot!
+        if (retry_count > 0) {
+            log.info("Ring buffer slot available after {d} retries, resuming", .{retry_count});
         }
 
-        // Push pointer to lock-free queue with backpressure retry
-        var retry_count: usize = 0;
+        // Get mutable reference to the pre-allocated event slot
+        const event = &self.batch_publisher.events[slot_idx];
+
+        // Reset event to clear any previous data
+        event.reset();
+
+        // Copy strings into inline buffers (zero heap allocation!)
+        try event.setSubject(subject);
+        try event.setTable(table);
+        try event.setOperation(operation);
+        try event.setMsgId(msg_id);
+
+        // Set remaining fields
+        event.relation_id = relation_id;
+        event.lsn = lsn;
+
+        // Pack columns into data_buffer (zero heap allocation!)
+        for (decoded_values.items) |column| {
+            event.addColumn(column.name, column.value) catch |err| {
+                if (err == error.BufferOverflow) {
+                    // TERMINAL FAILURE: Do not return the slot, do not yield.
+                    // We must stop to prevent ACKing this LSN to PostgreSQL.
+                    // If we ACK'd, PostgreSQL would discard this WAL data and we'd lose the row permanently.
+                    log.err("🔴🔴🔴 FATAL: CDC Event too large for pre-allocated buffer 🔴🔴🔴", .{});
+                    log.err("This is a configuration error - the bridge is shutting down to prevent data loss.", .{});
+                    log.err("The current row will be replayed when the bridge restarts with a larger buffer.", .{});
+                    @panic("CDC Event too large for buffer. Increase BASE_BUF environment variable and restart.");
+                }
+                // Other errors - return slot and propagate
+                log.err("Failed to pack column '{s}': {}", .{ column.name, err });
+                event.reset();
+                self.batch_publisher.free_slots.push(slot_idx) catch {};
+                return err;
+            };
+        }
+
+        // Push slot index to pending queue with retry + watchdog
+        // Exit if flush thread has fatal error to prevent infinite spinning
+        retry_count = 0;
+        timer = std.time.Timer.start() catch null; // Reset timer for second wait phase
         while (true) {
-            self.event_queue.push(event_ptr) catch |err| {
+            self.batch_publisher.pending_events.push(slot_idx) catch |err| {
                 if (err == error.QueueFull) {
                     retry_count += 1;
 
-                    // Log warning on first retry, then periodically
-                    if (retry_count == 1 or retry_count % 100 == 0) {
-                        log.warn(
-                            "⚠️ Event queue full! Applying backpressure (retry #{d}). Queue capacity: {d}",
-                            .{ retry_count, Config.Batch.ring_buffer_size },
-                        );
+                    // 1. Check if flush thread has encountered a fatal error
+                    if (retry_count % max_retries_before_fatal_check == 0) {
+                        if (self.batch_publisher.hasFatalError()) {
+                            log.err("🔴 Flush thread has fatal error - aborting event push", .{});
+                            event.reset();
+                            self.batch_publisher.free_slots.push(slot_idx) catch {};
+                            return error.PublisherFatalError;
+                        }
                     }
 
-                    // Yield CPU to flush thread
+                    // 2. Watchdog: Hard timeout if flush thread is completely stuck
+                    if (timer) |*t| {
+                        if (t.read() > watchdog_timeout_ns) {
+                            log.err("🔴 FATAL: Flush thread blocked for >30s during pending queue push", .{});
+                            log.err("    NATS client library appears hung. Forcing shutdown.", .{});
+                            event.reset();
+                            self.batch_publisher.free_slots.push(slot_idx) catch {};
+                            self.batch_publisher.fatal_error.store(true, .seq_cst);
+                            return error.FlushThreadStalled;
+                        }
+                    }
+
+                    if (retry_count == 1 or retry_count % 100 == 0) {
+                        log.warn("⚠️ Pending queue full (retry #{d})", .{retry_count});
+                    }
                     std.Thread.yield() catch {};
-                    continue; // Retry
+                    continue;
                 }
 
-                // Unexpected error - propagate (errdefer will clean up)
+                // Unexpected error - return slot to free pool and propagate
+                event.reset();
+                self.batch_publisher.free_slots.push(slot_idx) catch {};
                 return err;
             };
-
-            // Success!
-            if (retry_count > 0) {
-                log.info("Queue space available after {d} retries, resuming", .{retry_count});
-            }
             break;
         }
 
-        log.debug("Event pointer added to lock-free queue", .{});
+        log.debug("Event written to slot {d}, pushed to pending queue ({d} columns packed)", .{ slot_idx, event.column_count });
     }
 };

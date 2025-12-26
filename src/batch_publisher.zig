@@ -6,6 +6,7 @@
 const std = @import("std");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
+const nats = @import("nats");
 const nats_publisher = @import("nats_publisher.zig");
 const msgpack = @import("msgpack");
 const pgoutput = @import("pgoutput.zig");
@@ -15,6 +16,42 @@ const encoder_mod = @import("encoder.zig");
 const Metrics = @import("metrics.zig").Metrics;
 
 pub const log = std.log.scoped(.batch_publisher);
+
+/// Initialize memory slab for event ring buffer with optional memory locking
+/// Returns a contiguous block of memory sized for `slot_count` events of `slot_size` bytes each
+///
+/// Memory locking (mlock) prevents the kernel from swapping this buffer to disk,
+/// eliminating swap-related latency spikes in production. This is critical for:
+/// - Zero-stutter CDC replication (no pause when memory is swapped back in)
+/// - Predictable latency under memory pressure
+/// - Real-time performance guarantees
+///
+/// Note: mlock may fail if RLIMIT_MEMLOCK is too low. Check with `ulimit -l`.
+/// On systemd systems, you may need to set LimitMEMLOCK=infinity in the service file.
+pub fn initSlab(allocator: std.mem.Allocator, slot_count: usize, slot_size: usize) ![]u8 {
+    const total_bytes = slot_count * slot_size;
+
+    // Allocate page-aligned memory for mlock compatibility
+    const page_size = std.heap.page_size_min;
+    const slab = try allocator.alignedAlloc(u8, page_size, total_bytes);
+    errdefer allocator.free(slab);
+
+    // Attempt to lock memory to prevent swapping
+    // std.posix.mlock is available on POSIX systems (Linux, macOS, BSD)
+    if (@hasDecl(std.posix, "mlock")) {
+        std.posix.mlock(slab.ptr, slab.len) catch |err| {
+            // mlock failure is not fatal - bridge will still work, just with potential swap latency
+            log.warn("⚠️  Could not lock memory to RAM ({any}). Bridge will work but may experience swap-related latency.", .{err});
+            log.warn("    To enable memory locking, increase RLIMIT_MEMLOCK: ulimit -l unlimited", .{});
+            log.warn("    For systemd services, add LimitMEMLOCK=infinity to the service file.", .{});
+        };
+        log.info("🔒 Successfully pinned {d} MB to RAM (Zero-Stutter mode)", .{total_bytes / (1024 * 1024)});
+    } else {
+        log.info("📦 Allocated {d} MB slab (memory locking not available on this platform)", .{total_bytes / (1024 * 1024)});
+    }
+
+    return slab;
+}
 
 /// Convert pgoutput.Column value to encoder.Value
 fn columnValueToEncoderValue(
@@ -103,38 +140,222 @@ pub const BatchConfig = struct {
     max_payload_bytes: usize = 128 * 1024, // 128KB
 };
 
+/// Maximum packed buffer size for column data (1MB = 2^20)
+/// Actual size used is determined by runtime config (event_data_buffer_log2)
+/// This is the compile-time maximum - runtime config must not exceed this
+const MAX_EVENT_DATA_BUFFER_SIZE: usize = 1024 * 1024; // 1MB
+
 /// A single CDC event to be batched
+/// Zero-allocation design: all data stored in packed inline buffers
 pub const CDCEvent = struct {
-    subject: [:0]const u8,
-    table: []const u8,
-    operation: []const u8,
-    msg_id: []const u8,
-    relation_id: u32, // PostgreSQL relation OID (for schema version tracking)
-    data: ?std.ArrayList(pgoutput.Column),
-    lsn: u64, // WAL LSN for this event
+    // Fixed-size buffers for metadata (inline storage, no heap allocation)
+    subject_buf: [128]u8 = undefined,
+    subject_len: u8 = 0,
 
-    pub fn deinit(self: *CDCEvent, allocator: std.mem.Allocator) void {
-        allocator.free(self.subject);
-        allocator.free(self.table);
-        allocator.free(self.operation);
-        allocator.free(self.msg_id);
+    table_buf: [64]u8 = undefined,
+    table_len: u8 = 0,
 
-        if (self.data) |*columns| {
-            // Free slice-based values in columns
-            for (columns.items) |column| {
-                // Note: column.name is NOT owned (points to RelationMessage.columns)
-                // Only free the value if it's a slice type
-                switch (column.value) {
-                    .text => |txt| allocator.free(txt),
-                    .numeric => |num| allocator.free(num),
-                    .array => |arr| allocator.free(arr),
-                    .jsonb => |jsn| allocator.free(jsn),
-                    .bytea => |byt| allocator.free(byt),
-                    else => {}, // int32, int64, float64, boolean, null don't need freeing
-                }
-            }
-            columns.deinit(allocator);
+    operation_buf: [8]u8 = undefined, // INSERT, UPDATE, DELETE
+    operation_len: u8 = 0,
+
+    msg_id_buf: [64]u8 = undefined,
+    msg_id_len: u8 = 0,
+
+    relation_id: u32 = 0, // PostgreSQL relation OID (for schema version tracking)
+    lsn: u64 = 0, // WAL LSN for this event
+
+    // Packed data area - column names and values packed contiguously
+    // Points into separately-allocated data slab (sized at runtime)
+    // This avoids wasting memory when user configures smaller buffer sizes
+    data_buffer: []u8 = &[_]u8{}, // Slice into data slab
+    data_len: usize = 0,
+    // Note: data_buffer.len is the limit (no separate field needed)
+
+    // Fixed array of column descriptors (indices into data_buffer)
+    // Maximum 64 columns per event
+    // columns: [64]ColumnView = undefined,
+    columns: [512]ColumnView = undefined, // UPDATE to 512 columns
+    column_count: u8 = 0,
+
+    /// Column descriptor - "fat pointer" into packed data_buffer
+    pub const ColumnView = struct {
+        name_len: u8,
+        name_offset: u16,
+        value_tag: pgoutput.ValueTag,
+        value_len: u32,
+        value_offset: u32,
+    };
+
+    /// Set subject string (copies into inline buffer)
+    pub fn setSubject(self: *CDCEvent, subject: []const u8) !void {
+        if (subject.len > self.subject_buf.len) {
+            return error.SubjectTooLong;
         }
+        @memcpy(self.subject_buf[0..subject.len], subject);
+        self.subject_len = @intCast(subject.len);
+    }
+
+    /// Get subject string as slice
+    pub inline fn getSubject(self: *const CDCEvent) []const u8 {
+        return self.subject_buf[0..self.subject_len];
+    }
+
+    /// Set table name (copies into inline buffer)
+    pub fn setTable(self: *CDCEvent, table: []const u8) !void {
+        if (table.len > self.table_buf.len) {
+            return error.TableNameTooLong;
+        }
+        @memcpy(self.table_buf[0..table.len], table);
+        self.table_len = @intCast(table.len);
+    }
+
+    /// Get table name as slice
+    pub inline fn getTable(self: *const CDCEvent) []const u8 {
+        return self.table_buf[0..self.table_len];
+    }
+
+    /// Set operation (copies into inline buffer)
+    pub fn setOperation(self: *CDCEvent, operation: []const u8) !void {
+        if (operation.len > self.operation_buf.len) {
+            return error.OperationTooLong;
+        }
+        @memcpy(self.operation_buf[0..operation.len], operation);
+        self.operation_len = @intCast(operation.len);
+    }
+
+    /// Get operation as slice
+    pub inline fn getOperation(self: *const CDCEvent) []const u8 {
+        return self.operation_buf[0..self.operation_len];
+    }
+
+    /// Set message ID (copies into inline buffer)
+    pub fn setMsgId(self: *CDCEvent, msg_id: []const u8) !void {
+        if (msg_id.len > self.msg_id_buf.len) {
+            return error.MsgIdTooLong;
+        }
+        @memcpy(self.msg_id_buf[0..msg_id.len], msg_id);
+        self.msg_id_len = @intCast(msg_id.len);
+    }
+
+    /// Get message ID as slice
+    pub inline fn getMsgId(self: *const CDCEvent) []const u8 {
+        return self.msg_id_buf[0..self.msg_id_len];
+    }
+
+    /// Add column to packed buffer (zero-allocation)
+    /// Packs column name and value contiguously into data_buffer
+    pub fn addColumn(self: *CDCEvent, name: []const u8, value: pgoutput.DecodedValue) !void {
+        if (self.column_count >= 512) { // CHANGED FORM 64->512
+            return error.TooManyColumns;
+        }
+
+        // Pack column name
+        const name_off = @as(u16, @intCast(self.data_len));
+        const required_size = self.data_len + name.len;
+        if (required_size > self.data_buffer.len) {
+            log.err("🔴 FATAL: Row size exceeds configured buffer capacity!", .{});
+            log.err("    Column: '{s}'", .{name});
+            log.err("    Required: {d} bytes", .{required_size});
+            log.err("    Available: {d} bytes (BASE_BUF={d})", .{ self.data_buffer.len, std.math.log2_int(usize, self.data_buffer.len) });
+            log.err("    Table: {s}", .{self.getTable()});
+            log.err("    Solution: Increase BASE_BUF environment variable (e.g., BASE_BUF=16 for 64KB)", .{});
+            return error.BufferOverflow;
+        }
+        @memcpy(self.data_buffer[self.data_len..][0..name.len], name);
+        self.data_len += name.len;
+
+        // Pack value based on type and determine value tag
+        const val_off = @as(u32, @intCast(self.data_len));
+        var val_len: u32 = 0;
+        const value_tag: pgoutput.ValueTag = switch (value) {
+            .null => .null,
+            .boolean => .boolean,
+            .int32 => .int32,
+            .int64 => .int64,
+            .float64 => .float64,
+            .text => .text,
+            .numeric => .numeric,
+            .jsonb => .jsonb,
+            .array => .array,
+            .bytea => .bytea,
+        };
+
+        switch (value) {
+            .null => {
+                // No data to pack
+                val_len = 0;
+            },
+            .boolean => |v| {
+                val_len = 1;
+                if (self.data_len + val_len > self.data_buffer.len) {
+                    log.err("🔴 FATAL: Row size exceeds configured buffer capacity (boolean value)!", .{});
+                    log.err("    Required: {d} bytes, Available: {d} bytes", .{ self.data_len + val_len, self.data_buffer.len });
+                    return error.BufferOverflow;
+                }
+                self.data_buffer[self.data_len] = if (v) 1 else 0;
+            },
+            .int32 => |v| {
+                val_len = 4;
+                if (self.data_len + val_len > self.data_buffer.len) {
+                    log.err("🔴 FATAL: Row size exceeds configured buffer capacity (int32 value)!", .{});
+                    log.err("    Required: {d} bytes, Available: {d} bytes", .{ self.data_len + val_len, self.data_buffer.len });
+                    return error.BufferOverflow;
+                }
+                std.mem.writeInt(i32, self.data_buffer[self.data_len..][0..4], v, .little);
+            },
+            .int64 => |v| {
+                val_len = 8;
+                if (self.data_len + val_len > self.data_buffer.len) {
+                    log.err("🔴 FATAL: Row size exceeds configured buffer capacity (int64 value)!", .{});
+                    log.err("    Required: {d} bytes, Available: {d} bytes", .{ self.data_len + val_len, self.data_buffer.len });
+                    return error.BufferOverflow;
+                }
+                std.mem.writeInt(i64, self.data_buffer[self.data_len..][0..8], v, .little);
+            },
+            .float64 => |v| {
+                val_len = 8;
+                if (self.data_len + val_len > self.data_buffer.len) {
+                    log.err("🔴 FATAL: Row size exceeds configured buffer capacity (float64 value)!", .{});
+                    log.err("    Required: {d} bytes, Available: {d} bytes", .{ self.data_len + val_len, self.data_buffer.len });
+                    return error.BufferOverflow;
+                }
+                const bytes = std.mem.asBytes(&v);
+                @memcpy(self.data_buffer[self.data_len..][0..8], bytes);
+            },
+            .text, .numeric, .jsonb, .array, .bytea => |v| {
+                val_len = @intCast(v.len);
+                if (self.data_len + val_len > self.data_buffer.len) {
+                    log.err("🔴 FATAL: Row size exceeds configured buffer capacity (string/blob value)!", .{});
+                    log.err("    Value size: {d} bytes, Total required: {d} bytes, Available: {d} bytes", .{ val_len, self.data_len + val_len, self.data_buffer.len });
+                    return error.BufferOverflow;
+                }
+                @memcpy(self.data_buffer[self.data_len..][0..v.len], v);
+            },
+        }
+        self.data_len += val_len;
+
+        // Store column descriptor
+        self.columns[self.column_count] = .{
+            .name_len = @intCast(name.len),
+            .name_offset = name_off,
+            .value_tag = value_tag,
+            .value_len = val_len,
+            .value_offset = val_off,
+        };
+        self.column_count += 1;
+    }
+
+    /// Reset event for reuse (zero-allocation design)
+    /// Called when returning slot to free queue
+    pub fn reset(self: *CDCEvent) void {
+        self.subject_len = 0;
+        self.table_len = 0;
+        self.operation_len = 0;
+        self.msg_id_len = 0;
+        self.relation_id = 0;
+        self.lsn = 0;
+        self.data_len = 0;
+        self.column_count = 0;
     }
 };
 
@@ -147,16 +368,24 @@ pub const BatchPublisher = struct {
     format: encoder_mod.Format,
     metrics: ?*Metrics, // Optional metrics reference
 
-    // Lock-free event queue (SPSC: Single Producer Single Consumer)
-    // Producer: Main thread (via EventProcessor)
-    // Consumer: Flush thread (this thread)
-    // Now uses pointers to avoid copying CDCEvent structs
-    event_queue: SPSCQueue(*CDCEvent),
+    // Pre-allocated ring buffer of CDCEvent structs (zero malloc/free!)
+    // Allocated once at startup, reused for entire lifetime
+    events: []CDCEvent,
 
-    // Reclaim queue for memory ownership cycle
-    // Flush thread returns pointers here after publishing
-    // Main thread reclaims and frees in idle loops
-    reclaim_queue: SPSCQueue(*CDCEvent),
+    // Data slab - backing storage for all event data_buffers
+    // Allocated separately to avoid wasting memory on MAX_EVENT_DATA_BUFFER_SIZE
+    data_slab: []u8,
+
+    // Lock-free queue of INDICES into events array (SPSC)
+    // Producer: Main thread (via EventProcessor) - pushes event slot indices
+    // Consumer: Flush thread - pops indices to read events
+    pending_events: SPSCQueue(usize),
+
+    // Free slots queue - tracks available event slots
+    // Initially filled with all indices (0..capacity-1)
+    // Producer pops free slot, writes event, pushes to pending
+    // Consumer pops pending, reads event, pushes back to free
+    free_slots: SPSCQueue(usize),
 
     // Atomic state shared between threads
     last_confirmed_lsn: std.atomic.Value(u64), // Last LSN confirmed by NATS
@@ -174,31 +403,116 @@ pub const BatchPublisher = struct {
         format: encoder_mod.Format,
         metrics: ?*Metrics,
         runtime_config: *const Config.RuntimeConfig,
-    ) !BatchPublisher {
-        // Initialize lock-free queues with power-of-2 capacity from runtime config
-        const event_queue = try SPSCQueue(*CDCEvent).init(
-            allocator,
-            runtime_config.batch_ring_buffer_size,
-        );
-        const reclaim_queue = try SPSCQueue(*CDCEvent).init(
-            allocator,
-            runtime_config.batch_ring_buffer_size,
-        );
+    ) !*BatchPublisher {
+        // 1. The actual number of events the user wants
+        const event_count = runtime_config.batch_ring_buffer_size;
 
-        return BatchPublisher{
+        // 2a. Allocate metadata structs (tiny - just pointers and counters)
+        const events = try allocator.alloc(CDCEvent, event_count);
+        errdefer allocator.free(events);
+
+        // 2b. Calculate runtime buffer size from config
+        // bit shifting equivalent to td.math.pow(2, N)
+        const buffer_limit = @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2);
+
+        // Validate buffer limit doesn't exceed compile-time maximum
+        if (buffer_limit > MAX_EVENT_DATA_BUFFER_SIZE) {
+            log.err("🔴 FATAL: Configured buffer size ({d} bytes) exceeds compile-time maximum ({d} bytes)", .{
+                buffer_limit,
+                MAX_EVENT_DATA_BUFFER_SIZE,
+            });
+            log.err("    BASE_BUF={d} is too large. Maximum allowed: {d}", .{
+                runtime_config.event_data_buffer_log2,
+                std.math.log2_int(usize, MAX_EVENT_DATA_BUFFER_SIZE),
+            });
+            return error.BufferSizeTooLarge;
+        }
+
+        // 2c. Allocate DATA SLAB - this is the heavy allocation we want to mlock
+        // Allocate exactly the size the user configured (no waste!)
+        const data_slab_size = event_count * buffer_limit;
+
+        // Allocate page-aligned for mlock compatibility
+        // Use regular alloc - alignment will be sufficient for mlock on most systems
+        const data_slab = try allocator.alloc(u8, data_slab_size);
+        errdefer allocator.free(data_slab);
+
+        // 2d. Lock the DATA SLAB to RAM (this prevents swapping)
+        if (@hasDecl(std.posix, "mlock")) {
+            std.posix.mlock(data_slab.ptr, data_slab.len) catch |err| {
+                log.warn("⚠️  Could not lock data slab to RAM ({any})", .{err});
+                log.warn("    Bridge will work but may experience swap-related latency", .{});
+            };
+        }
+
+        // 2e. Link: Point each event's data_buffer into its slice of the slab
+        for (events, 0..) |*event, i| {
+            const offset = i * buffer_limit;
+            event.* = CDCEvent{
+                .data_buffer = data_slab[offset .. offset + buffer_limit],
+            };
+        }
+
+        // Calculate actual memory usage (metadata + data)
+        const metadata_bytes = @sizeOf(CDCEvent) * event_count;
+        const data_bytes = data_slab_size;
+        const total_bytes = metadata_bytes + data_bytes;
+        const total_mb = total_bytes / (1024 * 1024);
+
+        log.info("📦 Ring buffer allocation (two-stage):", .{});
+        log.info("   • Event count: {d}", .{event_count});
+        log.info("   • Buffer per event: {d} bytes (BASE_BUF={d})", .{ buffer_limit, runtime_config.event_data_buffer_log2 });
+        log.info("   • Metadata: {d} KB ({d} bytes/event)", .{ metadata_bytes / 1024, @sizeOf(CDCEvent) });
+        log.info("   • Data slab: {d} MB (mlock={s})", .{ data_bytes / (1024 * 1024), if (@hasDecl(std.posix, "mlock")) "yes" else "no" });
+        log.info("   • Total: {d} MB", .{total_mb});
+
+        // 3. Queue Capacity: SPSC math requires:
+        //    a) Power of 2
+        //    b) N+1 slots to hold N items (one slot reserved for full/empty distinction)
+        const min_queue_size = event_count + 1;
+        const queue_cap = std.math.ceilPowerOfTwo(usize, min_queue_size) catch return error.CapacityTooLarge;
+
+        var pending_events = try SPSCQueue(usize).init(allocator, queue_cap);
+        errdefer pending_events.deinit();
+
+        var free_slots = try SPSCQueue(usize).init(allocator, queue_cap);
+        errdefer free_slots.deinit();
+
+        // 4. Populate: Only push the indices of the storage we actually have
+        for (0..event_count) |i| {
+            try free_slots.push(i);
+        }
+
+        log.info("✨ Pre-allocated ring buffer: {d} events × {d} bytes = {d} KB (queue capacity: {d})", .{
+            event_count,
+            @sizeOf(CDCEvent),
+            (event_count * @sizeOf(CDCEvent)) / 1024,
+            queue_cap,
+        });
+
+        // Allocate BatchPublisher on heap for stable memory address
+        // This is critical because flush_thread holds references to pending_events/free_slots
+        const self = try allocator.create(BatchPublisher);
+        errdefer allocator.destroy(self);
+
+        self.* = BatchPublisher{
             .allocator = allocator,
             .publisher = publisher,
             .config = config,
             .format = format,
             .metrics = metrics,
-            .event_queue = event_queue,
-            .reclaim_queue = reclaim_queue,
+            .events = events,
+            .data_slab = data_slab,
+            .pending_events = pending_events,
+            .free_slots = free_slots,
             .last_confirmed_lsn = std.atomic.Value(u64).init(0),
             .fatal_error = std.atomic.Value(bool).init(false),
             .flush_complete = std.atomic.Value(bool).init(false),
             .flush_thread = null,
             .should_stop = std.atomic.Value(bool).init(false),
         };
+
+        return self;
     }
 
     /// Start the background flush thread. Must be called after init() and after
@@ -220,35 +534,43 @@ pub const BatchPublisher = struct {
         }
     }
 
-    /// Deinit - cleanup resources (call after join)
+    /// Deinit - cleanup resources
+    /// Safe to call even if join() wasn't called - will join first if needed
     pub fn deinit(self: *BatchPublisher) void {
-        // Clean up any remaining events in the event queue
-        while (self.event_queue.pop()) |event_ptr| {
-            event_ptr.deinit(self.allocator);
-            self.allocator.destroy(event_ptr);
+        // 1. Ensure background thread is stopped before freeing memory
+        //    This prevents shutdown race where thread accesses freed memory
+        //    Safe to call multiple times - join() is idempotent
+        self.join();
+
+        const allocator = self.allocator;
+
+        // 2. Unlock the data slab from RAM (symmetric with mlock in init)
+        if (@hasDecl(std.posix, "munlock")) {
+            std.posix.munlock(self.data_slab.ptr, self.data_slab.len) catch |err| {
+                log.warn("⚠️  Failed to unlock data slab: {any}", .{err});
+            };
         }
 
-        // Clean up any remaining events in the reclaim queue
-        while (self.reclaim_queue.pop()) |event_ptr| {
-            event_ptr.deinit(self.allocator);
-            self.allocator.destroy(event_ptr);
-        }
+        // 3. Now safe to free memory - no other thread is accessing it
+        allocator.free(self.data_slab); // Free data slab first
+        allocator.free(self.events); // Then metadata structs
+        self.pending_events.deinit();
+        self.free_slots.deinit();
 
-        // Deinit the queues themselves
-        self.event_queue.deinit();
-        self.reclaim_queue.deinit();
+        log.info("🛑 Batch publisher stopped cleanly", .{});
 
-        log.info("🥁 Batch publisher stopped", .{});
+        // 4. Free the heap-allocated BatchPublisher struct itself
+        allocator.destroy(self);
     }
 
-    /// Add an event to the batch (called from flush thread)
-    /// Now works with event pointers
+    /// Add an event index to the batch (called from flush thread)
+    /// Works with slot indices (not pointers!)
     fn addToBatch(
-        batch: *std.ArrayList(*CDCEvent),
-        event_ptr: *CDCEvent,
+        batch: *std.ArrayList(usize),
+        slot_idx: usize,
         allocator: std.mem.Allocator,
     ) !void {
-        try batch.append(allocator, event_ptr);
+        try batch.append(allocator, slot_idx);
     }
 
     /// Get the last LSN that was successfully confirmed by NATS
@@ -259,14 +581,14 @@ pub const BatchPublisher = struct {
 
     /// Get current queue usage (0.0 = empty, 1.0 = full)
     pub fn getQueueUsage(self: *BatchPublisher) f64 {
-        const current_len = self.event_queue.len();
-        const capacity = self.event_queue.capacity;
+        const current_len = self.pending_events.len();
+        const capacity = self.events.len;
         return @as(f64, @floatFromInt(current_len)) / @as(f64, @floatFromInt(capacity));
     }
 
-    /// Check if both queues are empty (safe point for arena reset)
+    /// Check if pending queue is empty (safe point for shutdown)
     pub fn queuesEmpty(self: *BatchPublisher) bool {
-        return self.event_queue.isEmpty() and self.reclaim_queue.isEmpty();
+        return self.pending_events.isEmpty();
     }
 
     /// Check if a fatal error occurred (e.g., NATS reconnection timeout)
@@ -279,21 +601,9 @@ pub const BatchPublisher = struct {
         return self.flush_complete.load(.seq_cst);
     }
 
-    /// Reclaim published events from the reclaim queue (called from main thread)
-    /// Returns number of events reclaimed and freed
-    /// Batches reclamation to reduce overhead
-    pub fn reclaimEvents(self: *BatchPublisher) usize {
-        var count: usize = 0;
-        const max_reclaim_per_call: usize = 100; // Limit reclamation per call to avoid blocking
-
-        while (count < max_reclaim_per_call) {
-            const event_ptr = self.reclaim_queue.pop() orelse break;
-            // Free individual allocations (no-op for ArenaAllocator)
-            event_ptr.deinit(self.allocator);
-            self.allocator.destroy(event_ptr);
-            count += 1;
-        }
-        return count;
+    /// Get the current queue length (number of pending events)
+    pub fn len(self: *BatchPublisher) usize {
+        return self.pending_events.len();
     }
 
     /// Background thread that continuously drains events from lock-free queue and flushes to NATS
@@ -303,17 +613,15 @@ pub const BatchPublisher = struct {
         var batches_processed: usize = 0;
         var last_flush_time = std.time.milliTimestamp();
 
-        // Persistent batch that accumulates event pointers across iterations
-        var batch = std.ArrayList(*CDCEvent){};
+        // Persistent batch that accumulates slot indices across iterations
+        var batch = std.ArrayList(usize){};
         var current_payload_size: usize = 0; // Track approximate payload size
         defer {
-            // Clean up on thread exit - return pointers to reclaim queue
-            for (batch.items) |event_ptr| {
-                self.reclaim_queue.push(event_ptr) catch |err| {
-                    log.err("Failed to reclaim event on thread exit: {}", .{err});
-                    // Last resort - free directly
-                    event_ptr.deinit(self.allocator);
-                    self.allocator.destroy(event_ptr);
+            // Return slot indices to free queue on thread exit
+            for (batch.items) |slot_idx| {
+                self.events[slot_idx].reset();
+                self.free_slots.push(slot_idx) catch |err| {
+                    log.err("Failed to return slot on thread exit: {}", .{err});
                 };
             }
             batch.deinit(self.allocator);
@@ -324,19 +632,17 @@ pub const BatchPublisher = struct {
             while (batch.items.len < self.config.max_events and
                 current_payload_size < self.config.max_payload_bytes)
             {
-                const event_ptr = self.event_queue.pop() orelse break;
+                const slot_idx = self.pending_events.pop() orelse break;
 
+                const event = &self.events[slot_idx];
                 // Approximate payload size (table + operation + subject strings)
-                const event_size = event_ptr.table.len + event_ptr.operation.len + event_ptr.subject.len;
+                const event_size = event.table_len + event.operation_len + event.subject_len;
 
-                addToBatch(&batch, event_ptr, self.allocator) catch |err| {
+                addToBatch(&batch, slot_idx, self.allocator) catch |err| {
                     log.err("⚠️ Failed to append to batch: {}", .{err});
-                    // Return to reclaim queue on error
-                    self.reclaim_queue.push(event_ptr) catch {
-                        // Last resort - free directly
-                        event_ptr.deinit(self.allocator);
-                        self.allocator.destroy(event_ptr);
-                    };
+                    // Return slot to free queue on error
+                    event.reset();
+                    self.free_slots.push(slot_idx) catch {};
                     break;
                 };
 
@@ -357,33 +663,32 @@ pub const BatchPublisher = struct {
 
                 // Log the msg_ids of events being flushed
                 if (batch.items.len > 0) {
+                    const first_event = &self.events[batch.items[0]];
+                    const last_event = &self.events[batch.items[batch.items.len - 1]];
                     log.debug("Batch #{d} contains msg_ids: {s} ... {s}", .{
                         batches_processed,
-                        batch.items[0].msg_id,
-                        batch.items[batch.items.len - 1].msg_id,
+                        first_event.getMsgId(),
+                        last_event.getMsgId(),
                     });
                 }
 
-                // Flush the current batch - this will free the events but retain capacity
+                // Flush the current batch
                 self.flushBatch(&batch) catch |err| {
                     log.err("⚠️ Failed to flush batch: {}", .{err});
                 };
 
                 // Clear the batch (capacity is retained for reuse)
-                // Events were already freed by flushBatch
                 current_payload_size = 0;
 
                 last_flush_time = now;
 
                 // Update queue usage metrics after flushing batch
-                // Queue usage has meaningfully changed - we just drained events
                 if (self.metrics) |m| {
                     const queue_usage = self.getQueueUsage();
                     m.updateQueueUsage(queue_usage);
                 }
             } else if (batch.items.len == 0) {
                 // No events available
-                // Check if we should stop immediately (no pending work)
                 if (self.should_stop.load(.seq_cst)) {
                     break;
                 }
@@ -391,7 +696,6 @@ pub const BatchPublisher = struct {
                 std.Thread.sleep(1 * std.time.ns_per_ms);
             } else {
                 // Have events but timeout not reached
-                // If shutting down, flush immediately instead of waiting
                 if (self.should_stop.load(.seq_cst)) {
                     log.info("Shutdown detected with {d} pending events - flushing now", .{batch.items.len});
                     self.flushBatch(&batch) catch |err| {
@@ -408,15 +712,12 @@ pub const BatchPublisher = struct {
         // Drain any remaining events on shutdown
         log.info("Flush thread shutting down, draining remaining events...", .{});
 
-        // Drain remaining events into the existing batch
-        while (self.event_queue.pop()) |event_ptr| {
-            addToBatch(&batch, event_ptr, self.allocator) catch |err| {
+        // Drain remaining slot indices into the existing batch
+        while (self.pending_events.pop()) |slot_idx| {
+            addToBatch(&batch, slot_idx, self.allocator) catch |err| {
                 log.err("⚠️ Failed to append final event: {}", .{err});
-                // Return to reclaim queue
-                self.reclaim_queue.push(event_ptr) catch {
-                    event_ptr.deinit(self.allocator);
-                    self.allocator.destroy(event_ptr);
-                };
+                self.events[slot_idx].reset();
+                self.free_slots.push(slot_idx) catch {};
                 break;
             };
         }
@@ -431,61 +732,75 @@ pub const BatchPublisher = struct {
         // Signal that flush thread has completed all work
         self.flush_complete.store(true, .seq_cst);
         log.info("✅ Flush thread completed - all events published", .{});
-
-        // Release NATS thread-local storage
-        // This is required when user-created threads call NATS C library APIs
-        c.nats_ReleaseThreadMemory();
     }
 
-    /// Flush a batch to NATS (runs in flush thread)
-    /// Takes a pointer to the batch ArrayList of event pointers
-    /// Returns event pointers to reclaim queue after flushing
-    fn flushBatch(self: *BatchPublisher, batch: *std.ArrayList(*CDCEvent)) !void {
-        if (batch.items.len == 0) return;
-
-        // Use allocator directly (flush arena caused segfault due to premature freeing)
-        // NATS C library may hold references to strings after publish() returns
-        const flush_alloc = self.allocator;
-
+    /// Update confirmed LSN and return slots to free queue after successful publish
+    fn updateConfirmedLsn(self: *BatchPublisher, batch_items: []usize) void {
         // Calculate maximum LSN in this batch
         var max_lsn: u64 = 0;
-        for (batch.items) |event_ptr| {
-            if (event_ptr.lsn > max_lsn) {
-                max_lsn = event_ptr.lsn;
+        for (batch_items) |slot_idx| {
+            const event = &self.events[slot_idx];
+            if (event.lsn > max_lsn) {
+                max_lsn = event.lsn;
             }
         }
 
-        const flush_start = std.time.milliTimestamp();
-        const event_count = batch.items.len;
+        // Update last confirmed LSN after successful flush
+        if (max_lsn > 0) {
+            self.last_confirmed_lsn.store(max_lsn, .seq_cst);
+            log.debug("Updated last confirmed LSN to {x}", .{max_lsn});
+        }
 
-        log.info("📦 Starting flush of {d} events", .{event_count});
+        // Return slot indices to free queue for reuse
+        for (batch_items) |slot_idx| {
+            self.events[slot_idx].reset();
+            self.free_slots.push(slot_idx) catch |err| {
+                log.err("Failed to push slot to free queue: {}", .{err});
+            };
+        }
+    }
+
+    /// Perform the actual encoding and publishing to NATS
+    /// Separated from flushBatch to enable clean retry logic
+    fn doPublish(self: *BatchPublisher, indices: []usize) !void {
+        if (indices.len == 0) return;
+
+        const flush_alloc = self.allocator;
+        const event_count = indices.len;
+
+        log.debug("📦 Encoding {d} events for publish", .{event_count});
 
         // For single event, encode and publish directly
         if (event_count == 1) {
-            const event_ptr = batch.items[0];
+            const slot_idx = indices[0];
+            const event = &self.events[slot_idx];
 
-            // Use unified encoder with flush arena
             var encoder = encoder_mod.Encoder.init(flush_alloc, self.format);
             defer encoder.deinit();
 
             var event_map = encoder.createMap();
             defer event_map.free(flush_alloc);
 
-            try event_map.put("subject", try encoder.createString(event_ptr.subject));
-            try event_map.put("table", try encoder.createString(event_ptr.table));
-            try event_map.put("operation", try encoder.createString(event_ptr.operation));
-            try event_map.put("msg_id", try encoder.createString(event_ptr.msg_id));
-            try event_map.put("relation_id", encoder.createInt(@intCast(event_ptr.relation_id)));
-            try event_map.put("lsn", encoder.createInt(@intCast(event_ptr.lsn)));
+            try event_map.put("subject", try encoder.createString(event.getSubject()));
+            try event_map.put("table", try encoder.createString(event.getTable()));
+            try event_map.put("operation", try encoder.createString(event.getOperation()));
+            try event_map.put("msg_id", try encoder.createString(event.getMsgId()));
+            try event_map.put("relation_id", encoder.createInt(@intCast(event.relation_id)));
+            try event_map.put("lsn", encoder.createInt(@intCast(event.lsn)));
 
-            // Add column data if present
-            if (event_ptr.data) |columns| {
-                log.debug("Single event has {d} columns", .{columns.items.len});
+            // Add column data from packed buffer
+            if (event.column_count > 0) {
+                log.debug("Single event has {d} columns", .{event.column_count});
                 var data_map = encoder.createMap();
 
-                for (columns.items) |column| {
-                    const value_enc = try columnValueToEncoderValue(&encoder, column.value);
-                    try data_map.put(column.name, value_enc);
+                // Iterate over column descriptors and decode from packed buffer
+                for (event.columns[0..event.column_count]) |col_view| {
+                    // Extract column name from packed buffer
+                    const col_name = event.data_buffer[col_view.name_offset..][0..col_view.name_len];
+
+                    // Decode value based on type tag
+                    const value_enc = try decodePackedValue(&encoder, event, col_view);
+                    try data_map.put(col_name, value_enc);
                 }
 
                 try event_map.put("data", data_map);
@@ -494,41 +809,45 @@ pub const BatchPublisher = struct {
             const encoded = try encoder.encode(event_map);
             defer self.allocator.free(encoded);
 
-            try self.publisher.publish(event_ptr.subject, encoded, event_ptr.msg_id);
+            // Create headers with message ID for deduplication
+            var headers = nats.pool.Headers{};
+            try headers.init(flush_alloc, 256);
+            defer headers.deinit();
+            try headers.append("Nats-Msg-Id", event.getMsgId());
 
-            // Flush async publishes to actually send them to NATS
-            try self.publisher.flushAsync();
+            try self.publisher.publish(event.getSubject(), &headers, encoded);
 
-            log.debug("Published single event: {s}", .{event_ptr.subject});
+            log.debug("Published single event: {s}", .{event.getSubject()});
         } else {
-            // Use unified encoder for batch publishing with flush arena
+            // Batch publishing
             var encoder = encoder_mod.Encoder.init(flush_alloc, self.format);
             defer encoder.deinit();
 
-            // Create array of events
             var batch_array = try encoder.createArray(event_count);
             defer batch_array.free(flush_alloc);
 
             const encode_start = std.time.milliTimestamp();
 
-            for (batch.items, 0..) |event_ptr, i| {
-                // Each event is a map with subject, table, operation, msg_id, and data
+            for (indices, 0..) |slot_idx, i| {
+                const event = &self.events[slot_idx];
+
                 var event_map = encoder.createMap();
 
-                try event_map.put("subject", try encoder.createString(event_ptr.subject));
-                try event_map.put("table", try encoder.createString(event_ptr.table));
-                try event_map.put("operation", try encoder.createString(event_ptr.operation));
-                try event_map.put("msg_id", try encoder.createString(event_ptr.msg_id));
-                try event_map.put("relation_id", encoder.createInt(@intCast(event_ptr.relation_id)));
-                try event_map.put("lsn", encoder.createInt(@intCast(event_ptr.lsn)));
+                try event_map.put("subject", try encoder.createString(event.getSubject()));
+                try event_map.put("table", try encoder.createString(event.getTable()));
+                try event_map.put("operation", try encoder.createString(event.getOperation()));
+                try event_map.put("msg_id", try encoder.createString(event.getMsgId()));
+                try event_map.put("relation_id", encoder.createInt(@intCast(event.relation_id)));
+                try event_map.put("lsn", encoder.createInt(@intCast(event.lsn)));
 
-                // Add column data if present
-                if (event_ptr.data) |columns| {
+                // Add column data from packed buffer
+                if (event.column_count > 0) {
                     var data_map = encoder.createMap();
 
-                    for (columns.items) |column| {
-                        const value_enc = try columnValueToEncoderValue(&encoder, column.value);
-                        try data_map.put(column.name, value_enc);
+                    for (event.columns[0..event.column_count]) |col_view| {
+                        const col_name = event.data_buffer[col_view.name_offset..][0..col_view.name_len];
+                        const value_enc = try decodePackedValue(&encoder, event, col_view);
+                        try data_map.put(col_name, value_enc);
                     }
 
                     try event_map.put("data", data_map);
@@ -544,31 +863,32 @@ pub const BatchPublisher = struct {
 
             // Publish the batch with a composite message ID
             const publish_start = std.time.milliTimestamp();
-            const first_msg_id = batch.items[0].msg_id;
-            const last_msg_id = batch.items[event_count - 1].msg_id;
+            const first_event = &self.events[indices[0]];
+            const last_event = &self.events[indices[event_count - 1]];
             const batch_msg_id = try std.fmt.allocPrint(
                 flush_alloc,
                 "batch-{s}-to-{s}",
-                .{ first_msg_id, last_msg_id },
+                .{ first_event.getMsgId(), last_event.getMsgId() },
             );
             defer self.allocator.free(batch_msg_id);
 
-            // Use first event's subject pattern but with .batch suffix
             const batch_subject = try std.fmt.allocPrintSentinel(
                 flush_alloc,
                 "{s}.batch",
-                .{batch.items[0].subject},
+                .{first_event.getSubject()},
                 0,
             );
             defer self.allocator.free(batch_subject);
 
-            try self.publisher.publish(batch_subject, encoded, batch_msg_id);
+            var headers = nats.pool.Headers{};
+            try headers.init(flush_alloc, 256);
+            defer headers.deinit();
+            try headers.append("Nats-Msg-Id", batch_msg_id);
+
+            try self.publisher.publish(batch_subject, &headers, encoded);
             const publish_elapsed = std.time.milliTimestamp() - publish_start;
 
-            // Flush async publishes to actually send them to NATS
-            try self.publisher.flushAsync();
-
-            log.info("Published batch: {d} events, {d} bytes to {s} (encode: {d}ms, publish: {d}ms)", .{
+            log.info("📤 Published batch: {d} events, {d} bytes to {s} (encode: {d}ms, publish: {d}ms)", .{
                 event_count,
                 encoded.len,
                 batch_subject,
@@ -576,38 +896,118 @@ pub const BatchPublisher = struct {
                 publish_elapsed,
             });
         }
+    }
 
-        // Update last confirmed LSN after successful flush
-        if (max_lsn > 0) {
-            self.last_confirmed_lsn.store(max_lsn, .seq_cst);
-            log.debug("Updated last confirmed LSN to {x}", .{max_lsn});
+    /// Flush a batch to NATS with retry logic and exponential backoff
+    /// Takes a pointer to the batch ArrayList of slot indices
+    /// Only returns slots to free queue after successful publish
+    fn flushBatch(self: *BatchPublisher, batch: *std.ArrayList(usize)) !void {
+        if (batch.items.len == 0) return;
+
+        var retry_count: u32 = 0;
+        const max_retries = 5;
+        var backoff_ms: u64 = 100; // Start with 100ms
+
+        const flush_start = std.time.milliTimestamp();
+
+        log.info("📦 Starting flush of {d} events", .{batch.items.len});
+
+        while (true) {
+            // Attempt to encode and publish
+            const result = self.doPublish(batch.items);
+
+            if (result) |_| {
+                // SUCCESS - Update LSN and return slots to free queue
+                self.updateConfirmedLsn(batch.items);
+                batch.clearRetainingCapacity();
+
+                // Log flush timing if it took longer than expected
+                const flush_elapsed = std.time.milliTimestamp() - flush_start;
+                if (flush_elapsed > 100) {
+                    log.warn("⏱️  Slow flush: {d}ms for {d} events", .{
+                        flush_elapsed,
+                        batch.items.len,
+                    });
+                }
+                return;
+            } else |err| {
+                // FAILURE - Log and retry with backoff
+                log.err("❌ NATS publish failed (attempt {d}/{d}): {}", .{
+                    retry_count + 1,
+                    max_retries + 1,
+                    err,
+                });
+
+                if (retry_count >= max_retries) {
+                    // Exhausted retries - set fatal flag to stop PostgreSQL replication
+                    log.err("🔴 FATAL: Exhausted retries for batch publish - stopping bridge to prevent WAL overflow", .{});
+                    self.fatal_error.store(true, .seq_cst);
+                    return err;
+                }
+
+                // Wait before retrying (exponential backoff)
+                log.warn("⏳ Retrying in {d}ms...", .{backoff_ms});
+                std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+
+                // Double the wait for next time, capped at 5 seconds
+                backoff_ms = @min(backoff_ms * 2, 5000);
+                retry_count += 1;
+            }
         }
+    }
 
-        // Check if publish failed due to NATS timeout - trigger fatal error to shutdown bridge
-        // This happens in publisher.flushAsync() which throws error.FlushFailed
-        // If we got here without error, the flush succeeded
+    /// Decode a value from the packed buffer and convert to encoder value
+    fn decodePackedValue(
+        encoder: *encoder_mod.Encoder,
+        event: *const CDCEvent,
+        col_view: CDCEvent.ColumnView,
+    ) !encoder_mod.Value {
+        return switch (col_view.value_tag) {
+            .null => encoder.createNull(),
+            .boolean => blk: {
+                const val = event.data_buffer[col_view.value_offset] != 0;
+                break :blk encoder.createBool(val);
+            },
+            .int32 => blk: {
+                const bytes = event.data_buffer[col_view.value_offset..][0..4];
+                const val = std.mem.readInt(i32, bytes, .little);
+                break :blk encoder.createInt(@intCast(val));
+            },
+            .int64 => blk: {
+                const bytes = event.data_buffer[col_view.value_offset..][0..8];
+                const val = std.mem.readInt(i64, bytes, .little);
+                break :blk encoder.createInt(val);
+            },
+            .float64 => blk: {
+                const bytes = event.data_buffer[col_view.value_offset..][0..8];
+                const val: f64 = @bitCast(bytes.*);
+                break :blk encoder.createFloat(val);
+            },
+            .text, .numeric, .array, .bytea, .jsonb => blk: {
+                const str = event.data_buffer[col_view.value_offset..][0..col_view.value_len];
+                break :blk try encoder.createString(str);
+            },
+            // .jsonb => blk: {
+            //     const json_str = event.data_buffer[col_view.value_offset..][0..col_view.value_len];
+            //     // For JSONB columns in MessagePack mode, parse and convert to native types
+            //     break :blk switch (encoder.format) {
+            //         .msgpack => blk2: {
+            //             const parsed = std.json.parseFromSlice(
+            //                 std.json.Value,
+            //                 encoder.allocator,
+            //                 json_str,
+            //                 .{},
+            //             ) catch {
+            //                 break :blk2 try encoder.createString(json_str);
+            //             };
+            //             defer parsed.deinit();
 
-        log.debug("Returning {d} events to reclaim queue", .{event_count});
-
-        // Return event pointers to reclaim queue instead of freeing
-        // Main thread will reclaim and free them
-        for (batch.items) |event_ptr| {
-            self.reclaim_queue.push(event_ptr) catch |err| {
-                log.err("Failed to push to reclaim queue: {}", .{err});
-                // Last resort - free directly (should rarely happen)
-                event_ptr.deinit(self.allocator);
-                self.allocator.destroy(event_ptr);
-            };
-        }
-        batch.clearRetainingCapacity();
-
-        // Log flush timing if it took longer than expected
-        const flush_elapsed = std.time.milliTimestamp() - flush_start;
-        if (flush_elapsed > 5) {
-            log.warn(
-                "Slow flush: {d}ms for {d} events",
-                .{ flush_elapsed, event_count },
-            );
-        }
+            //             const mp = try jsonValueToMsgpack(parsed.value, encoder.allocator);
+            //             break :blk2 encoder_mod.Value{ .msgpack = mp };
+            //         },
+            //         .json => try encoder.createString(json_str),
+            //     };
+            // },
+        };
     }
 };

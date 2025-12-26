@@ -11,8 +11,57 @@
 const std = @import("std");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
+const streaming_encoder = @import("streaming_encoder.zig");
+const StreamingEncoder = streaming_encoder.StreamingEncoder;
 
 pub const log = std.log.scoped(.pg_copy_csv);
+
+/// Encode MessagePack array header into a buffer
+/// Returns the number of bytes written (1, 3, or 5)
+fn encodeArrayHeader(buf: *[5]u8, len: usize) usize {
+    if (len < 16) {
+        // fixarray (1 byte)
+        buf[0] = @as(u8, @intCast(0x90 | len));
+        return 1;
+    } else if (len < 65536) {
+        // array 16 (3 bytes)
+        buf[0] = 0xdc;
+        buf[1] = @as(u8, @intCast((len >> 8) & 0xff));
+        buf[2] = @as(u8, @intCast(len & 0xff));
+        return 3;
+    } else {
+        // array 32 (5 bytes)
+        buf[0] = 0xdd;
+        buf[1] = @as(u8, @intCast((len >> 24) & 0xff));
+        buf[2] = @as(u8, @intCast((len >> 16) & 0xff));
+        buf[3] = @as(u8, @intCast((len >> 8) & 0xff));
+        buf[4] = @as(u8, @intCast(len & 0xff));
+        return 5;
+    }
+}
+
+/// PQgetCopyData provides a mutable pointer, we can treat it as a slice we own until PQfreemem is called
+/// Unescape CSV quoted value in-place (replace "" with ")
+/// Returns a slice of the original buffer with the new length.
+fn unescapeCsvInPlace(input: []u8) []u8 {
+    var write_idx: usize = 0;
+    var read_idx: usize = 0;
+
+    while (read_idx < input.len) {
+        if (input[read_idx] == '"' and read_idx + 1 < input.len and input[read_idx + 1] == '"') {
+            // Found "", write a single " and skip two characters
+            input[write_idx] = '"';
+            read_idx += 2;
+        } else {
+            // Normal character, copy it forward
+            input[write_idx] = input[read_idx];
+            read_idx += 1;
+        }
+        write_idx += 1;
+    }
+
+    return input[0..write_idx];
+}
 
 /// A row from CSV data
 pub const CsvRow = struct {
@@ -172,7 +221,7 @@ pub const CopyCsvParser = struct {
         }
     };
 
-    /// Parse a single CSV line into fields
+    /// Parse a single CSV line into fields (optimized with in-place unescaping)
     fn parseCsvLine(self: *CopyCsvParser, line: []const u8) !CsvRow {
         var fields = std.ArrayList(CsvField){};
         errdefer {
@@ -182,10 +231,9 @@ pub const CopyCsvParser = struct {
             fields.deinit(self.allocator);
         }
 
-        var col_idx: usize = 0;
         var it = std.mem.splitScalar(u8, line, ',');
 
-        while (it.next()) |raw_field| : (col_idx += 1) {
+        while (it.next()) |raw_field| {
             const trimmed = std.mem.trim(u8, raw_field, " \r");
 
             // Handle NULL
@@ -194,12 +242,16 @@ pub const CopyCsvParser = struct {
                 continue;
             }
 
-            // Handle quoted values
+            // Handle quoted values with in-place unescaping
             if (trimmed.len >= 2 and trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"') {
-                // Unquote and unescape
+                // Unquote and unescape in-place
                 const quoted = trimmed[1 .. trimmed.len - 1];
-                const unescaped = try self.unescapeCsv(quoted);
-                try fields.append(self.allocator, .{ .value = unescaped });
+                // We need to copy first because the buffer is const from the iterator
+                const mutable_copy = try self.allocator.dupe(u8, quoted);
+                const unescaped = unescapeCsvInPlace(mutable_copy);
+                // unescaped is a slice of mutable_copy, so we need to resize it
+                const final_value = try self.allocator.realloc(mutable_copy, unescaped.len);
+                try fields.append(self.allocator, .{ .value = final_value });
             } else {
                 // Plain value
                 try fields.append(self.allocator, .{ .value = try self.allocator.dupe(u8, trimmed) });
@@ -211,26 +263,65 @@ pub const CopyCsvParser = struct {
             .allocator = self.allocator,
         };
     }
+    /// [OLD] Parse a single CSV line into fields
+    // fn parseCsvLine(self: *CopyCsvParser, line: []const u8) !CsvRow {
+    //     var fields = std.ArrayList(CsvField){};
+    //     errdefer {
+    //         for (fields.items) |field| {
+    //             if (field.value) |v| self.allocator.free(v);
+    //         }
+    //         fields.deinit(self.allocator);
+    //     }
 
-    /// Unescape CSV quoted value (replace "" with ")
-    fn unescapeCsv(self: *CopyCsvParser, input: []const u8) ![]const u8 {
-        var result: std.ArrayList(u8) = .empty;
-        defer result.deinit(self.allocator);
+    //     var col_idx: usize = 0;
+    //     var it = std.mem.splitScalar(u8, line, ',');
 
-        var i: usize = 0;
-        while (i < input.len) {
-            if (input[i] == '"' and i + 1 < input.len and input[i + 1] == '"') {
-                // Double quote -> single quote
-                try result.append(self.allocator, '"');
-                i += 2;
-            } else {
-                try result.append(self.allocator, input[i]);
-                i += 1;
-            }
-        }
+    //     while (it.next()) |raw_field| : (col_idx += 1) {
+    //         const trimmed = std.mem.trim(u8, raw_field, " \r");
 
-        return try result.toOwnedSlice(self.allocator);
-    }
+    //         // Handle NULL
+    //         if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "\\N")) {
+    //             try fields.append(self.allocator, .{ .value = null });
+    //             continue;
+    //         }
+
+    //         // Handle quoted values
+    //         if (trimmed.len >= 2 and trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"') {
+    //             // Unquote and unescape
+    //             const quoted = trimmed[1 .. trimmed.len - 1];
+    //             const unescaped = try self.unescapeCsv(quoted);
+    //             try fields.append(self.allocator, .{ .value = unescaped });
+    //         } else {
+    //             // Plain value
+    //             try fields.append(self.allocator, .{ .value = try self.allocator.dupe(u8, trimmed) });
+    //         }
+    //     }
+
+    //     return .{
+    //         .fields = try fields.toOwnedSlice(self.allocator),
+    //         .allocator = self.allocator,
+    //     };
+    // }
+
+    /// [OLD] Unescape CSV quoted value (replace "" with ")
+    // fn unescapeCsv(self: *CopyCsvParser, input: []const u8) ![]const u8 {
+    //     var result: std.ArrayList(u8) = .empty;
+    //     defer result.deinit(self.allocator);
+
+    //     var i: usize = 0;
+    //     while (i < input.len) {
+    //         if (input[i] == '"' and i + 1 < input.len and input[i + 1] == '"') {
+    //             // Double quote -> single quote
+    //             try result.append(self.allocator, '"');
+    //             i += 2;
+    //         } else {
+    //             try result.append(self.allocator, input[i]);
+    //             i += 1;
+    //         }
+    //     }
+
+    //     return try result.toOwnedSlice(self.allocator);
+    // }
 
     /// Get row iterator
     pub fn rows(self: *CopyCsvParser) RowIterator {
@@ -243,6 +334,169 @@ pub const CopyCsvParser = struct {
     /// Get column names
     pub fn columnNames(self: *CopyCsvParser) ?[][]const u8 {
         return self.header;
+    }
+
+    // ========================================================================
+    // Streaming API (zero-copy, direct-to-buffer encoding)
+    // ========================================================================
+
+    /// Parse header from a single line and store it
+    fn parseHeaderFromLine(self: *CopyCsvParser, line: []const u8) !void {
+        var cols = std.ArrayList([]const u8){};
+        errdefer {
+            for (cols.items) |col| self.allocator.free(col);
+            cols.deinit(self.allocator);
+        }
+
+        var it = std.mem.splitScalar(u8, line, ',');
+        while (it.next()) |col_name| {
+            const trimmed = std.mem.trim(u8, col_name, " \r");
+            // Dupe the header because it needs to live for the entire snapshot
+            try cols.append(self.allocator, try self.allocator.dupe(u8, trimmed));
+        }
+
+        self.header = try cols.toOwnedSlice(self.allocator);
+        log.debug("Streaming Parser initialized with {d} columns", .{self.header.?.len});
+    }
+
+    /// Parse a CSV line and stream fields directly to the encoder
+    fn parseCsvLineStreaming(
+        self: *CopyCsvParser,
+        line: []u8,
+        encoder: *StreamingEncoder,
+    ) !void {
+        const expected_cols = if (self.header) |h| h.len else 0;
+        try encoder.beginRow(expected_cols);
+
+        var it = std.mem.splitScalar(u8, line, ',');
+
+        while (it.next()) |raw_field| {
+            const trimmed = std.mem.trim(u8, raw_field, " \r");
+
+            const field_value: ?[]const u8 = if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "\\N"))
+                null
+            else if (trimmed.len >= 2 and trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"')
+                // In-place unescape
+                unescapeCsvInPlace(@constCast(trimmed[1 .. trimmed.len - 1]))
+            else
+                trimmed;
+
+            try encoder.writeField(field_value);
+        }
+    }
+
+    /// Stream PostgreSQL COPY data directly to MessagePack encoder
+    /// This is the main streaming entry point that replaces executeCopy + row iteration
+    pub fn streamToEncoder(
+        self: *CopyCsvParser,
+        query: [:0]const u8,
+        encoder: *StreamingEncoder,
+    ) !usize {
+        // 1. Start PostgreSQL COPY
+        const result = c.PQexec(self.conn, query.ptr);
+        defer c.PQclear(result);
+
+        if (c.PQresultStatus(result) != c.PGRES_COPY_OUT) {
+            const err_msg = c.PQerrorMessage(self.conn);
+            log.err("COPY command failed: {s}", .{err_msg});
+            return error.CopyFailed;
+        }
+
+        // 2. We'll count rows as we stream them
+        var row_count: usize = 0;
+
+        // Reserve space for array header (we'll write it at the end when we know the count)
+        // MessagePack array header can be 1, 3, or 5 bytes depending on count
+        // Reserve 5 bytes for safety (supports up to 4 billion rows)
+        const array_header_start = encoder.getPos();
+        const max_header_size: usize = 5;
+        for (0..max_header_size) |_| {
+            try encoder.writer.writeByte(0);
+        }
+
+        // 3. Stream loop: Fetch -> Parse -> Encode
+        while (true) {
+            var buf_ptr: [*c]u8 = undefined;
+            const len = c.PQgetCopyData(self.conn, &buf_ptr, 0);
+
+            if (len == -1) break; // End of COPY data
+            if (len == -2) {
+                const err_msg = c.PQerrorMessage(self.conn);
+                log.err("PQgetCopyData failed: {s}", .{err_msg});
+                return error.CopyDataFailed;
+            }
+
+            defer c.PQfreemem(buf_ptr);
+            const line = std.mem.trim(u8, buf_ptr[0..@intCast(len)], " \n\r");
+            if (line.len == 0) continue;
+
+            // First line is the header
+            if (self.header == null) {
+                try self.parseHeaderFromLine(line);
+                continue;
+            }
+
+            // Subsequent lines are data rows
+            // Make line mutable for in-place unescaping
+            const mutable_line = @constCast(line);
+            try self.parseCsvLineStreaming(mutable_line, encoder);
+            row_count += 1;
+        }
+
+        // 4. Now go back and write the correct array header with actual row count
+        const total_written = encoder.getPos();
+        const rows_data_start = array_header_start + max_header_size;
+
+        // Build the correct array header
+        var header_buf: [5]u8 = undefined;
+        const actual_header_len = encodeArrayHeader(&header_buf, row_count);
+
+        // Debug: Log what we're encoding
+        log.debug("Array header encoding: row_count={d}, header_len={d}, header_bytes={any}", .{
+            row_count,
+            actual_header_len,
+            header_buf[0..actual_header_len],
+        });
+
+        // Shift data forward if header is smaller than reserved space
+        const shift_amount = max_header_size - actual_header_len;
+        if (shift_amount > 0) {
+            const data_len = total_written - rows_data_start;
+            const dst_start = array_header_start + actual_header_len;
+
+            log.debug("Shifting data: total_written={d}, shift_amount={d}, data_len={d}, dst_start={d}", .{
+                total_written,
+                shift_amount,
+                data_len,
+                dst_start,
+            });
+
+            // Move data forward using std.mem.copyForwards (safe for overlapping regions)
+            std.mem.copyForwards(
+                u8,
+                encoder.buffer[dst_start..dst_start + data_len],
+                encoder.buffer[rows_data_start..total_written]
+            );
+
+            // Write the header at the beginning
+            @memcpy(encoder.buffer[array_header_start..array_header_start + actual_header_len], header_buf[0..actual_header_len]);
+
+            // Update encoder position (we removed shift_amount bytes)
+            encoder.setPos(total_written - shift_amount);
+
+            log.debug("Final position: pos={d}, first 10 bytes={any}", .{
+                encoder.pos,
+                encoder.buffer[0..@min(10, encoder.pos)],
+            });
+        } else {
+            // Header fits exactly (5 bytes), just write it
+            @memcpy(encoder.buffer[array_header_start..array_header_start + actual_header_len], header_buf[0..actual_header_len]);
+
+            log.debug("No shift needed, wrote header directly at position {d}", .{array_header_start});
+        }
+
+        log.debug("COPY streamed {d} rows directly to encoder", .{row_count});
+        return row_count;
     }
 };
 
@@ -467,30 +721,18 @@ test "CopyCsvParser - row with mixed NULL and values" {
     try std.testing.expectEqualStrings("quoted value", row.fields[5].value.?);
 }
 
-test "CopyCsvParser - unescape CSV double quotes" {
-    const allocator = std.testing.allocator;
-
-    var parser = CopyCsvParser.init(allocator, null);
-    defer parser.deinit();
-
-    // Test unescaping "" -> "
-    const input = "This is a \"\"quoted\"\" word";
-    const result = try parser.unescapeCsv(input);
-    defer allocator.free(result);
+test "CopyCsvParser - in-place unescape CSV double quotes" {
+    // Test unescaping "" -> " in-place
+    var input = [_]u8{ 'T', 'h', 'i', 's', ' ', 'i', 's', ' ', 'a', ' ', '"', '"', 'q', 'u', 'o', 't', 'e', 'd', '"', '"', ' ', 'w', 'o', 'r', 'd' };
+    const result = unescapeCsvInPlace(&input);
 
     try std.testing.expectEqualStrings("This is a \"quoted\" word", result);
 }
 
-test "CopyCsvParser - unescape multiple consecutive quotes" {
-    const allocator = std.testing.allocator;
-
-    var parser = CopyCsvParser.init(allocator, null);
-    defer parser.deinit();
-
+test "CopyCsvParser - in-place unescape multiple consecutive quotes" {
     // Test """" -> ""
-    const input = "\"\"\"\"";
-    const result = try parser.unescapeCsv(input);
-    defer allocator.free(result);
+    var input = [_]u8{ '"', '"', '"', '"' };
+    const result = unescapeCsvInPlace(&input);
 
     try std.testing.expectEqualStrings("\"\"", result);
 }

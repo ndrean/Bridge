@@ -33,45 +33,28 @@ services:
     networks:
       - cdc-bridge
 
-  nats-config-gen:
-    image: busybox:latest
-    container_name: nats-config-gen
-    env_file:
-      - .env.prod
-    volumes:
-      - nats-config:/config
-      - ./nats-server.conf.template:/nats-server.conf.template:ro
-    command:
-      - sh
-      - -c
-      - |
-        sed -e "s/\$${NATS_TOKEN}/$${NATS_TOKEN}/g" \
-        /nats-server.conf.template > /config/nats-server.conf && \
-        echo "✓ Generated NATS config with token"
-    networks:
-      - cdc-bridge
-    restart: "no"
-
   nats-server:
-    image: nats:latest
+    image: nats:2.11.11-alpine3.22
+    # image: nats:latest
     container_name: nats-server
-    depends_on:
-      nats-config-gen:
-        condition: service_completed_successfully
+
     ports:
       - "4222:4222" # Client connections
       - "8222:8222" # HTTP monitoring
+      - "9222:9222" # WebSocket connections
     volumes:
       - nats-data:/data
-      - nats-config:/config:ro
+      - ./nats.conf:/config/nats-server.conf:ro
     env_file:
       - .env.prod
+
     command: [ "-js", "-m", "8222", "-c", "/config/nats-server.conf" ]
     restart: unless-stopped
     networks:
       - cdc-bridge
 
   nats-init:
+
     image: natsio/nats-box:latest
     container_name: nats-init
     networks:
@@ -100,20 +83,20 @@ services:
         echo 'NATS server is ready!'
 
         echo 'Creating NATS JetStream stream: CDC'
-        nats stream add CDC --server=nats://nats-server:4222 --subjects='cdc.>' --storage=file --retention=limits --max-age=1m --max-msgs=1000000 --max-bytes=1G --replicas=1 --compression s2 --defaults || true
+        nats stream add CDC --server=nats://nats-server:4222 --subjects='cdc.>' --storage=file --retention=limits --max-age=1d --max-msgs=1000000 --max-bytes=1G --replicas=1 --compression s2 --defaults || true
         echo 'Stream CDC created successfully'
 
         echo 'Creating NATS JetStream stream: INIT'
         nats stream add INIT --server=nats://nats-server:4222 --subjects='init.>' --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
         echo 'Stream INIT created successfully'
 
-        echo 'Creating NATS KV bucket: schemas'
-        nats kv add schemas --server=nats://nats-server:4222 --history=10 --replicas=1 || true
-        echo 'KV bucket schemas created successfully'
+        # echo 'Creating NATS KV bucket: schemas'
+        # nats kv add schemas --server=nats://nats-server:4222 --history=10 --replicas=1 || true
+        # echo 'KV bucket schemas created successfully'
 
-        echo 'Creating NATS KV bucket: dictionaries'
-        nats kv add dictionaries --server=nats://nats-server:4222 --history=10 --replicas=1 || true
-        echo 'KV bucket dictionaries created successfully'
+        # echo 'Creating NATS KV bucket: dictionaries'
+        # nats kv add dictionaries --server=nats://nats-server:4222 --history=10 --replicas=1 || true
+        # echo 'KV bucket dictionaries created successfully'
 
         echo 'NATS initialization complete - exiting'
         exit 0

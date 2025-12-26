@@ -54,24 +54,26 @@ pub const SchemaCache = struct {
     /// Returns:
     ///   true if schema changed or is new, false if unchanged
     pub fn hasChanged(self: *SchemaCache, table_name: []const u8, relation_id: u32) !bool {
-        const cached_id = self.cache.get(table_name);
-
-        if (cached_id == null or cached_id.? != relation_id) {
-            // Schema changed or new table - update cache
-            // Need to own the key
-            const owned_name = try self.allocator.dupe(u8, table_name);
-            errdefer self.allocator.free(owned_name);
-
-            // Free old key if exists
-            const old_entry = try self.cache.fetchPut(owned_name, relation_id);
-            if (old_entry) |old| {
-                self.allocator.free(old.key);
+        // Fast path: Check if value matches BEFORE allocating
+        // This avoids string duplication in the common case (no schema change)
+        if (self.cache.get(table_name)) |cached_id| {
+            if (cached_id == relation_id) {
+                return false; // No change - avoid allocation
             }
-
-            return true;
         }
 
-        return false;
+        // Schema changed or new table - update cache
+        // Only allocate when we know we need to update
+        const owned_name = try self.allocator.dupe(u8, table_name);
+        errdefer self.allocator.free(owned_name);
+
+        // Free old key if exists (will exist if this was a schema change, not a new table)
+        const old_entry = try self.cache.fetchPut(owned_name, relation_id);
+        if (old_entry) |old| {
+            self.allocator.free(old.key);
+        }
+
+        return true;
     }
 
     /// Get the cached relation_id for a table, if it exists

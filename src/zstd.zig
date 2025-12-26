@@ -1,32 +1,24 @@
 //! Bindings and wrappers for Zstandard (zstd) compression library.
+//! Purified for high-performance streaming without internal logging.
 //!
-//! Zstandard is a fast lossless compression algorithm, targeting real-time compression scenarios
-//! at zlib-level and better compression ratios.
+//! Thread-safety
+//! -----------
+//! ZSTD_CCtx / ZSTD_DCtx are NOT thread-safe.
+//! Each thread must own its own `Compressor` / `Decompressor`, or use `ContextPool`.
 //!
-//! This module provides a lightweight wrapper around system libzstd.
-//!
-//! ## Quick Start
-//!
-//! ```zig
-//! // Initialize contexts
-//! const cctx = try init_compressor(.{ .recipe = .structured_data });
-//! defer _ = free_compressor(cctx);
-//!
-//! const dctx = try init_decompressor(.{});
-//! defer _ = free_decompressor(dctx);
-//!
-//! // Compress and decompress
-//! const compressed = try compress(allocator, cctx, data);
-//! defer allocator.free(compressed);
-//!
-//! const decompressed = try decompress(allocator, dctx, compressed);
-//! defer allocator.free(decompressed);
-//! ```
+//! Dictionary lifecycle:
+//! 1. Dictionaries are trained and distributed as raw bytes ([]u8).
+//! 2. Raw dictionaries are sent over the wire (e.g. via NATS).
+//! 3. Each consumer digests raw dictionaries locally using
+//!    `ZSTD_createCDict` / `ZSTD_createDDict`.
+//! 4. Digested dictionaries are process-local and must NOT be serialized.
+
 const std = @import("std");
 
-pub const log = std.log.scoped(.zstd);
+// -----------------------------------
+// === C API bindings (Minimal) ===
+// -----------------------------------
 
-// C API bindings
 extern "c" fn ZSTD_isError(code: usize) c_uint;
 extern "c" fn ZSTD_getErrorName(code: usize) [*c]const u8;
 extern "c" fn ZSTD_versionString() [*c]const u8;
@@ -35,11 +27,18 @@ extern "c" fn ZSTD_compressBound(srcSize: usize) usize;
 
 pub const ZSTD_CCtx = opaque {};
 pub const ZSTD_DCtx = opaque {};
+pub const ZSTD_CDict = opaque {};
+pub const ZSTD_DDict = opaque {};
 
 extern "c" fn ZSTD_createCCtx() ?*ZSTD_CCtx;
 extern "c" fn ZSTD_freeCCtx(cctx: *ZSTD_CCtx) usize;
 extern "c" fn ZSTD_createDCtx() ?*ZSTD_DCtx;
 extern "c" fn ZSTD_freeDCtx(dctx: *ZSTD_DCtx) usize;
+
+extern "c" fn ZSTD_createCDict(dictBuffer: [*]const u8, dictSize: usize, compressionLevel: c_int) ?*ZSTD_CDict;
+extern "c" fn ZSTD_freeCDict(cdict: *ZSTD_CDict) usize;
+extern "c" fn ZSTD_createDDict(dictBuffer: [*]const u8, dictSize: usize) ?*ZSTD_DDict;
+extern "c" fn ZSTD_freeDDict(ddict: *ZSTD_DDict) usize;
 
 extern "c" fn ZSTD_compress2(
     cctx: *ZSTD_CCtx,
@@ -47,6 +46,15 @@ extern "c" fn ZSTD_compress2(
     dstCapacity: usize,
     src: [*]const u8,
     srcSize: usize,
+) usize;
+
+extern "c" fn ZSTD_compress_usingCDict(
+    cctx: *ZSTD_CCtx,
+    dst: [*]u8,
+    dstCapacity: usize,
+    src: [*]const u8,
+    srcSize: usize,
+    cdict: *ZSTD_CDict,
 ) usize;
 
 extern "c" fn ZSTD_decompressDCtx(
@@ -57,40 +65,142 @@ extern "c" fn ZSTD_decompressDCtx(
     srcSize: usize,
 ) usize;
 
+extern "c" fn ZSTD_decompress_usingDDict(
+    dctx: *ZSTD_DCtx,
+    dst: [*]u8,
+    dstCapacity: usize,
+    src: [*]const u8,
+    srcSize: usize,
+    ddict: *ZSTD_DDict,
+) usize;
+
 extern "c" fn ZSTD_minCLevel() c_int;
 extern "c" fn ZSTD_maxCLevel() c_int;
+
+extern "c" fn ZSTD_CCtx_setParameter(cctx: *ZSTD_CCtx, param: ZSTD_cParameter, value: c_int) usize;
+extern "c" fn ZSTD_CCtx_reset(cctx: *ZSTD_CCtx, reset: ZSTD_ResetDirective) usize;
+extern "c" fn ZSTD_DCtx_reset(dctx: *ZSTD_DCtx, reset: ZSTD_ResetDirective) usize;
+
+extern "c" fn ZDICT_trainFromBuffer(
+    dictBuffer: [*]u8,
+    dictBufferCapacity: usize,
+    samplesBuffer: [*]const u8,
+    samplesSizes: [*]const usize,
+    nbSamples: c_uint,
+) usize;
 
 pub fn version() []const u8 {
     return std.mem.span(ZSTD_versionString());
 }
 
+pub fn errorName(code: usize) []const u8 {
+    return std.mem.span(ZSTD_getErrorName(code));
+}
+
+// -------------------------------
+// === STREAMING (C API Low-level) ===
+// -------------------------------
+
+/// Zstd streaming input buffer (ABI-compatible)
+pub const ZSTD_inBuffer = extern struct {
+    src: ?*const anyopaque,
+    size: usize,
+    pos: usize,
+};
+
+/// Zstd streaming output buffer (ABI-compatible)
+pub const ZSTD_outBuffer = extern struct {
+    dst: ?*anyopaque,
+    size: usize,
+    pos: usize,
+};
+
+/// Streaming compression directives
+pub const ZSTD_EndDirective = enum(c_int) {
+    ZSTD_e_continue = 0,
+    ZSTD_e_flush = 1,
+    ZSTD_e_end = 2,
+};
+
+extern "c" fn ZSTD_compressStream2(
+    cctx: *ZSTD_CCtx,
+    output: *ZSTD_outBuffer,
+    input: *ZSTD_inBuffer,
+    endOp: ZSTD_EndDirective,
+) usize;
+
+extern "c" fn ZSTD_decompressStream(
+    dctx: *ZSTD_DCtx,
+    output: *ZSTD_outBuffer,
+    input: *ZSTD_inBuffer,
+) usize;
+
+extern "c" fn ZSTD_CStreamInSize() usize;
+extern "c" fn ZSTD_CStreamOutSize() usize;
+extern "c" fn ZSTD_DStreamInSize() usize;
+extern "c" fn ZSTD_DStreamOutSize() usize;
+
+/// Recommended buffer sizes (never fail)
+pub fn compressStreamInSize() usize {
+    return ZSTD_CStreamInSize();
+}
+
+pub fn compressStreamOutSize() usize {
+    return ZSTD_CStreamOutSize();
+}
+
+pub fn decompressStreamInSize() usize {
+    return ZSTD_DStreamInSize();
+}
+
+pub fn decompressStreamOutSize() usize {
+    return ZSTD_DStreamOutSize();
+}
+
+// -----------------------------------
+// === Errors + Helpers ===
+// -----------------------------------
+
+pub const Error = error{
+    ZstdError,
+    NotZstdFormat,
+    SizeUnknown,
+    InvalidCompressionLevel,
+    InvalidDictionarySize,
+    NoSamples,
+    OutputTooLarge,
+};
+
+/// Pure error wrapper for Zstd size_t return codes.
+fn wrap(code: usize) Error!usize {
+    if (ZSTD_isError(code) != 0) return error.ZstdError;
+    return code;
+}
+
+// -----------------------------------
+// === Frame size helper ===
+// -----------------------------------
+
 const ZSTD_CONTENTSIZE_UNKNOWN: u64 = std.math.maxInt(u64);
 const ZSTD_CONTENTSIZE_ERROR: u64 = std.math.maxInt(u64) - 1;
 
-pub fn get_decompressed_size(compressed: []const u8) !usize {
+pub fn get_decompressed_size(compressed: []const u8) Error!usize {
     const size = ZSTD_getFrameContentSize(compressed.ptr, compressed.len);
-    if (size == ZSTD_CONTENTSIZE_ERROR) {
-        return error.NotZstdFormat;
-    }
-    if (size == ZSTD_CONTENTSIZE_UNKNOWN) {
-        return error.SizeUnknown;
-    }
+    if (size == ZSTD_CONTENTSIZE_ERROR) return error.NotZstdFormat;
+    if (size == ZSTD_CONTENTSIZE_UNKNOWN) return error.SizeUnknown;
     return @intCast(size);
 }
 
-// Context parameters
-const ZSTD_cParameter = enum(i16) {
+// -----------------------------------
+// === Enums & Configs ===
+// -----------------------------------
+
+const ZSTD_cParameter = enum(c_int) {
     ZSTD_c_compressionLevel = 100,
-    ZSTD_c_windowLog = 101,
-    ZSTD_c_hashLog = 102,
-    ZSTD_c_chainLog = 103,
-    ZSTD_c_searchLog = 104,
-    ZSTD_c_minMatch = 105,
-    ZSTD_c_targetLength = 106,
     ZSTD_c_strategy = 107,
 };
 
-pub const ZSTD_strategy = enum(i16) {
+pub const ZSTD_strategy = enum(c_int) {
     ZSTD_fast = 1,
     ZSTD_dfast = 2,
     ZSTD_greedy = 3,
@@ -102,37 +212,28 @@ pub const ZSTD_strategy = enum(i16) {
     ZSTD_btultra2 = 9,
 };
 
-const ZSTD_ResetDirective = enum(i8) {
+pub const ZSTD_ResetDirective = enum(c_int) {
     ZSTD_reset_session_only = 0,
     ZSTD_reset_parameters = 1,
     ZSTD_reset_session_and_parameters = 2,
 };
 
-extern "c" fn ZSTD_CCtx_setParameter(cctx: *ZSTD_CCtx, param: ZSTD_cParameter, value: i16) usize;
-extern "c" fn ZSTD_CCtx_reset(cctx: *ZSTD_CCtx, reset: ZSTD_ResetDirective) usize;
-extern "c" fn ZSTD_DCtx_reset(dctx: *ZSTD_DCtx, reset: ZSTD_ResetDirective) usize;
-extern "c" fn ZSTD_CCtx_loadDictionary(cctx: *ZSTD_CCtx, dict: [*]const u8, dictSize: usize) usize;
-extern "c" fn ZSTD_DCtx_loadDictionary(dctx: *ZSTD_DCtx, dict: [*]const u8, dictSize: usize) usize;
-
-/// Compression recipes for different data types
-/// NOTE: This enum is also defined in config.zig for RuntimeConfig
-/// The two definitions must be kept in sync manually
 pub const CompressionRecipe = enum {
-    fast,            // level 1, fast strategy
-    balanced,        // level 3, dfast strategy
-    binary,          // level 6, lazy2 strategy (default for snapshots)
-    text,            // level 9, btopt strategy
-    structured_data, // level 9, btultra strategy (MessagePack/JSON)
-    maximum,         // level 22, btultra2 strategy
+    fast,
+    balanced,
+    binary,
+    text,
+    structured_data,
+    maximum,
 
-    pub fn getLevel(self: CompressionRecipe) i16 {
+    pub fn getLevel(self: CompressionRecipe) c_int {
         return switch (self) {
             .fast => 1,
             .balanced => 3,
-            .maximum => 22,
+            .binary => 6,
             .text => 9,
             .structured_data => 9,
-            .binary => 6,
+            .maximum => 22,
         };
     }
 
@@ -140,162 +241,399 @@ pub const CompressionRecipe = enum {
         return switch (self) {
             .fast => .ZSTD_fast,
             .balanced => .ZSTD_dfast,
-            .maximum => .ZSTD_btultra2,
+            .binary => .ZSTD_lazy2,
             .text => .ZSTD_btopt,
             .structured_data => .ZSTD_btultra,
-            .binary => .ZSTD_lazy2,
+            .maximum => .ZSTD_btultra2,
         };
     }
 };
 
 pub const CompressionConfig = struct {
-    compression_level: ?i16 = null,
+    compression_level: ?c_int = null,
     recipe: ?CompressionRecipe = null,
 };
 
 pub const DecompressionConfig = struct {
-    max_window_log: ?i16 = null,
+    max_window_log: ?c_int = null, // reserved for future
 };
 
-pub fn init_compressor(config: CompressionConfig) !*ZSTD_CCtx {
-    const cctx = ZSTD_createCCtx() orelse return error.ZstdError;
-    errdefer _ = ZSTD_freeCCtx(cctx);
+// -----------------------------------
+// === Compressor
+// -----------------------------------
 
-    const level: i16 = if (config.compression_level) |lvl|
-        lvl
-    else if (config.recipe) |recipe|
-        recipe.getLevel()
-    else
-        3;
+pub const Compressor = struct {
+    ctx: *ZSTD_CCtx,
 
-    if (level < ZSTD_minCLevel() or level > ZSTD_maxCLevel()) {
-        return error.InvalidCompressionLevel;
-    }
+    pub fn init(config: CompressionConfig) !Compressor {
+        const cctx = ZSTD_createCCtx() orelse return error.ZstdError;
+        errdefer _ = ZSTD_freeCCtx(cctx);
 
-    var result = ZSTD_CCtx_setParameter(cctx, ZSTD_cParameter.ZSTD_c_compressionLevel, level);
-    if (ZSTD_isError(result) == 1) {
-        std.log.err("Zstd error: {s}", .{ZSTD_getErrorName(result)});
-        return error.ZstdError;
-    }
+        const level: c_int =
+            if (config.compression_level) |lvl| lvl else if (config.recipe) |recipe| recipe.getLevel() else 3;
 
-    if (config.recipe) |recipe| {
-        result = ZSTD_CCtx_setParameter(cctx, ZSTD_cParameter.ZSTD_c_strategy, @intFromEnum(recipe.getStrategy()));
-        if (ZSTD_isError(result) == 1) {
-            std.log.err("Zstd error: {s}", .{ZSTD_getErrorName(result)});
-            return error.ZstdError;
+        if (level < ZSTD_minCLevel() or level > ZSTD_maxCLevel()) return error.InvalidCompressionLevel;
+
+        _ = try wrap(ZSTD_CCtx_setParameter(cctx, .ZSTD_c_compressionLevel, level));
+        if (config.recipe) |recipe| {
+            _ = try wrap(ZSTD_CCtx_setParameter(cctx, .ZSTD_c_strategy, @intFromEnum(recipe.getStrategy())));
         }
+
+        return .{ .ctx = cctx };
     }
 
-    return cctx;
-}
-
-pub fn free_compressor(ctx: *ZSTD_CCtx) usize {
-    return ZSTD_freeCCtx(ctx);
-}
-
-pub fn reset_compressor_session(ctx: *ZSTD_CCtx) !void {
-    const reset_result = ZSTD_CCtx_reset(ctx, ZSTD_ResetDirective.ZSTD_reset_session_only);
-    if (ZSTD_isError(reset_result) == 1) {
-        std.log.err("Zstd error: {s}", .{ZSTD_getErrorName(reset_result)});
-        return error.ZstdError;
-    }
-}
-
-pub fn compress(allocator: std.mem.Allocator, ctx: *ZSTD_CCtx, input: []const u8) ![]u8 {
-    const bound = ZSTD_compressBound(input.len);
-    if (ZSTD_isError(bound) == 1) {
-        log.err("Zstd error: {s}", .{ZSTD_getErrorName(bound)});
-        return error.ZstdError;
+    pub fn deinit(self: *Compressor) void {
+        _ = ZSTD_freeCCtx(self.ctx);
     }
 
-    const out = try allocator.alloc(u8, bound);
-    errdefer allocator.free(out);
-
-    const written_size = ZSTD_compress2(ctx, out.ptr, bound, input.ptr, input.len);
-    if (ZSTD_isError(written_size) == 1) {
-        log.err("Zstd error: {s}", .{ZSTD_getErrorName(written_size)});
-        return error.ZstdError;
+    pub fn resetSession(self: *Compressor) Error!void {
+        _ = try wrap(ZSTD_CCtx_reset(self.ctx, .ZSTD_reset_session_only));
     }
-    return allocator.realloc(out, written_size);
-}
 
-pub fn init_decompressor(config: DecompressionConfig) !*ZSTD_DCtx {
-    _ = config;
-    const dctx = ZSTD_createDCtx() orelse return error.ZstdError;
-    return dctx;
-}
-
-pub fn free_decompressor(ctx: *ZSTD_DCtx) usize {
-    return ZSTD_freeDCtx(ctx);
-}
-
-pub fn reset_decompressor_session(ctx: *ZSTD_DCtx) !void {
-    const reset_result = ZSTD_DCtx_reset(ctx, ZSTD_ResetDirective.ZSTD_reset_session_only);
-    if (ZSTD_isError(reset_result) == 1) {
-        log.err("Zstd error: {s}", .{ZSTD_getErrorName(reset_result)});
-        return error.ZstdError;
+    pub fn getUpperBound(src_len: usize) usize {
+        // ZSTD_compressBound cannot fail.
+        return ZSTD_compressBound(src_len);
     }
-}
 
-pub fn decompress(allocator: std.mem.Allocator, ctx: *ZSTD_DCtx, input: []const u8) ![]u8 {
-    const output_size = try get_decompressed_size(input);
-    const out = try allocator.alloc(u8, output_size);
-    errdefer allocator.free(out);
+    pub fn compress(
+        self: *Compressor,
+        allocator: std.mem.Allocator,
+        input: []const u8,
+    ) ![]u8 {
+        _ = try wrap(ZSTD_CCtx_reset(
+            self.ctx,
+            .ZSTD_reset_session_only,
+        ));
+        const bound = ZSTD_compressBound(input.len);
+        const dst = try allocator.alloc(u8, bound);
+        errdefer allocator.free(dst);
 
-    const written = ZSTD_decompressDCtx(ctx, out.ptr, output_size, input.ptr, input.len);
-    if (ZSTD_isError(written) == 1) {
-        log.err("Zstd error: {s}", .{ZSTD_getErrorName(written)});
-        return error.ZstdError;
+        const written = try wrap(
+            ZSTD_compress2(
+                self.ctx,
+                dst.ptr,
+                dst.len,
+                input.ptr,
+                input.len,
+            ),
+        );
+
+        if (written < dst.len) _ = allocator.resize(dst, written);
+        return dst[0..written];
     }
-    return allocator.realloc(out, written);
-}
 
-pub fn load_compression_dictionary(ctx: *ZSTD_CCtx, dictionary: []const u8) !void {
-    const result = ZSTD_CCtx_loadDictionary(ctx, dictionary.ptr, dictionary.len);
-    if (ZSTD_isError(result) == 1) {
-        log.err("Zstd load compression dictionary error: {s}", .{ZSTD_getErrorName(result)});
-        return error.ZstdError;
-    }
-}
+    pub fn compress_using_cdict(
+        self: *Compressor,
+        allocator: std.mem.Allocator,
+        input: []const u8,
+        cdict: *ZSTD_CDict,
+    ) ![]u8 {
 
-pub fn load_decompression_dictionary(ctx: *ZSTD_DCtx, dictionary: []const u8) !void {
-    const result = ZSTD_DCtx_loadDictionary(ctx, dictionary.ptr, dictionary.len);
-    if (ZSTD_isError(result) == 1) {
-        std.log.err("Zstd load decompression dictionary error: {s}", .{ZSTD_getErrorName(result)});
-        return error.ZstdError;
+        //reset for pooled context safety
+        _ = try wrap(ZSTD_CCtx_reset(self.ctx, .ZSTD_reset_session_only));
+
+        const bound = ZSTD_compressBound(input.len);
+        const out = try allocator.alloc(u8, bound);
+        errdefer allocator.free(out);
+
+        const written = try wrap(
+            ZSTD_compress_usingCDict(
+                self.ctx,
+                out.ptr,
+                bound,
+                input.ptr,
+                input.len,
+                cdict,
+            ),
+        );
+        if (written < out.len) _ = allocator.resize(out, written);
+        return out[0..written];
     }
+
+    // Low-level streaming compression step.
+    ///
+    /// Returns:
+    /// - number of bytes still to flush (0 means done)
+    ///
+    /// Contract:
+    /// - `ZSTD_CCtx_reset(..., ZSTD_reset_session_only)`
+    ///   must be called *once* before starting a new stream.
+    pub fn compressStream(
+        self: *Compressor,
+        output: *ZSTD_outBuffer,
+        input: *ZSTD_inBuffer,
+        endOp: ZSTD_EndDirective,
+    ) Error!usize {
+        return wrap(
+            ZSTD_compressStream2(
+                self.ctx,
+                output,
+                input,
+                endOp,
+            ),
+        );
+    }
+};
+
+// -----------------------------------
+// === Decompressor
+// -----------------------------------
+
+pub const Decompressor = struct {
+    ctx: *ZSTD_DCtx,
+
+    pub fn init(config: DecompressionConfig) !Decompressor {
+        _ = config;
+        const dctx = ZSTD_createDCtx() orelse return error.ZstdError;
+        return .{ .ctx = dctx };
+    }
+
+    pub fn deinit(self: *Decompressor) void {
+        _ = ZSTD_freeDCtx(self.ctx);
+    }
+
+    pub fn resetSession(self: *Decompressor) Error!void {
+        _ = try wrap(ZSTD_DCtx_reset(self.ctx, .ZSTD_reset_session_only));
+    }
+
+    pub fn decompress_known_size(
+        self: *Decompressor,
+        allocator: std.mem.Allocator,
+        input: []const u8,
+    ) ![]u8 {
+        const output_size = try get_decompressed_size(input);
+        const out = try allocator.alloc(u8, output_size);
+        errdefer allocator.free(out);
+
+        const written = try wrap(
+            ZSTD_decompressDCtx(
+                self.ctx,
+                out.ptr,
+                output_size,
+                input.ptr,
+                input.len,
+            ),
+        );
+        if (written < out.len) _ = allocator.resize(out, written);
+        return out[0..written];
+    }
+
+    pub fn decompress_using_ddict(
+        self: *Decompressor,
+        allocator: std.mem.Allocator,
+        input: []const u8,
+        ddict: *ZSTD_DDict,
+    ) ![]u8 {
+        const output_size = try get_decompressed_size(input);
+        const out = try allocator.alloc(u8, output_size);
+        errdefer allocator.free(out);
+
+        const written = try wrap(
+            ZSTD_decompress_usingDDict(
+                self.ctx,
+                out.ptr,
+                output_size,
+                input.ptr,
+                input.len,
+                ddict,
+            ),
+        );
+        if (written < out.len) _ = allocator.resize(out, written);
+        return out[0..written];
+    }
+
+    pub fn decompress_growable(
+        self: *Decompressor,
+        allocator: std.mem.Allocator,
+        input_data: []const u8,
+        max_output: usize,
+    ) ![]u8 {
+        try self.resetSession();
+
+        var out_list = std.ArrayList(u8).init(allocator);
+        errdefer out_list.deinit();
+
+        const initial_guess = @max(input_data.len * 2, ZSTD_DStreamOutSize());
+        try out_list.ensureTotalCapacity(initial_guess);
+
+        var input = ZSTD_inBuffer{ .src = input_data.ptr, .size = input_data.len, .pos = 0 };
+
+        while (input.pos < input.size) {
+            const spare = out_list.unusedCapacitySlice();
+            if (spare.len == 0) {
+                try out_list.ensureTotalCapacity(out_list.capacity + (out_list.capacity / 2) + 1);
+                continue;
+            }
+
+            var output = ZSTD_outBuffer{ .dst = spare.ptr, .size = spare.len, .pos = 0 };
+            const r = try wrap(ZSTD_decompressStream(self.ctx, &output, &input));
+
+            out_list.items.len += output.pos;
+
+            if (out_list.items.len > max_output) return error.OutputTooLarge;
+
+            // Supports concatenated frames if present in input.
+            if (r == 0 and input.pos == input.size) break;
+        }
+
+        return out_list.toOwnedSlice();
+    }
+
+    /// Low-level streaming decompression step.
+    ///
+    /// Returns:
+    /// - hint for how much more input is expected (0 = frame complete)
+    ///
+    /// Contract:
+    /// - `ZSTD_DCtx_reset(..., ZSTD_reset_session_only)`
+    ///   must be called *once* before starting a new stream.
+    pub fn decompressStream(
+        self: *Decompressor,
+        output: *ZSTD_outBuffer,
+        input: *ZSTD_inBuffer,
+    ) Error!usize {
+        return wrap(
+            ZSTD_decompressStream(
+                self.ctx,
+                output,
+                input,
+            ),
+        );
+    }
+};
+
+// -----------------------------------
+// === Context Pooling
+// -----------------------------------
+
+pub fn ContextPool(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        allocator: std.mem.Allocator,
+        contexts: std.ArrayList(*T),
+        mutex: std.Thread.Mutex = .{},
+        sem: std.Thread.Semaphore,
+
+        pub fn init(allocator: std.mem.Allocator, capacity: usize, config: anytype) !*Self {
+            _ = config; // for future configurability (e.g. tuning)
+
+            const self = try allocator.create(Self);
+            self.* = .{
+                .allocator = allocator,
+                .contexts = std.ArrayList(*T).init(allocator),
+                .sem = std.Thread.Semaphore{ .permits = capacity },
+            };
+            errdefer self.deinit();
+
+            for (0..capacity) |_| {
+                const ctx: *T = blk: {
+                    if (T == ZSTD_CCtx) {
+                        break :blk ZSTD_createCCtx() orelse return error.ZstdError;
+                    } else if (T == ZSTD_DCtx) {
+                        break :blk ZSTD_createDCtx() orelse return error.ZstdError;
+                    } else {
+                        @compileError("ContextPool only supports ZSTD_CCtx or ZSTD_DCtx");
+                    }
+                };
+
+                // If append fails, free the ctx to avoid leaks.
+                self.contexts.append(ctx) catch |e| {
+                    if (T == ZSTD_CCtx) _ = ZSTD_freeCCtx(@ptrCast(ctx)) else _ = ZSTD_freeDCtx(@ptrCast(ctx));
+                    return e;
+                };
+            }
+
+            return self;
+        }
+
+        pub fn acquire(self: *Self) *T {
+            self.sem.wait();
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            std.debug.assert(self.contexts.items.len > 0);
+            return self.contexts.pop();
+        }
+
+        pub fn release(self: *Self, ctx: *T) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            if (T == ZSTD_CCtx) {
+                _ = ZSTD_CCtx_reset(@ptrCast(ctx), .ZSTD_reset_session_only);
+            } else {
+                _ = ZSTD_DCtx_reset(@ptrCast(ctx), .ZSTD_reset_session_only);
+            }
+
+            self.contexts.append(ctx) catch unreachable;
+            self.sem.post();
+        }
+
+        pub fn deinit(self: *Self) void {
+            for (self.contexts.items) |ctx| {
+                if (T == ZSTD_CCtx) _ = ZSTD_freeCCtx(@ptrCast(ctx)) else _ = ZSTD_freeDCtx(@ptrCast(ctx));
+            }
+            self.contexts.deinit();
+            self.allocator.destroy(self);
+        }
+    };
 }
 
 // -----------------------------------
-// === Dictionary Training ===
+// === Dictionary Training (RAW) ===
 // -----------------------------------
 
-extern "c" fn ZSTD_trainFromBuffer(
-    dictBuffer: [*]u8,
-    dictBufferCapacity: usize,
-    samplesBuffer: [*]const u8,
-    samplesSizes: [*]const usize,
-    nbSamples: c_uint,
-) usize;
+/// Train a portable (raw) Zstd dictionary from a pre-flattened corpus.
+///
+/// This function performs no allocation and produces bytes that are
+/// safe to store, version, and distribute (e.g. via NATS).
+///
+/// The resulting dictionary must be digested locally using
+/// `ZSTD_createCDict` / `ZSTD_createDDict` before use.
+pub fn trainRawDictionary(
+    dict_buffer: []u8,
+    samples_buffer: []const u8,
+    sample_sizes: []const usize,
+) Error!usize {
+    if (sample_sizes.len == 0) return error.NoSamples;
+    return wrap(ZDICT_trainFromBuffer(
+        dict_buffer.ptr,
+        dict_buffer.len,
+        samples_buffer.ptr,
+        sample_sizes.ptr,
+        @intCast(sample_sizes.len),
+    ));
+}
 
-/// Train a dictionary from sample data for better compression of small similar files.
-/// The samples should be representative of the data you'll compress.
-/// dict_size is the target dictionary size (typical: 64-128KB for snapshots).
-/// Returns the dictionary data. Caller owns the memory and is responsible for freeing it.
+// -----------------------------------
+// === Dictionary Support
+// -----------------------------------
+
+/// Wrapper around `train_dictionary_from_buffer()`.
+///
+/// - Allocates and flattens samples
+/// - Trains the dictionary
+/// - Returns an owned slice containing the trained dictionary
+///
+/// Suitable for one-off training.
+///
+/// Dictionary lifecycle:
+/// 1. Dictionaries are trained and distributed as raw bytes ([]u8).
+/// 2. Raw dictionaries are sent over the wire (e.g. via NATS).
+/// 3. Each consumer digests raw dictionaries locally using
+///    `ZSTD_createCDict` / `ZSTD_createDDict`.
+/// 4. Digested dictionaries are process-local and must NOT be serialized.
 pub fn train_dictionary(
     allocator: std.mem.Allocator,
     samples: []const []const u8,
     dict_size: usize,
 ) ![]u8 {
-    if (samples.len == 0) {
-        return error.NoSamples;
-    }
+    if (samples.len == 0) return error.NoSamples;
+    if (dict_size < 256 or dict_size > (1 << 20)) return error.InvalidDictionarySize;
 
-    // Build samples buffer and sizes array
     var total_size: usize = 0;
-    for (samples) |sample| {
-        total_size += sample.len;
-    }
+    for (samples) |s| total_size += s.len;
 
     const samples_buffer = try allocator.alloc(u8, total_size);
     defer allocator.free(samples_buffer);
@@ -304,127 +642,108 @@ pub fn train_dictionary(
     defer allocator.free(sample_sizes);
 
     var offset: usize = 0;
-    for (samples, 0..) |sample, i| {
-        @memcpy(samples_buffer[offset .. offset + sample.len], sample);
-        sample_sizes[i] = sample.len;
-        offset += sample.len;
+    for (samples, 0..) |s, i| {
+        @memcpy(samples_buffer[offset .. offset + s.len], s);
+        sample_sizes[i] = s.len;
+        offset += s.len;
     }
 
-    // Train dictionary
     const dict_buffer = try allocator.alloc(u8, dict_size);
     errdefer allocator.free(dict_buffer);
 
-    const result = ZSTD_trainFromBuffer(
+    const written = try train_dictionary_from_buffer(
+        dict_buffer,
+        samples_buffer,
+        sample_sizes,
+    );
+
+    if (written < dict_buffer.len)
+        _ = allocator.resize(dict_buffer, written);
+
+    return dict_buffer[0..written];
+}
+
+pub const DictionaryManager = struct {
+    allocator: std.mem.Allocator,
+    cdicts: std.StringHashMap(*ZSTD_CDict),
+    ddicts: std.StringHashMap(*ZSTD_DDict),
+
+    pub fn init(allocator: std.mem.Allocator) DictionaryManager {
+        return .{
+            .allocator = allocator,
+            .cdicts = std.StringHashMap(*ZSTD_CDict).init(allocator),
+            .ddicts = std.StringHashMap(*ZSTD_DDict).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *DictionaryManager) void {
+        {
+            var it = self.cdicts.iterator();
+            while (it.next()) |e| _ = ZSTD_freeCDict(e.value_ptr.*);
+            self.cdicts.deinit();
+        }
+        {
+            var it = self.ddicts.iterator();
+            while (it.next()) |e| _ = ZSTD_freeDDict(e.value_ptr.*);
+            self.ddicts.deinit();
+        }
+    }
+
+    pub fn hasTable(self: *DictionaryManager, table_name: []const u8) bool {
+        return self.cdicts.contains(table_name);
+    }
+
+    pub fn loadTableCDict(self: *DictionaryManager, table_name: []const u8, raw_dict: []const u8, level: c_int) !void {
+        if (level < ZSTD_minCLevel() or level > ZSTD_maxCLevel()) return error.InvalidCompressionLevel;
+
+        const cdict = ZSTD_createCDict(raw_dict.ptr, raw_dict.len, level) orelse return error.ZstdError;
+        errdefer _ = ZSTD_freeCDict(cdict);
+
+        const prev = try self.cdicts.fetchPut(table_name, cdict);
+        if (prev) |p| _ = ZSTD_freeCDict(p.value);
+    }
+
+    pub fn loadTableDDict(self: *DictionaryManager, table_name: []const u8, raw_dict: []const u8) !void {
+        const ddict = ZSTD_createDDict(raw_dict.ptr, raw_dict.len) orelse return error.ZstdError;
+        errdefer _ = ZSTD_freeDDict(ddict);
+
+        const prev = try self.ddicts.fetchPut(table_name, ddict);
+        if (prev) |p| _ = ZSTD_freeDDict(p.value);
+    }
+
+    pub fn getCDict(self: *DictionaryManager, table_name: []const u8) ?*ZSTD_CDict {
+        return self.cdicts.get(table_name);
+    }
+
+    pub fn getDDict(self: *DictionaryManager, table_name: []const u8) ?*ZSTD_DDict {
+        return self.ddicts.get(table_name);
+    }
+};
+
+/// Train a Zstd dictionary from a pre-flattened samples buffer.
+///
+/// - `dict_buffer`: output buffer (capacity = max dictionary size)
+/// - `samples_buffer`: concatenation of all samples
+/// - `sample_sizes`: length of each sample, in order
+///
+/// Returns the number of bytes written into `dict_buffer`.
+///
+/// This function performs **no allocations** and is suitable for
+/// large corpora or repeated training runs.
+pub fn train_dictionary_from_buffer(
+    dict_buffer: []u8,
+    samples_buffer: []const u8,
+    sample_sizes: []const usize,
+) Error!usize {
+    if (sample_sizes.len == 0) return error.NoSamples;
+
+    const written = ZDICT_trainFromBuffer(
         dict_buffer.ptr,
-        dict_size,
+        dict_buffer.len,
         samples_buffer.ptr,
         sample_sizes.ptr,
-        @intCast(samples.len),
+        @intCast(sample_sizes.len),
     );
 
-    if (ZSTD_isError(result) == 1) {
-        std.log.err("Zstd dictionary training error: {s}", .{ZSTD_getErrorName(result)});
-        return error.ZstdError;
-    }
-
-    return allocator.realloc(dict_buffer, result);
-}
-
-// -----------------------------------
-// === Dictionary Support (One-time Use) ===
-// -----------------------------------
-
-extern "c" fn ZSTD_compress_usingDict(
-    ctx: *ZSTD_CCtx,
-    dst: [*]u8,
-    dstCapacity: usize,
-    src: [*]const u8,
-    srcSize: usize,
-    dict: ?[*]const u8,
-    dictSize: usize,
-    compressionLevel: c_int,
-) usize;
-
-extern "c" fn ZSTD_decompress_usingDict(
-    dctx: *ZSTD_DCtx,
-    dst: [*]u8,
-    dstCapacity: usize,
-    src: [*]const u8,
-    srcSize: usize,
-    dict: ?[*]const u8,
-    dictSize: usize,
-) usize;
-
-/// Compress data using a dictionary for better compression of small similar files.
-/// The dictionary should be trained on representative sample data.
-/// Caller owns the memory and is responsible for freeing it.
-///
-/// NOTE: For production use with many chunks, prefer using load_compression_dictionary()
-/// once, then compress() multiple times. This function is useful for one-off compressions.
-pub fn compress_with_dict(
-    allocator: std.mem.Allocator,
-    ctx: *ZSTD_CCtx,
-    input: []const u8,
-    dictionary: []const u8,
-    level: i32,
-) ![]u8 {
-    if (level < ZSTD_minCLevel() or level > ZSTD_maxCLevel()) {
-        return error.InvalidCompressionLevel;
-    }
-
-    const bound = ZSTD_compressBound(input.len);
-    if (ZSTD_isError(bound) == 1) {
-        log.err("Zstd error: {s}", .{ZSTD_getErrorName(bound)});
-        return error.ZstdError;
-    }
-
-    const out = try allocator.alloc(u8, bound);
-    errdefer allocator.free(out);
-
-    const written_size = ZSTD_compress_usingDict(
-        ctx,
-        out.ptr,
-        bound,
-        input.ptr,
-        input.len,
-        dictionary.ptr,
-        dictionary.len,
-        level,
-    );
-    if (ZSTD_isError(written_size) == 1) {
-        log.err("Zstd error: {s}", .{ZSTD_getErrorName(written_size)});
-        return error.ZstdError;
-    }
-    return allocator.realloc(out, written_size);
-}
-
-/// Decompress data that was compressed using a dictionary.
-/// Caller owns the memory and is responsible for freeing it.
-///
-/// NOTE: For production use with many chunks, prefer using load_decompression_dictionary()
-/// once, then decompress() multiple times. This function is useful for one-off decompressions.
-pub fn decompress_with_dict(
-    allocator: std.mem.Allocator,
-    ctx: *ZSTD_DCtx,
-    input: []const u8,
-    dictionary: []const u8,
-    output_size: usize,
-) ![]u8 {
-    const out = try allocator.alloc(u8, output_size);
-    errdefer allocator.free(out);
-
-    const written = ZSTD_decompress_usingDict(
-        ctx,
-        out.ptr,
-        output_size,
-        input.ptr,
-        input.len,
-        dictionary.ptr,
-        dictionary.len,
-    );
-    if (ZSTD_isError(written) == 1) {
-        log.err("Zstd error: {s}", .{ZSTD_getErrorName(written)});
-        return error.ZstdError;
-    }
-    return allocator.realloc(out, written);
+    return try wrap(written);
 }
