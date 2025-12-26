@@ -90,14 +90,6 @@ services:
         nats stream add INIT --server=nats://nats-server:4222 --subjects='init.>' --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
         echo 'Stream INIT created successfully'
 
-        # echo 'Creating NATS KV bucket: schemas'
-        # nats kv add schemas --server=nats://nats-server:4222 --history=10 --replicas=1 || true
-        # echo 'KV bucket schemas created successfully'
-
-        # echo 'Creating NATS KV bucket: dictionaries'
-        # nats kv add dictionaries --server=nats://nats-server:4222 --history=10 --replicas=1 || true
-        # echo 'KV bucket dictionaries created successfully'
-
         echo 'NATS initialization complete - exiting'
         exit 0
     restart: "no"

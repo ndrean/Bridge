@@ -11,6 +11,7 @@ nats-data/
 # Dependencies (vendored)
 libs/
 
+/consumer/.elixir_ls/
 # IDE
 .vscode/
 .idea/
@@ -23,6 +24,8 @@ postgres-data/
 src/test_files/
 /docs/
 /demo/
+
+.DS_Store
 
 examples/01-micro_vm-nodejs/node_modules/
 examples/02-micro_vm-python/__pycache__/

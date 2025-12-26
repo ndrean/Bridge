@@ -1,4 +1,5 @@
 # **Bridge server** [PostgreSQL  → NATS] 
+
 <img width="755" height="433" alt="Screenshot 2025-12-26 at 02 37 57" src="https://github.com/user-attachments/assets/b3701ef4-2d58-497a-be21-52ad1b970644" />
 
 ![Zig support](https://img.shields.io/badge/Zig-0.15.2-color?logo=zig&color=%23f3ab20)
@@ -6,22 +7,21 @@
 A lightweight, opinionated application to fan out PostgreSQL _proto-v1_ CDC streams and table bootstrapping (schemas and snapshots) to the message broker NATS/JetStream.
 It uses MessagePack encoding by default (JSON option) with optional Zstd compression.
 
-Built with Zig for minimal overhead, includes table bootstrapping for consumer initialization with optional ZSTD compression
+Built with Zig for minimal overhead.
 
 ⚠️ **Status**: Early stage, not yet battle-tested in production. Suitable for experimentation and non-critical workloads.
 
 ```mermaid
 flowchart LR
-    PG[Postgres<br/>Log. Repl.] --> Bridge[Bridge Server<br/>5 threads]
-    Bridge --> NATS[NATS JetStream]
+    PG[PostgreSQL] --> Bridge[Bridge <br>Server]
+    Bridge --> NATS[NATS <br>JetStream]
 
-    subgraph NATS
-        CDC[CDC Stream<br>cdc.table.op]
-        INIT[INIT Stream<br>init.snap.*, <br>init.meta.*]
-        KV[KV Store: <br>schemas<br>key=table]
+    NATS --> Consumers
+
+    subgraph Consumers
+      App
+      Local_DB
     end
-
-    NATS --> Consumer[Consumer<br>option ZSTD decompress<br> MessagePack or JSON<br>SQLite/PGLite]
 ```
 
 ## Table of Contents
