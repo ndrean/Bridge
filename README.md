@@ -3,7 +3,8 @@
 
 ![Zig support](https://img.shields.io/badge/Zig-0.15.2-color?logo=zig&color=%23f3ab20)
 
-A lightweight (15MB), opinionated bridge for streaming PostgreSQL _proto-v1_ changes to NATS JetStream with default MessagePack encoding (and JSON option).
+A lightweight, opinionated application to fan out PostgreSQL _proto-v1_ CDC streams and table bootstrapping (schemas and snapshots) to the message broker NATS/JetStream.
+It uses MessagePack encoding by default (JSON option) with optional Zstd compression.
 
 Built with Zig for minimal overhead, includes table bootstrapping for consumer initialization with optional ZSTD compression
 
