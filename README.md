@@ -1,4 +1,5 @@
-# PostgreSQL CDC → NATS Bridge
+# **Bridge server** [PostgreSQL  → NATS] 
+<img width="755" height="433" alt="Screenshot 2025-12-26 at 02 37 57" src="https://github.com/user-attachments/assets/b3701ef4-2d58-497a-be21-52ad1b970644" />
 
 ![Zig support](https://img.shields.io/badge/Zig-0.15.2-color?logo=zig&color=%23f3ab20)
 
